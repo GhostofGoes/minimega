@@ -25,6 +25,8 @@ var (
 	f_https         = flag.Bool("https", false, "enable https (TLS) service")
 	f_httproot      = flag.String("httproot", "", "serve directory with http(s) instead of the builtin page generator")
 	f_httpGzip      = flag.Bool("httpgzip", false, "gzip image served in http/https pages")
+	f_icmp          = flag.Bool("icmp", false, "ping target host with ICMP")
+	f_icmp_ran_seq  = flag.Bool("icmp-random-seq", false, "randomize sequence number of ICMP packets (defaults to seq=1 for all packets)")
 	f_irc           = flag.Bool("irc", false, "enable irc service")
 	f_ircport       = flag.String("ircport", "6667", "port to use for IRC client or server")
 	f_channels      = flag.String("channels", "#general,#random", "overwrite default IRC channels to join, seperated by commas")
@@ -36,19 +38,20 @@ var (
 	f_ftps          = flag.Bool("ftps", false, "enable ftp (TLS) service")
 	f_ssh           = flag.Bool("ssh", false, "enable ssh service")
 	f_smtp          = flag.Bool("smtp", false, "enable smtp service")
-	f_smtpUser      = flag.String("smtpuser", "", "specify a particular user to send email to for the given domain, otherwise random")
-	f_smtpTls       = flag.Bool("smtptls", true, "enable or disable sending mail with TLS")
-	f_smtpmail      = flag.String("smtpmail", "", "send email from a given file instead of the builtin email corpus")
-	f_mean          = flag.Duration("u", time.Duration(1000*time.Millisecond), "mean time between actions")
-	f_stddev        = flag.Duration("s", time.Duration(0), "standard deviation between actions")
-	f_min           = flag.Duration("min", time.Duration(0), "minimum time allowable for events")
-	f_max           = flag.Duration("max", time.Duration(60000*time.Millisecond), "maximum time allowable for events")
-	f_v4            = flag.Bool("ipv4", true, "use IPv4. Can be used together with -ipv6")
-	f_v6            = flag.Bool("ipv6", true, "use IPv6. Can be used together with -ipv4")
-	f_report        = flag.Duration("report", time.Duration(10*time.Second), "time between reports, set to 0 to disable")
-	f_httpTLSCert   = flag.String("httptlscert", "", "file containing public certificate for TLS")
-	f_httpTLSKey    = flag.String("httptlskey", "", "file containing private key for TLS")
-	f_tlsVersion    = flag.String("tlsversion", "", "Select a TLS version for the client: tls1.0, tls1.1, tls1.2")
+	// TODO: smtpUser is unused, the destination from the email messages being sent are used
+	f_smtpUser    = flag.String("smtpuser", "", "specify a particular user to send email to for the given domain, otherwise random")
+	f_smtpTls     = flag.Bool("smtptls", true, "enable or disable sending mail with TLS")
+	f_smtpmail    = flag.String("smtpmail", "", "send email from a given file instead of the builtin email corpus")
+	f_mean        = flag.Duration("u", time.Duration(1000*time.Millisecond), "mean time between actions")
+	f_stddev      = flag.Duration("s", time.Duration(0), "standard deviation between actions")
+	f_min         = flag.Duration("min", time.Duration(0), "minimum time allowable for events")
+	f_max         = flag.Duration("max", time.Duration(60000*time.Millisecond), "maximum time allowable for events")
+	f_v4          = flag.Bool("ipv4", true, "use IPv4. Can be used together with -ipv6")
+	f_v6          = flag.Bool("ipv6", true, "use IPv6. Can be used together with -ipv4")
+	f_report      = flag.Duration("report", time.Duration(10*time.Second), "time between reports, set to 0 to disable")
+	f_httpTLSCert = flag.String("httptlscert", "", "file containing public certificate for TLS")
+	f_httpTLSKey  = flag.String("httptlskey", "", "file containing private key for TLS")
+	f_tlsVersion  = flag.String("tlsversion", "", "Select a TLS version for the client: tls1.0, tls1.1, tls1.2")
 
 	// See main for registering with flag
 	f_httpImageSize = DefaultFileSize
@@ -90,7 +93,7 @@ func main() {
 
 	// make sure at least one service is enabled
 
-	if !dns && !*f_http && !*f_https && !*f_irc && !*f_ftp && !*f_ftps && !*f_ssh && !*f_smtp {
+	if !dns && !*f_http && !*f_https && !*f_irc && !*f_ftp && !*f_ftps && !*f_ssh && !*f_smtp && !*f_icmp {
 		log.Fatalln("no enabled services")
 	}
 
@@ -137,6 +140,14 @@ func main() {
 	}
 
 	// start services
+	if *f_icmp {
+		if *f_serve {
+			// TODO: icmp server
+			log.Errorln("icmp serve is not implemented")
+		} else {
+			go icmpClient()
+		}
+	}
 	if dns {
 		if *f_serve {
 			go dnsServer()
