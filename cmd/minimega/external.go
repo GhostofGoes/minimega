@@ -20,6 +20,13 @@ import (
 )
 
 var (
+	// MIN_QEMU is the floor below which minimega refuses to run; it is not
+	// the version minimega is developed/tested against. minimega has been
+	// audited against upstream QEMU's Removed/Deprecated features docs
+	// through QEMU 11.0 (the latest stable release as of this writing) --
+	// see doc/content/articles/vmtypes.article for details and the
+	// docker/Dockerfile qemubuilder stage, which builds that version from
+	// source for the published container image.
 	MIN_QEMU    = []int{1, 6}
 	MIN_DNSMASQ = []int{2, 73}
 	MIN_OVS     = []int{1, 11}

@@ -92,7 +92,7 @@ external program.
 If you plan to launch and maintain VMs, you'll need the following programs at a
 minimum:
 
-- kvm - qemu-kvm with the kvm kernel module loaded (minimum version 1.6)
+- kvm - qemu-kvm with the kvm kernel module loaded (minimum version 1.6, developed/tested against the latest stable QEMU release -- see the [[/articles/vmtypes.article][VM types]] article for details)
 - ip - ip tool for manipulating devices
 - ovs-vsctl - Open vSwitch switch control with daemon running and kernel module loaded (minimum version 1.11)
 - ovs-ofctl - Open vSwitch openflow control with daemon running and kernel module loaded

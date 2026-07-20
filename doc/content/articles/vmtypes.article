@@ -80,7 +80,14 @@ Configuration parameters specific to `KVM` instances:
 
 *** Technical details
 
-minimega uses QEMU version 1.6 or greater. When launching `kvm` type VMs, the
+minimega requires QEMU version 1.6 or greater to run at all, but is
+developed and tested against the latest stable QEMU release (currently
+QEMU 11.0). minimega's use of the QEMU command line and QMP has been
+reviewed against upstream's Removed and Deprecated features documentation
+for every release between 6.2 and 11.0; the Docker image published for
+minimega builds QEMU 11.0 from source (see `docker/Dockerfile`) since
+distro packages typically lag several years behind upstream. When
+launching `kvm` type VMs, the
 following occurs, in order:
 
 - A new VM handler is created within minimega, which is populated with a copy of the VM configuration
@@ -100,6 +107,31 @@ architecture (for kvm support), and enabling memory ballooning. In rare
 circumstances some of these arguments need to by removed or modified. The
 `vm`config`qemu-override` API provides a mechanism to patch the QEMU argument
 string before launching VMs.
+
+*** QEMU 11.0 compatibility notes
+
+As part of upgrading the QEMU version minimega is developed/tested against
+from 6.2 to 11.0, minimega's command line and QMP usage was reviewed against
+upstream's Removed and Deprecated features documentation for every release in
+between. This turned up (and fixed) two long-standing bugs where minimega
+constructed QEMU arguments using device/option names that were never valid
+(hugepage support used `-mem-info`, which does not exist; AHCI-attached disks
+used the `ide-drive` device, which was removed in QEMU 6.0 in favor of
+`ide-hd`/`ide-cd`). No other hardcoded arguments or QMP commands minimega
+relies on (`-vnc`, `-rtc`, `-usb`, `qemu-xhci`/`usb-ehci`, `virtio-serial-pci`,
+`qemu-vdagent`, `migrate` with an `exec:` URI, `query-migrate`,
+`blockdev-change-medium`, `screendump`, etc.) have been removed as of QEMU
+11.0.
+
+One notable deprecation to keep an eye on for future QEMU releases: the
+`drive-backup` QMP command minimega uses for `vm`config`snapshot`-style disk
+saves has been deprecated since QEMU 6.2 in favor of `blockdev-backup` (used
+together with explicit `blockdev-create`/`blockdev-add` calls). It has not
+been removed as of 11.0, and migrating to the replacement is a non-trivial
+change (it requires minimega to independently create and manage the target
+block node, including picking an image format/options that `drive-backup`
+previously inferred automatically), so it has intentionally been left as-is
+pending an upstream removal announcement.
 
 ** Containers
 
