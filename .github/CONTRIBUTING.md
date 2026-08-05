@@ -1,6 +1,9 @@
+# Contributing to minimega
+
 Thank you for your interest in contributing to minimega! We welcome contributions from everyone and appreciate your efforts to improve our project. This guide will help you understand how to contribute effectively.
 
-> Note: A failure to follow this guide may result in delay of PRs until there is compliance. 
+> [!NOTE]
+> A failure to follow this guide may result in delay of PRs until there is compliance.
 
 ## Table of Contents
 
@@ -53,7 +56,7 @@ If you encounter a bug or have a feature request, please open an issue in the [I
 
 ### Suggesting Enhancements
 
-We welcome suggestions for improvements! Please open an issue to discuss your ideas before implementing them. 
+We welcome suggestions for improvements! Please open an issue to discuss your ideas before implementing them.
 
 ### Submitting Code
 
@@ -99,7 +102,7 @@ We welcome suggestions for improvements! Please open an issue to discuss your id
     ```bash
     git commit -m "feat(auth): add user authentication feature"
     ```
-    If you need to write a longer commit message, you can do so by running `git commit`. This will open your default text editor where you can write a detailed commit message. The first line should be a brief summary conforming to the format above, followed by a blank line, and then a more detailed explanation. 
+    If you need to write a longer commit message, you can do so by running `git commit`. This will open your default text editor where you can write a detailed commit message. The first line should be a brief summary conforming to the format above, followed by a blank line, and then a more detailed explanation.
 
     Example:
     ```bash
@@ -109,12 +112,12 @@ We welcome suggestions for improvements! Please open an issue to discuss your id
     ```
 
 4. **Push to Your Fork**: Push to your branch and ensure CI/CD workflows are passing.
-    
+
     Example:
     ```bash
     git push origin feat/add-user-authentication
     ```
-    
+
 5. **Open a Pull Request**: Go to the original repository and open a [pull request](https://github.com/sandia-minimega/minimega/pulls). Provide a clear description of your changes and reference any related issues.
 
 ### EditorConfig
@@ -136,4 +139,5 @@ Quick verification:
 EditorConfig complements language-native formatters such as `gofmt`; continue to run language-specific formatters and tests before opening a pull request.
 
 ## License
+
 By contributing to this project, you agree that your contributions will be licensed under the [GNU General Public License v3.0](https://github.com/sandia-minimega/minimega/blob/master/LICENSE) License.
