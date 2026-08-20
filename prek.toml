@@ -1,0 +1,227 @@
+# Configuration file for `prek`, a git hook framework written in Rust.
+# See https://prek.j178.dev for more information.
+# Run manually: prek run --all-files
+#:schema https://www.schemastore.org/prek.json
+
+auto_update.cooldown_days = 30
+minimum_prek_version = "0.4.3"
+default_language_version.python = "3.12"
+default_language_version.golang = "1.24"
+
+# All hooks at the same priority level will run *concurrently* (in parallel),
+# and hooks with a lower priority will run before hooks with a higher priority.
+# See: https://prek.j178.dev/proposals/concurrency
+#
+# Priority 0: built-in hooks that modify files (e.g. fix line endings, remove trailing whitespace)
+# Priority 1: language linters that modify files (go fmt)
+# Priority 2: language linters that don't modify files (codespell, golangci-lint)
+#
+# NOTE: minimega does not currently maintain a project-level golangci-lint
+# config and relies on `gofmt` / `go vet` via `scripts/check.bash`. We do not
+# run `golangci-lint` from prek here; if/when a `.golangci.yml` is added at
+# the repo root, uncomment the corresponding hooks below.
+
+
+# Spell checking
+[[repos]]
+repo = "https://github.com/codespell-project/codespell"
+rev = "v2.4.2"
+
+[[repos.hooks]]
+id = "codespell"
+args = [
+  "--ignore-words-list",
+  "ue,ot,ues,fo,nd,ist,te,iif,iam,parm,parms,ser,bord,nin,inout,readded,thru,wan,ans,ro,whitespaces",
+  # Vendored Go deps, large build artifacts, generated minidoc HTML, etc.
+  "--skip",
+  "vendor/*,lib/dist/*,lib/minimega.egg-info/*,packages/*,packaging/*,bin/*,rpmbuild/*,*.deb,*.rpm,*.tar,*.tar.gz,*.svg,*.lock,go.sum,LICENSES/*,doc/content/articles/*,misc/web/*"
+]
+priority = 2
+
+
+# Shell: ShellCheck (checks shell scripts for common issues)
+# Unfortunately, ShellCheck's standard pre-commit hook calls into Docker,
+#   which doesn't work well in CI, since the CI runs in a container.
+# Instead, use this neat hack that uses Python pip to download and
+#   install the ShellCheck binary.
+[[repos]]
+repo = "https://github.com/shellcheck-py/shellcheck-py"
+rev = "v0.11.0.1"
+
+[[repos.hooks]]
+id = "shellcheck"
+# The existing bash scripts use a number of patterns (sourced files,
+# word-splitting on intentional unquoted vars) that we'd rather flag as
+# advice than as a build break.
+args = [
+    "--severity=warning",
+    "--exclude=SC1090,SC1091,SC2086,SC2034,SC2154"
+]
+exclude = '^(vendor/|packages/|packaging/)'
+priority = 2
+
+
+# Dockerfile: hadolint
+# hadolint-py uses python pip to download and install the hadolint binary.
+# This is used instead of using Docker like the official hadolint
+# pre-commit hook, so it can work in CI without docker-in-docker.
+[[repos]]
+repo = "https://github.com/AleksaC/hadolint-py"
+rev = "v2.14.0"
+
+[[repos.hooks]]
+id = "hadolint"
+# DL3059 - Ignore consecutive RUN instructions in Dockerfile
+args = ["--ignore", "DL3059"]
+exclude = '^(vendor/|packages/|packaging/)'
+priority = 1
+
+
+# YAML: yamllint
+[[repos]]
+repo = "https://github.com/adrienverge/yamllint.git"
+rev = "v1.29.0"
+
+[[repos.hooks]]
+id = "yamllint"
+args = [
+    "--strict",
+    "--config-file=.yamllint.yml"
+]
+priority = 2
+
+
+# Enforce conventional commit messages
+[[repos]]
+repo = "https://github.com/compilerla/conventional-pre-commit"
+rev = "v4.4.0"
+
+[[repos.hooks]]
+id = "conventional-pre-commit"
+stages = ["commit-msg"]
+args = [
+  "feat",
+  "fix",
+  "docs",
+  "style",
+  "refactor",
+  "test",
+  "chore"
+]
+priority = 1
+
+
+# General checks built into prek
+[[repos]]
+repo = "builtin"
+
+[[repos.hooks]]
+id = "trailing-whitespace"
+args = ["--markdown-linebreak-ext=md"]
+types_or = [
+  "python",
+  "go",
+  "markdown",
+  "yaml",
+  "json",
+  "shell"
+]
+exclude = '^(vendor/|packages/|packaging/|lib/dist/|lib/minimega\.egg-info/|bin/|rpmbuild/|internal/version/version\.go$)'
+priority = 0
+
+[[repos.hooks]]
+id = "check-added-large-files"
+# Repo currently ships .deb/.rpm artifacts; raise the threshold so we don't
+# block routine commits, but still catch genuinely huge files.
+args = ["--maxkb=10240"]
+exclude = '^(vendor/|.*\.deb$|.*\.rpm$|.*\.tar(\.gz)?$|.*\.buildinfo$|.*\.changes$)'
+priority = 1
+
+[[repos.hooks]]
+id = "check-case-conflict"
+priority = 1
+
+[[repos.hooks]]
+id = "check-illegal-windows-names"
+priority = 1
+
+[[repos.hooks]]
+id = "end-of-file-fixer"
+types_or = [
+  "python",
+  "go",
+  "markdown",
+  "shell"
+]
+exclude = '^(vendor/|packages/|packaging/|lib/dist/|lib/minimega\.egg-info/|bin/|rpmbuild/|internal/version/version\.go$)'
+priority = 0
+
+[[repos.hooks]]
+id = "fix-byte-order-marker"
+priority = 0
+
+[[repos.hooks]]
+id = "check-yaml"
+exclude = '^(vendor/|packages/|packaging/)'
+priority = 1
+
+[[repos.hooks]]
+id = "check-json"
+exclude = '^(vendor/|packages/|packaging/|devcontainer\.json$)'
+priority = 1
+
+[[repos.hooks]]
+id = "check-merge-conflict"
+priority = 1
+
+[[repos.hooks]]
+id = "check-executables-have-shebangs"
+exclude = { glob = [
+    "vendor/**",
+    "packages/**",
+    "packaging/**",
+    "**/*.desktop",
+    "**/*.ps1",
+    "**/*.bat",
+    "**/*.cmd",
+]}
+priority = 1
+
+[[repos.hooks]]
+id = "check-shebang-scripts-are-executable"
+exclude = '^(vendor/|packages/|packaging/)'
+priority = 1
+
+[[repos.hooks]]
+id = "check-symlinks"
+priority = 1
+
+[[repos.hooks]]
+id = "check-toml"
+exclude = '^vendor/'
+priority = 1
+
+[[repos.hooks]]
+id = "mixed-line-ending"
+args = ["--fix=no"]
+exclude = '^(vendor/|packages/|packaging/|lib/dist/)'
+priority = 0
+
+[[repos.hooks]]
+id = "check-vcs-permalinks"
+description = "Ensures that links to vcs websites are permalinks"
+priority = 1
+
+[[repos.hooks]]
+id = "no-commit-to-branch"
+name = "branch name validation"
+description = "Prevent committing to 'master', 'main', or any branch that aren't kebab-case (only allows letters, numbers, and hyphens)"
+args = [
+  "--branch",
+  "master",
+  "--branch",
+  "main",
+  "--pattern",
+  '.*[^\w-].*'
+]
+priority = 1
