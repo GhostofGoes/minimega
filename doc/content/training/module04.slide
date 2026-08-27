@@ -45,7 +45,7 @@ This will print the available options for miniweb
 
 * 
 
-- If you want minimega to be available via console
+- If you like the minimega console to be available in the web application
 -- use the -console flag
 -- ensure minimega is located in a bin directory, specify with -base
 

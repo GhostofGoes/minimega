@@ -190,6 +190,18 @@ Tags are key/value pairs, and are added simply by using the -tag switch on a run
 
     ./miniccc -tag foo bar
 
+* Pitfall: version mismatches
+
+miniccc and minimega must come from the same minimega release. The c2 protocol between them can change between versions, so mixing versions can cause clients to fail to connect, silently drop commands, or misreport responses.
+
+When a client's version doesn't match, minimega logs a warning at handshake time:
+
+    mismatched miniccc version on <hostname>: <client version>
+
+Check minimega's log (-level info or higher) if clients seem to connect but never respond as expected.
+
+If you see this warning, rebuild your VM image's miniccc binary any time you upgrade minimega.
+
 * Next up…
 
 [[module08.slide][Module 08: Background traffic]]

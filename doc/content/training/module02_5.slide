@@ -49,6 +49,16 @@ A container only requires a filesystem with the various programs and files neede
 
 Consequently, containers require far fewer resources to run, and you can therefore run many more containers on a host compared to KVMs.
 
+* How minimega containers differ from Docker/LXC
+
+minimega implements its own lightweight container runtime rather than shelling out to Docker or LXC.
+
+minimega builds containers directly using Linux namespaces (mount, PID, network, UTS, IPC) and cgroups, without requiring a container engine daemon (such as dockerd) to be installed or running on the host.
+
+Because minimega manages the namespaces itself, containers are treated as first-class citizens alongside KVM VMs: they share the same `vm`config`/`vm`launch` workflow, the same networking (VLANs, taps), the same command and control (miniccc), and the same instrumentation tools (`vm`top`, packet capture, etc.).
+
+minimega containers also boot from a plain root filesystem (an `init` program and a directory tree) rather than a layered image format like a Docker image, which keeps the tooling (vmbetter) simple and avoids the overhead of an image registry or union filesystem.
+
 * Types of VM image files
 
 There are a number of image files you can use to launch a virtual machine or container. 
