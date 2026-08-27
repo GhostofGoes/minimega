@@ -144,9 +144,12 @@ Then, a second interface is added to the router VM, and again, the router will a
 
 * Step 3 - Configure the Router
 
-Then, we define a routing protocol of OSPF. These two lines allow the traffic of each network to cross over via the router.
+Then, we set the router as the default gateway for each network, using the `router` option of the `router`dhcp` command:
 
-Details on how OSPF works is beyond the scope of this tutorial, however we recommend the user be familiar with such networking details, if this impacts how you will be configuring your experiment.
+ router router dhcp 10.0.0.0 router 10.0.0.1
+ router router dhcp 20.0.0.0 router 20.0.0.1
+
+We don't need a routing protocol like OSPF here. Because the router VM is a member of both networks, and DHCP has already told each VM to use the router as its default gateway, the router already knows how to get traffic everywhere it needs to go.
 
 Finally, after any router commands are defined, the user must commit the commands using the commit command:
 

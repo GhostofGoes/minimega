@@ -89,12 +89,14 @@ See [[/articles/api.article][the minimega API]] for more details on dnsmasq, or 
 
     minimega$ help dnsmasq
 
+Note: DNSMASQ runs on the host, which means the host itself becomes part of your experiment's network. For most experiments, it's better to use minirouter (or another dedicated VM) to serve DHCP instead, so the host stays isolated from the experiment network. See the next section for details.
+
 
 * minirouter
 
 minirouter is a simple tool, run in a VM, that orchestrates various router functions such as DHCP, DNS, IPv4/IPv6 assignments, and, of course, routing. The minirouter tool is interfaced by minimega's router API and the minimega distribution provides a prebuilt minirouter container image.
 
-minirouter currently supports several protocols and capabilities including DHCP, DNS, router advertisements, OSPF, and static routes. It can route in excess of 40 gigabits per second when running as a container. 
+minirouter currently supports several protocols and capabilities including DHCP, DNS, router advertisements, static routes, OSPF, and BGP. It can route in excess of 40 gigabits per second when running as a container. 
 
 minirouter can run on bare metal, as a container, or a KVM image.
 
@@ -160,7 +162,7 @@ minirouter provides a simple mechanism to add A or AAAA records for any host/IP 
 
 * Routing
 
-minirouter uses the bird routing daemon to provide routing using a variety of protocols. Currently, minirouter only supports static and OSPF routes. Support for BGP and others are planned.
+minirouter uses the bird routing daemon to provide routing using a variety of protocols. minirouter supports static routes, OSPF, and BGP.
 
 Bird is a lightweight routing daemon that scales well. In our tests we were able to scale minirouter with bird to at least 40 gigabit
 
@@ -177,6 +179,16 @@ minirouter provides basic support for OSPF and OSPFv3 (IPv6 enabled OSPF) by spe
 Interfaces are identified by the index in which they were added by the vm config net API. For example, to add the first and third network of the router VM to area 0 in an OSPF route:
 
 .mega module06_content/router08.mm
+
+OSPF route costs can also be tuned to influence path selection. See [[/articles/ospf_cost.article][the OSPF cost article]] for details.
+
+* Routing - the full router API
+
+We've only covered a subset of the `router` API in this module. The router API includes commands for interfaces, DHCP, DNS, upstream DNS, default gateway, router advertisements, routes, router ID, and firewall rules (about 9 subcommands in total).
+
+See [[/articles/api.article][the minimega API]] for the full list, or in minimega:
+
+    minimega$ help router
 
 * Connecting to the internet
 

@@ -29,8 +29,8 @@ router router dhcp 10.0.0.0 dns 10.0.0.2
 router router interface 1 20.0.0.1/24
 router router dhcp 20.0.0.0 range 20.0.0.2 20.0.0.2
 router router dhcp 20.0.0.0 dns 20.0.0.2
-router router route ospf 0 0
-router router route ospf 0 1
+router router dhcp 10.0.0.0 router 10.0.0.1
+router router dhcp 20.0.0.0 router 20.0.0.1
 router router commit
 
 shell echo "start the router first, and give it a chance to configure"
