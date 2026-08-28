@@ -123,9 +123,9 @@ can execute commands.
 
 This is achieved by running the following after starting minimega:
 
-  chgrp -R minimega $MM_RUN_PATH
-  chmod -R g=u $MM_RUN_PATH
-  chmod g+s $MM_RUN_PATH ${MM_RUN_PATH}/minimega
+  chgrp -R minimega $MM_BASE
+  chmod -R g=u $MM_BASE
+  chmod g+s $MM_BASE ${MM_BASE}/minimega
   
 in the systemctl script or by minimega on startup.
 
@@ -305,5 +305,3 @@ Source of the entire distribution is available on
 [[https://github.com/sandia-minimega/minimega/v2][Github]]. Follow the directions 
 for cloning or forking minimega on github.com. In order to build minimega, you 
 will need a Go 1.12+ compiler and libpcap headers.
-
-
