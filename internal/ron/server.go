@@ -1123,6 +1123,10 @@ func (s *Server) route(m *Message) {
 			} else {
 				log.Info("unable to send message to %v: %v", uuid, err)
 			}
+		} else if m.Type == MESSAGE_COMMAND {
+			for id := range m.Commands {
+				s.commands[id].Issued++
+			}
 		}
 	}
 
