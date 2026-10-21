@@ -1,0 +1,21 @@
+#!/bin/sh
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+# Run miniccc over the virtio-serial "cc" port. VMs launched with
+# "vm config backchannel false" have no such port, so idle instead of letting
+# init respawn this script in a tight loop.
+if [ ! -e /dev/virtio-ports/cc ]; then
+	exec sleep 2147483647
+fi
+
+# On routers, "router commit" arrives over cc as soon as miniccc connects and
+# runs "minirouter -u", which needs the minirouter daemon's socket. Wait for
+# it so the first commit is not lost.
+if grep -q 'live.role=router' /proc/cmdline; then
+	i=0
+	while [ ! -S /tmp/minirouter/minirouter ] && [ $i -lt 60 ]; do
+		sleep 0.5
+		i=$((i + 1))
+	done
+fi
+
+exec /usr/bin/miniccc -v=false -serial /dev/virtio-ports/cc -logfile /var/log/miniccc.log
