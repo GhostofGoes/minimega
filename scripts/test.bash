@@ -15,7 +15,13 @@ echo "TESTING"
 for i in ${DIRECTORY_ARRAY[@]}; do
     for j in `ls $i | grep -v plumbing`
     do
-        go test $i/$j
+        flags=""
+        # Check the main daemon for data races
+        if [[ "$i/$j" == "$ROOT_DIR/cmd/minimega" ]]; then
+            flags="-race"
+        fi
+
+        go test $flags $i/$j
         if [[ $? != 0 ]]; then
             exit 1
         fi
