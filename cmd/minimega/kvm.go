@@ -966,7 +966,7 @@ func (vm *KvmVM) createBonds() error {
 	for i := range vm.Bonds {
 		bond := &vm.Bonds[i]
 
-		if bond.created {
+		if bond.Created {
 			// bond has already been created, don't need to do it again
 			continue
 		}
@@ -974,8 +974,6 @@ func (vm *KvmVM) createBonds() error {
 		if err := vm.addBond(bond); err != nil {
 			return vm.setErrorf("unable to reate bond %v: %v", i, err)
 		}
-
-		bond.created = true
 	}
 
 	if len(vm.Bonds) > 0 {
