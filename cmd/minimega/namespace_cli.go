@@ -227,6 +227,9 @@ func cliNamespaceAddHost(ns *Namespace, c *minicli.Command, resp *minicli.Respon
 		peers[peer] = true
 	}
 
+	ns.configLock.Lock()
+	defer ns.configLock.Unlock()
+
 	// Test that the host is actually in the mesh. If it's not, we could
 	// try to mesh dial it... Returning an error is simpler, for now.
 	for i := range hosts {
@@ -264,6 +267,9 @@ func cliNamespaceDelHost(ns *Namespace, c *minicli.Command, resp *minicli.Respon
 		return fmt.Errorf("invalid hosts -- %v", err)
 	}
 
+	ns.configLock.Lock()
+	defer ns.configLock.Unlock()
+
 	for _, host := range hosts {
 		if host == Wildcard {
 			ns.Hosts = map[string]bool{}
@@ -297,7 +303,7 @@ func cliNamespaceLoad(ns *Namespace, c *minicli.Command, resp *minicli.Response)
 func cliNamespaceQueue(ns *Namespace, c *minicli.Command, resp *minicli.Response) error {
 	var buf bytes.Buffer
 
-	for _, q := range ns.queue {
+	for _, q := range ns.queued() {
 		var names []string
 		for _, n := range q.Names {
 			if n != "" {
@@ -324,7 +330,7 @@ func cliNamespaceQueueing(ns *Namespace, c *minicli.Command, resp *minicli.Respo
 	if c.BoolArgs["true"] || c.BoolArgs["false"] {
 		ns.QueueVMs = c.BoolArgs["true"]
 
-		if len(ns.queue) > 0 {
+		if len(ns.queued()) > 0 {
 			log.Warn("queueing behavior changed when VMs already queued")
 		}
 	} else {
@@ -335,6 +341,9 @@ func cliNamespaceQueueing(ns *Namespace, c *minicli.Command, resp *minicli.Respo
 }
 
 func cliNamespaceFlush(ns *Namespace, c *minicli.Command, resp *minicli.Response) error {
+	ns.configLock.Lock()
+	defer ns.configLock.Unlock()
+
 	ns.queue = nil
 	return nil
 }
