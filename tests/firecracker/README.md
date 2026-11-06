@@ -20,6 +20,26 @@ their SHA-256 sums. It also builds the minimal guest root image with
 When a test fails, the workflow uploads the minimega log and the VM logs as an
 artifact.
 
+## Memory dump and save checks
+
+Check 10a of `smoke.sh` writes an ELF memory dump of `fc3` with
+`vm memory-dump`. It polls `vm memory-dump` until the dump is `completed`.
+Then it makes sure that `readelf -l` shows at least one `LOAD` segment and
+that the file is not smaller than the 256 MiB of guest memory.
+
+Check 10b saves `fc1` with `vm save fc1 fc1snap` and polls `vm save` until the
+save is `completed`. It makes sure of these items:
+
+- The files directory has `fc1snap.state`, `fc1snap.mem`, `fc1snap.hdd`, and
+  `fc1snap.json`, and `fc1snap.json` has `"vm_type": "firecracker"`.
+- `fc1` is `PAUSED` after the save, as a KVM VM is after `vm save`.
+
+Then the check kills and flushes `fc1`. It launches `fcr` with the
+configuration of `fc1`, `vm config disk <files>/fc1snap.hdd`, and
+`vm config firecracker-snapshot <files>/fc1snap`, and starts it. `fcr` must
+be `RUNNING`, answer ping at the address of `fc1` in 30 seconds, and be a cc
+client in 90 seconds. The test removes the `fc1snap` files at the end.
+
 ## Shared read-only root check
 
 Check 14 of `smoke.sh` boots 10 VMs, `ro1` to `ro10`, from the minimal guest
@@ -64,7 +84,7 @@ create taps, network namespaces, loop devices, and device-mapper targets.
    ```bash
    sudo apt-get install build-essential dnsmasq iproute2 isc-dhcp-client libpcap-dev \
      ntfs-3g openssh-client openvswitch-switch qemu-kvm qemu-utils squashfs-tools \
-     e2fsprogs xfsprogs acl dmsetup fdisk iputils-ping
+     e2fsprogs xfsprogs acl dmsetup fdisk iputils-ping binutils
    ```
 
 2. Install `firecracker` and `jailer` v1.17.0 as `/usr/local/bin/firecracker`
@@ -110,6 +130,7 @@ create taps, network namespaces, loop devices, and device-mapper targets.
 
 The checks use VLAN `LAN`, the host tap `mmfc_host`, and the addresses in
 `172.16.0.0/28` and `172.16.1.0/26`. The cc checks put one file in the minimega files
-directory (`<base>/files`) and remove it at the end. Use a minimega instance
+directory (`<base>/files`), and check 10b puts the `fc1snap` files there. The
+test removes them at the end. Use a minimega instance
 that has no other VMs. To use other paths, set `MM`, `MM_BASE`, `MM_LOG`,
 `MM_FILES`, `FC_DIR`, and `MINIMAL`.

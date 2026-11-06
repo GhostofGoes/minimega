@@ -73,6 +73,9 @@ INJECT_MNT=""
 CC_SEND_NAME="minifire-cc-$$"
 CC_SEND_SRC=""
 
+# The path prefix of the vm save of fc1, in the minimega files directory.
+SNAP=""
+
 fail() {
 	echo "FAIL: $*" >&2
 	exit 1
@@ -94,6 +97,9 @@ cleanup() {
 	fi
 	if [[ -n "$CC_SEND_SRC" ]]; then
 		rm -f "$CC_SEND_SRC" || true
+	fi
+	if [[ -n "$SNAP" ]]; then
+		rm -f "${SNAP}.state" "${SNAP}.mem" "${SNAP}.hdd" "${SNAP}.json" || true
 	fi
 
 	if [[ $rc -ne 0 ]]; then
@@ -347,6 +353,23 @@ kill_flush_all() {
 	wait_for 30 "vm info has no VMs" no_vms
 }
 
+# job_status prints the status of VM $2 in the progress table of command $1,
+# "vm save" or "vm memory-dump" with no arguments.
+job_status() {
+	mm ".annotate false .headers false .csv true .columns name,status $1" | awk -F, -v n="$2" '$1 == n {print $2}' | tr -d '[:space:]'
+}
+
+# job_completed returns 0 when the job of VM $2 in command $1 is completed, and
+# fails the test when it failed.
+job_completed() {
+	local s
+	s="$(job_status "$1" "$2")"
+	if [[ "$s" == failed ]]; then
+		fail "$1 of $2 failed"
+	fi
+	[[ "$s" == completed ]]
+}
+
 case "$FS" in
 xfs | ext4) ;;
 *) fail "set FS to xfs or ext4" ;;
@@ -589,6 +612,59 @@ INJECT_LOOP=""
 mm "clear vm config inject"
 mm "vm flush"
 wait_for 30 "fc4 is flushed" vm_absent fc4
+
+# ---------------------------------------------------------------------------
+step "10a. memory dump of fc3"
+
+command -v readelf >/dev/null || fail "readelf is missing: install binutils"
+dump="${TMP}/fc3.elf"
+mm "vm memory-dump fc3 ${dump}"
+wait_for 120 "the memory dump of fc3 is completed" job_completed "vm memory-dump" fc3
+mm "vm memory-dump"
+readelf -l -W "$dump" >"${TMP}/fc3.readelf"
+loads="$(grep -c '^ *LOAD ' "${TMP}/fc3.readelf" || true)"
+((loads >= 1)) || fail "${dump} has no LOAD segment"
+dump_size="$(stat -c %s "$dump")"
+((dump_size >= 256 << 20)) || fail "${dump} is ${dump_size} bytes, less than the 256 MiB of fc3"
+echo "${dump} has ${loads} LOAD segments and ${dump_size} bytes"
+wait_state fc3 RUNNING 10
+rm -f "$dump"
+
+# ---------------------------------------------------------------------------
+step "10b. save fc1 and restore it as fcr"
+
+SNAP="${MM_FILES}/fc1snap"
+mm "vm save fc1 fc1snap"
+wait_for 300 "vm save of fc1 is completed" job_completed "vm save" fc1
+mm "vm save"
+for ext in state mem hdd json; do
+	[[ -s "${SNAP}.${ext}" ]] || fail "${SNAP}.${ext} is missing or empty"
+done
+grep -qF '"vm_type": "firecracker"' "${SNAP}.json" || fail "${SNAP}.json does not have \"vm_type\": \"firecracker\""
+state_is fc1 PAUSED || fail "fc1 is $(vm_field fc1 state) after vm save, not PAUSED"
+echo "vm save wrote ${SNAP}.state, .mem, .hdd, and .json, and fc1 is PAUSED"
+
+mm "vm kill fc1"
+wait_state fc1 QUIT 30
+mm "vm flush fc1"
+wait_for 30 "fc1 is flushed" vm_absent fc1
+
+base_config
+mm "vm config disk ${SNAP}.hdd"
+mm "vm config backchannel true"
+mm "vm config net ${VLAN},$(guest_mac 1)"
+mm "vm config firecracker-snapshot ${SNAP}"
+mm "vm launch firecracker fcr"
+wait_state fcr BUILDING 120
+mm "vm start fcr"
+wait_state fcr RUNNING 30
+wait_for 30 "restored fcr answers ping at $(guest_ip 1)" ping_ok "$(guest_ip 1)"
+echo "restored fcr answers at $(guest_ip 1)"
+fcr_uuid="$(vm_field fcr uuid)"
+[[ -n "$fcr_uuid" ]] || fail "no UUID for fcr"
+wait_for 90 "restored fcr (${fcr_uuid}) is a cc client" cc_has_client "$fcr_uuid"
+echo "restored fcr is a cc client"
+mm "clear vm config firecracker-snapshot"
 
 # ---------------------------------------------------------------------------
 step "11. launch and start 20 VMs"

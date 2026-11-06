@@ -706,9 +706,9 @@ func (n *Namespace) processVMBonds(vals []string) error {
 }
 
 // Save creates a restorable namespace launch script and saves runtime state for
-// VM types that support minimega save semantics. KVM VMs have state and disk
-// files saved. Container, Android, and Firecracker VMs are saved as
-// configuration only.
+// VM types that support minimega save semantics. KVM VMs, and Firecracker VMs
+// that are running or paused, have state and disk files saved. Container and
+// Android VMs, and other Firecracker VMs, are saved as configuration only.
 // Android Emulator runtime state, AVD data changes, and guest-side network
 // configuration are not captured. If dir is not an absolute path, it will be a
 // subdirectory of iomBase.
@@ -812,6 +812,18 @@ func (n *Namespace) Save(dir string) error {
 			fmt.Fprintf(f, "vm config disks %s\n", diskConfigs.String())
 
 			fmt.Fprintf(f, "vm launch %v %q\n\n", vm.GetType(), vm.GetName())
+		} else if vm.GetType() == FIRECRACKER && vm.GetState()&(VM_RUNNING|VM_PAUSED) != 0 {
+			vmDst := filepath.Join(dir, vm.GetName())
+			cmd = minicli.MustCompilef("vm save %q %v", vm.GetName(), vmDst)
+			cmd.Record = false
+
+			if err := consume(runCommands(cmd)); err != nil {
+				return err
+			}
+
+			if err := writeFirecrackerRestore(f, vm, vmDst, useIOM); err != nil {
+				return err
+			}
 		} else if err := saveVMConfigOnly(f, vm); err != nil {
 			return err
 		}
@@ -833,7 +845,8 @@ func (n *Namespace) Save(dir string) error {
 }
 
 // saveVMConfigOnly writes the launch commands for a VM that namespace save
-// saves as configuration only: container, Android, and Firecracker VMs.
+// saves as configuration only: container, Android, and Firecracker VMs that
+// are not running or paused.
 func saveVMConfigOnly(f io.Writer, vm VM) error {
 	switch vm.GetType() {
 	case CONTAINER:

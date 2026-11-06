@@ -298,13 +298,25 @@ func (c *fcClient) PatchVMState(state string) error {
 	return c.do(context.Background(), http.MethodPatch, "/vm", fcVMState{State: state}, nil)
 }
 
-// CreateSnapshot writes a full snapshot of a paused VM. The deadline of ctx
-// applies, else the client timeout.
+// CreateSnapshot writes a full snapshot of a paused VM and does not wait for
+// the host to sync the files to disk. The deadline of ctx applies, else the
+// client timeout.
 func (c *fcClient) CreateSnapshot(ctx context.Context, statePath, memPath string) error {
+	return c.createSnapshot(ctx, statePath, memPath, false)
+}
+
+// CreateSnapshotSync is CreateSnapshot, but Firecracker syncs the state and
+// memory files to disk before it returns.
+func (c *fcClient) CreateSnapshotSync(ctx context.Context, statePath, memPath string) error {
+	return c.createSnapshot(ctx, statePath, memPath, true)
+}
+
+func (c *fcClient) createSnapshot(ctx context.Context, statePath, memPath string, sync bool) error {
 	return c.do(ctx, http.MethodPut, "/snapshot/create", fcSnapshotCreate{
-		SnapshotType: "Full",
-		SnapshotPath: statePath,
-		MemFilePath:  memPath,
+		SnapshotType:      "Full",
+		SnapshotPath:      statePath,
+		MemFilePath:       memPath,
+		SyncSnapshotFiles: sync,
 	}, nil)
 }
 

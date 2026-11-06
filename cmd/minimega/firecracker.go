@@ -118,8 +118,28 @@ type FirecrackerConfig struct {
 	VsockCID uint64 `config:"vsock-cid" validate:"validVsockCID"`
 
 	// Set the path prefix of a Firecracker snapshot that vm save wrote. When
-	// set, vm launch restores the VM from the snapshot instead of a cold
-	// boot.
+	// set, vm launch loads <prefix>.state and <prefix>.mem in place of a
+	// boot, and vm start resumes the VM. A relative prefix is relative to the
+	// files directory (-filepath).
+	//
+	// The configuration must match <prefix>.json: the same vCPUs, memory,
+	// disks, ro disks, scratch disk, NICs, backchannel, entropy device, and
+	// PCI setting. Set vm config disk to <prefix>.hdd, the disk that vm save
+	// wrote with the snapshot. The VM gets the NIC MACs of the snapshot. A
+	// scratch disk gets the content of <prefix>.scratch.
+	//
+	// minimega restores a snapshot only on the same kind of host (the same
+	// CPU model and host kernel) and with a Firecracker version that loads
+	// its snapshot format version. A Firecracker upgrade usually changes the
+	// format version. Keep vm config kernel set: when the guest reboots, the
+	// VM boots its disk with that kernel and does not load the snapshot again.
+	//
+	// After a restore, guest TCP sessions with other nodes break, vsock
+	// connections reset, and the guest clock is behind until the guest sets
+	// it, for example with NTP. minimega does not set the clock_realtime
+	// option of the load. All restores of one snapshot have the same MACs,
+	// addresses, and memory, so do not run two of them on one VLAN. A source
+	// VM that resumes after vm save also shares that state.
 	//
 	// Note: this configuration only applies to Firecracker-based VMs.
 	FirecrackerSnapshotPath string `config:"firecracker-snapshot" path:"false"`
@@ -154,13 +174,23 @@ type FirecrackerVM struct {
 	netns     *bridge.Netns
 	mtus      []int
 	exportSeq int
+	snapACLs  []string // snapshot files with an ACL entry for the VM uid
 
-	// Objects of the current VMM.
+	// restoring is the snapshot that the current launch loads. restored is
+	// true after a launch loaded firecracker-snapshot, so later launches
+	// boot the disk.
+	restoring *fcRestore
+	restored  bool
+
+	// Objects of the current VMM. loaded is true while the VMM holds a
+	// loaded snapshot that vm start did not resume yet.
+	fcBin   string
 	jail    fcJail
 	console *fcConsole
 	vmmLog  *fcConsole
 	vmm     *fcProcess
 	client  *fcClient
+	loaded  bool
 	gen     int // changes at each launch and at flush
 
 	// cc is the ron server from Connect. ccPath is the cc listener of the
@@ -257,6 +287,7 @@ func (vm *FirecrackerVM) Copy() VM {
 	vm2.FirecrackerConfig = vm.FirecrackerConfig.Copy()
 	vm2.disks = append([]fcDisk(nil), vm.disks...)
 	vm2.mtus = append([]int(nil), vm.mtus...)
+	vm2.snapACLs = append([]string(nil), vm.snapACLs...)
 
 	return vm2
 }
@@ -369,9 +400,6 @@ func (vm *FirecrackerVM) launch() error {
 	if err != nil {
 		return vm.setErrorf("%v", err)
 	}
-	if vm.FirecrackerSnapshotPath != "" {
-		return vm.setErrorf("restore from firecracker-snapshot is not supported yet")
-	}
 	if len(vm.Injects) > 0 && len(vm.Disks) == 0 {
 		return vm.setErrorf("vm config inject needs a disk")
 	}
@@ -379,6 +407,17 @@ func (vm *FirecrackerVM) launch() error {
 	fcBin, jailerBin, err := fcCheckHost(vm.FirecrackerPath, vm.JailerPath)
 	if err != nil {
 		return vm.setErrorf("%v", err)
+	}
+	vm.fcBin = fcBin
+
+	if vm.FirecrackerSnapshotPath != "" && !vm.restored {
+		r, err := vm.checkRestore(cfg, fcBin)
+		if err != nil {
+			return vm.setErrorf("%v", err)
+		}
+
+		vm.restoring = r
+		defer func() { vm.restoring = nil }()
 	}
 
 	if fcIsBeaconName(vm.Name) {
@@ -391,6 +430,11 @@ func (vm *FirecrackerVM) launch() error {
 
 	if err := vm.startVMM(cfg, fcBin, jailerBin); err != nil {
 		return vm.setErrorf("%v", err)
+	}
+
+	if vm.restoring != nil {
+		log.Info("vm %v: loaded snapshot %v; vm start resumes it", vm.ID, vm.restoring.prefix)
+		vm.restored = true
 	}
 
 	return nil
@@ -473,7 +517,8 @@ func (vm *FirecrackerVM) prepare() error {
 }
 
 // prepareDisks creates the disks that are not there yet, then the scratch
-// disk as the last disk, and applies the injects to disk 0 once.
+// disk as the last disk, and applies the injects to disk 0 once. A restore
+// gets the scratch disk of its snapshot.
 func (vm *FirecrackerVM) prepareDisks() error {
 	dir := fcInstanceDir(vm.ID)
 	uid := fcVMUID(vm.ID)
@@ -491,7 +536,12 @@ func (vm *FirecrackerVM) prepareDisks() error {
 		return fmt.Errorf("firecracker-scratch: %v", err)
 	}
 	if size > 0 && len(vm.disks) == len(vm.Disks) {
-		d, err := fcPrepareScratch(dir, size, uid)
+		var d fcDisk
+		if vm.restoring != nil && vm.restoring.scratch != "" {
+			d, err = fcRestoreScratch(dir, vm.restoring.scratch, uid)
+		} else {
+			d, err = fcPrepareScratch(dir, size, uid)
+		}
 		if err != nil {
 			return err
 		}
@@ -512,11 +562,13 @@ func (vm *FirecrackerVM) prepareDisks() error {
 }
 
 // startVMM builds a new jail, starts the jailer in it, and configures the
-// VMM over its API socket.
+// VMM over its API socket. For a restore, the VMM loads the snapshot in place
+// of the boot configuration.
 func (vm *FirecrackerVM) startVMM(cfg VMConfig, fcBin, jailerBin string) error {
 	vm.stopVMM()
 	vm.stopConsole()
 	vm.stopCCListener()
+	vm.loaded = false
 
 	vm.gen++
 	gen := vm.gen
@@ -567,6 +619,17 @@ func (vm *FirecrackerVM) startVMM(cfg VMConfig, fcBin, jailerBin string) error {
 	if vm.initrd.path != "" {
 		if _, err := j.Link(vm.initrd.path, "/initrd"); err != nil {
 			return fail(err)
+		}
+	}
+
+	if r := vm.restoring; r != nil {
+		if err := vm.grantSnapshotRead(r); err != nil {
+			return fail(err)
+		}
+		for _, l := range [][2]string{{r.state, fcRestoreState}, {r.mem, fcRestoreMem}} {
+			if _, err := j.Link(l[0], l[1]); err != nil {
+				return fail(err)
+			}
 		}
 	}
 
@@ -658,12 +721,18 @@ func (vm *FirecrackerVM) startVMM(cfg VMConfig, fcBin, jailerBin string) error {
 		return err
 	}
 
-	if err := vm.configure(c, bootArgs, rootIndex); err != nil {
+	if vm.restoring != nil {
+		err = vm.configureRestore(c, vm.restoring)
+	} else {
+		err = vm.configure(c, bootArgs, rootIndex)
+	}
+	if err != nil {
 		vm.stopVMM()
 		return err
 	}
 
 	vm.client = c
+	vm.loaded = vm.restoring != nil
 	vm.waitToKill(p, vm.kill)
 
 	return nil
@@ -911,6 +980,19 @@ func (vm *FirecrackerVM) Start() error {
 		return vm.setErrorf("unable to start: no firecracker VMM")
 	}
 
+	// A loaded snapshot is paused, and InstanceStart is only for a boot.
+	if vm.loaded {
+		log.Info("resuming restored VM: %v", vm.ID)
+		if err := vm.client.PatchVMState("Resumed"); err != nil {
+			vm.stopVMM()
+			return vm.setErrorf("unable to resume: %v", err)
+		}
+
+		vm.loaded = false
+		vm.setState(VM_RUNNING)
+		return nil
+	}
+
 	log.Info("starting VM: %v", vm.ID)
 	if err := vm.client.Action("InstanceStart"); err != nil {
 		vm.stopVMM()
@@ -965,6 +1047,8 @@ func (vm *FirecrackerVM) Flush() error {
 	}
 	vm.disks, vm.stale = nil, nil
 
+	vm.revokeSnapshotRead()
+
 	for _, f := range []fcCachedFile{vm.kernel, vm.initrd} {
 		if f.key != "" {
 			fcCache.removeUser(f.key, vm.ID)
@@ -996,6 +1080,7 @@ func (vm *FirecrackerVM) Flush() error {
 	vm.dirReady = false
 
 	fcExports.remove(vm.ID)
+	fcSaves.remove(vm.ID)
 
 	return vm.BaseVM.Flush()
 }

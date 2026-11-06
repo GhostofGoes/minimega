@@ -606,8 +606,28 @@ Default: 3
 	{
 		HelpShort: "configures firecracker-snapshot",
 		HelpLong: `Set the path prefix of a Firecracker snapshot that vm save wrote. When
-set, vm launch restores the VM from the snapshot instead of a cold
-boot.
+set, vm launch loads <prefix>.state and <prefix>.mem in place of a
+boot, and vm start resumes the VM. A relative prefix is relative to the
+files directory (-filepath).
+
+The configuration must match <prefix>.json: the same vCPUs, memory,
+disks, ro disks, scratch disk, NICs, backchannel, entropy device, and
+PCI setting. Set vm config disk to <prefix>.hdd, the disk that vm save
+wrote with the snapshot. The VM gets the NIC MACs of the snapshot. A
+scratch disk gets the content of <prefix>.scratch.
+
+minimega restores a snapshot only on the same kind of host (the same
+CPU model and host kernel) and with a Firecracker version that loads
+its snapshot format version. A Firecracker upgrade usually changes the
+format version. Keep vm config kernel set: when the guest reboots, the
+VM boots its disk with that kernel and does not load the snapshot again.
+
+After a restore, guest TCP sessions with other nodes break, vsock
+connections reset, and the guest clock is behind until the guest sets
+it, for example with NTP. minimega does not set the clock_realtime
+option of the load. All restores of one snapshot have the same MACs,
+addresses, and memory, so do not run two of them on one VLAN. A source
+VM that resumes after vm save also shares that state.
 
 Note: this configuration only applies to Firecracker-based VMs.
 `,

@@ -14,6 +14,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -452,11 +453,35 @@ status of in-flight saves by invoking 'vm save' with no arguments.
 
 Note: This will overwrite any prior saved files.
 
-Note: vm save is currently supported for KVM VMs only. Android VM save is not
+For a Firecracker VM, the VM must be in the running or paused state. minimega
+pauses the VM, Firecracker writes a full snapshot, and minimega copies the
+writable disks. The VM stays paused, as a KVM VM does after vm save. Use "vm
+start" to resume it. minimega then writes these files in the background, each
+to a temporary name that it renames into place:
+
+- <filename>.state: the Firecracker state file
+- <filename>.mem: the guest memory, as large as the memory of the VM
+- <filename>.hdd: disk 0, raw. Other writable disks go to <filename>.hdd<N>,
+  and the scratch disk goes to <filename>.scratch.
+- <filename>.json: the VM type, the Firecracker and snapshot format versions,
+  the host CPU model and kernel, the vCPUs, the memory, the devices, the NIC
+  MACs, and the memory regions. minimega writes it last.
+
+minimega does not copy a disk with option ro. <filename>.json records its
+path. The snapshot resets the vsock connections of the guest, so cc commands,
+file transfers, and tunnels in progress fail.
+
+To restore a Firecracker VM, use the same vm config as the saved VM, set "vm
+config firecracker-snapshot <filename>" and "vm config disk <filename>.hdd",
+and then use "vm launch firecracker". See "vm config firecracker-snapshot" for
+the limits. A KVM VM cannot load a Firecracker snapshot, and a Firecracker VM
+cannot load a KVM snapshot.
+
+Note: vm save is supported for KVM and Firecracker VMs. Android VM save is not
 supported because Android Emulator snapshot/AVD state is managed separately
 from minimega's KVM migration state. For other VM types, vm save returns the
-error "vm save is not supported for <type> VMs". The old names vm snapshot and
-vm migrate do the same as vm save.`,
+error "vm save is not supported for "<name>" (type <type>)". The old names vm
+snapshot and vm migrate do the same as vm save.`,
 		Patterns: []string{
 			"vm save",
 			"vm save <vm name>",
@@ -1116,6 +1141,15 @@ func cliVMSave(ns *Namespace, c *minicli.Command, resp *minicli.Response) error 
 				fmt.Sprintf("%.2f", complete)})
 		}
 
+		if rows := fcSaves.table(ns.Name); len(rows) > 0 {
+			resp.Tabular = append(resp.Tabular, rows...)
+			sort.SliceStable(resp.Tabular, func(i, j int) bool {
+				a, _ := strconv.Atoi(resp.Tabular[i][0])
+				b, _ := strconv.Atoi(resp.Tabular[j][0])
+				return a < b
+			})
+		}
+
 		return nil
 	}
 
@@ -1129,7 +1163,7 @@ func cliVMSave(ns *Namespace, c *minicli.Command, resp *minicli.Response) error 
 	vm, isKVM := found.(*KvmVM)
 	saver, isSaver := found.(vmSaver)
 	if !isKVM && !isSaver {
-		return fmt.Errorf("vm save is not supported for %v VMs", found.GetType())
+		return fmt.Errorf("vm save is not supported for %q (type %v)", found.GetName(), found.GetType())
 	}
 
 	fname := c.StringArgs["filename"]

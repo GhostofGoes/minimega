@@ -497,8 +497,8 @@ func TestFCDriverErrors(t *testing.T) {
 		cfg.FirecrackerSnapshotPath = "/snap/vm"
 		vm := f.newVM(t, cfg)
 
-		if err := vm.Launch(); err == nil || !strings.Contains(err.Error(), "not supported yet") {
-			t.Fatalf("Launch() = %v, want not supported", err)
+		if err := vm.Launch(); err == nil || !strings.Contains(err.Error(), "/snap/vm.json does not exist") {
+			t.Fatalf("Launch() = %v, want missing sidecar error", err)
 		}
 		if err := vm.Flush(); err != nil {
 			t.Fatalf("Flush() = %v", err)

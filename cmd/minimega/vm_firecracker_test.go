@@ -222,7 +222,6 @@ func TestFCUnsupportedCommands(t *testing.T) {
 		cmd  *minicli.Command
 		want string
 	}{
-		{"vm save", cliVMSave, cmdArgs(map[string]string{"vm": "fc1"}), "vm save is not supported for firecracker VMs"},
 		{"vm cdrom eject", cliVMCdrom, cmdArgs(map[string]string{"vm": "fc1"}, "eject"), "vm cdrom is not supported for firecracker VMs"},
 		{"vm cdrom change", cliVMCdrom, cmdArgs(map[string]string{"vm": "fc1", "path": file}, "change"), "vm cdrom is not supported for firecracker VMs"},
 		{"vm hotplug add", cliVMHotplug, cmdArgs(map[string]string{"vm": "fc1", "filename": file}, "add"), "vm hotplug is not supported for firecracker VMs"},
@@ -260,6 +259,18 @@ func TestFCUnsupportedCommands(t *testing.T) {
 		if err := tc.fn(ns, tc.cmd, &minicli.Response{}); err != nil {
 			t.Errorf("%v = %v, want nil", tc.name, err)
 		}
+	}
+}
+
+func TestVMSaveUnsupported(t *testing.T) {
+	vm := &ContainerVM{BaseVM: &BaseVM{ID: 9, Name: "c1", Type: CONTAINER, Namespace: DefaultNamespace}}
+	ns := &Namespace{Name: DefaultNamespace}
+	ns.VMs.m = map[int]VM{vm.ID: vm}
+
+	cmd := &minicli.Command{StringArgs: map[string]string{"vm": "c1"}, BoolArgs: map[string]bool{}}
+	want := `vm save is not supported for "c1" (type container)`
+	if err := cliVMSave(ns, cmd, &minicli.Response{}); err == nil || err.Error() != want {
+		t.Errorf("cliVMSave() = %v, want %v", err, want)
 	}
 }
 
