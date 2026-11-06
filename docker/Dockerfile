@@ -38,15 +38,15 @@ COPY --from=gobuilder /minimega/.git ./.git
 RUN python scripts/zensical_build.py build --strict
 
 
-# -- Firecracker download (optional) --
-# To install Firecracker and the jailer: --build-arg FIRECRACKER_VERSION=1.17.0
-# The build then needs network access to github.com. FIRECRACKER_SHA256 is the
-# expected SHA-256 of the release tarball; without it, the build uses the
-# .sha256.txt file of the release.
+# -- Firecracker download --
+# Installs Firecracker and the jailer of FIRECRACKER_VERSION, so the build needs
+# network access to github.com. FIRECRACKER_SHA256 is the expected SHA-256 of the
+# release tarball; when it is empty, the build uses the .sha256.txt file of the
+# release. Change both together. An empty FIRECRACKER_VERSION leaves them out.
 FROM ${BASE_IMAGE} AS fcfetch
 
-ARG FIRECRACKER_VERSION=""
-ARG FIRECRACKER_SHA256=""
+ARG FIRECRACKER_VERSION="1.17.0"
+ARG FIRECRACKER_SHA256="06094a1108ae9e82aa4c23a775aa92758f53f1175d422270d9d6162cb9ade558"
 
 RUN mkdir -p /fc \
   && if [ -n "${FIRECRACKER_VERSION}" ]; then \

@@ -79,15 +79,19 @@ docker compose logs -f  # CTRL+C to stop following logs
 
 # Firecracker VMs
 
-The image includes the tools that Firecracker VMs need at run time (`acl`,
-`dmsetup`, `iproute2`, and `qemu-utils`). To also install Firecracker and the
-jailer, set the `FIRECRACKER_VERSION` build argument. The build then needs
-network access to `github.com`. It checks the SHA-256 of the release tarball
-against `FIRECRACKER_SHA256`, or against the `.sha256.txt` file of the release
-when `FIRECRACKER_SHA256` is empty.
+The image includes Firecracker and the jailer v1.17.0, and the tools that
+Firecracker VMs need at run time (`acl`, `dmsetup`, `iproute2`, and
+`qemu-utils`). The build needs network access to `github.com` to get
+Firecracker. It checks the SHA-256 of the release tarball against the
+`FIRECRACKER_SHA256` build argument, or against the `.sha256.txt` file of the
+release when `FIRECRACKER_SHA256` is empty.
+
+To install a different version, set `FIRECRACKER_VERSION`, and set
+`FIRECRACKER_SHA256` to its SHA-256 or to an empty value. To build the image
+without Firecracker, set `FIRECRACKER_VERSION` to an empty value:
 
 ```bash
-docker build --build-arg FIRECRACKER_VERSION=1.17.0 -t minimega -f docker/Dockerfile .
+docker build --build-arg FIRECRACKER_VERSION= -t minimega -f docker/Dockerfile .
 ```
 
 ## Start the container for many Firecracker VMs
