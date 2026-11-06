@@ -2,8 +2,9 @@
 
 ## Project and scoped guidance
 
-minimega is a Go platform for managing KVM virtual machines, Android emulators,
-Linux containers, networks, and distributed experiments. The root module is
+minimega is a Go platform for managing KVM virtual machines, Firecracker
+microVMs, Android emulators, Linux containers, networks, and distributed
+experiments. The root module is
 `github.com/sandia-minimega/minimega/v2`, requires Go 1.24 or newer, and uses
 vendored dependencies through `GOFLAGS=-mod=vendor`.
 
