@@ -49,12 +49,17 @@ func newFCJail(vmID int, fcBin string) fcJail {
 		Base:     filepath.Join(fcResolve(*f_firecrackerDir), "jail"),
 		ExecName: filepath.Base(fcResolve(fcBin)),
 		ID:       fmt.Sprintf("vm%d", vmID),
-		UID:      int(*f_firecrackerUIDBase) + vmID,
+		UID:      fcVMUID(vmID),
 	}
 	j.GID = j.UID
 	j.Root = filepath.Join(j.Dir(), "root")
 
 	return j
+}
+
+// fcVMUID returns the uid and gid of the VMM of VM vmID.
+func fcVMUID(vmID int) int {
+	return int(*f_firecrackerUIDBase) + vmID
 }
 
 // Dir returns the per-VM jail directory that holds Root.

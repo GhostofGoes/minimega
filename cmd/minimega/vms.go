@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/sandia-minimega/minimega/v2/internal/meshage"
@@ -344,6 +345,7 @@ func (vms *VMs) Launch(requestor, namespace string, q *QueuedVMs) <-chan error {
 		}
 
 		var wg sync.WaitGroup
+		var fcLaunched atomic.Int32
 
 		for _, vm := range reserved {
 			wg.Add(1)
@@ -360,10 +362,18 @@ func (vms *VMs) Launch(requestor, namespace string, q *QueuedVMs) <-chan error {
 					errs <- err
 					return
 				}
+
+				if vm.GetType() == FIRECRACKER {
+					fcLaunched.Add(1)
+				}
 			}(vm)
 		}
 
 		wg.Wait()
+
+		if n := fcLaunched.Load(); n > 0 {
+			log.Info("%v", fcLaunchedMessage(int(n)))
+		}
 
 		stop := time.Now()
 		log.Info("launched %v %v vms in %v", len(q.Names), q.VMType, stop.Sub(start))

@@ -549,10 +549,6 @@ func fcCacheType(cache string) string {
 func fcPrepareDisk(instanceDir string, index int, dc DiskConfig, snapshot bool, vmID, uid int) (d fcDisk, err error) {
 	d = fcDisk{CacheType: fcCacheType(dc.Cache), vmID: vmID}
 
-	if dc.Interface != "" && dc.Interface != "virtio" {
-		log.Warn("firecracker always uses virtio-blk: ignoring interface %v of disk %v", dc.Interface, dc.Path)
-	}
-
 	defer func() {
 		if err != nil {
 			if err2 := fcReleaseDisk(d); err2 != nil {
