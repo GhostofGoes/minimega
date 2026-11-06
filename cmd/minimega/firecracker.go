@@ -127,6 +127,7 @@ type FirecrackerVM struct {
 	initrd     fcCachedFile
 	netnsReady bool
 	mtus       []int
+	exportSeq  int
 
 	// Objects of the current VMM.
 	jail    fcJail
@@ -380,25 +381,10 @@ func (vm *FirecrackerVM) createInstanceDir() error {
 // prepare creates the disks, the boot file cache entries, the netns, and the
 // taps that are not there yet. Flush removes them.
 func (vm *FirecrackerVM) prepare() error {
-	dir := fcInstanceDir(vm.ID)
 	uid := fcVMUID(vm.ID)
 
-	for i := len(vm.disks); i < len(vm.Disks); i++ {
-		d, err := fcPrepareDiskFn(dir, i, vm.Disks[i], vm.Snapshot, vm.ID, uid)
-		if err != nil {
-			return fmt.Errorf("unable to prepare disk %v: %v", i, err)
-		}
-		vm.disks = append(vm.disks, d)
-	}
-
-	if !vm.injected && vm.Snapshot && len(vm.Injects) > 0 {
-		fcLaunchSem.Acquire()
-		err := fcApplyInjectsFn(vm.disks[0].HostPath, vm.Injects)
-		fcLaunchSem.Release()
-		if err != nil {
-			return err
-		}
-		vm.injected = true
+	if err := vm.prepareDisks(); err != nil {
+		return err
 	}
 
 	if vm.kernel.key == "" {
@@ -448,6 +434,33 @@ func (vm *FirecrackerVM) prepare() error {
 		if err := vm.writeTaps(); err != nil {
 			return fmt.Errorf("unable to write taps: %v", err)
 		}
+	}
+
+	return nil
+}
+
+// prepareDisks creates the disks that are not there yet, and applies the
+// injects to disk 0 once.
+func (vm *FirecrackerVM) prepareDisks() error {
+	dir := fcInstanceDir(vm.ID)
+	uid := fcVMUID(vm.ID)
+
+	for i := len(vm.disks); i < len(vm.Disks); i++ {
+		d, err := fcPrepareDiskFn(dir, i, vm.Disks[i], vm.Snapshot, vm.ID, uid)
+		if err != nil {
+			return fmt.Errorf("unable to prepare disk %v: %v", i, err)
+		}
+		vm.disks = append(vm.disks, d)
+	}
+
+	if !vm.injected && vm.Snapshot && len(vm.Injects) > 0 {
+		fcLaunchSem.Acquire()
+		err := fcApplyInjectsFn(vm.disks[0].HostPath, vm.Injects)
+		fcLaunchSem.Release()
+		if err != nil {
+			return err
+		}
+		vm.injected = true
 	}
 
 	return nil
@@ -883,11 +896,13 @@ func (vm *FirecrackerVM) Flush() error {
 		vm.netnsReady = false
 	}
 
-	if vm.dirReady {
-		if err := os.RemoveAll(fcInstanceDir(vm.ID)); err != nil {
-			log.Error("vm %v: remove instance directory: %v", vm.ID, err)
-		}
+	// A failed launch can leave the directory with dirReady false.
+	if err := os.RemoveAll(fcInstanceDir(vm.ID)); err != nil {
+		log.Error("vm %v: remove instance directory: %v", vm.ID, err)
 	}
+	vm.dirReady = false
+
+	fcExports.remove(vm.ID)
 
 	return vm.BaseVM.Flush()
 }

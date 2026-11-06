@@ -462,6 +462,28 @@ func TestFCDriverErrors(t *testing.T) {
 		}
 	})
 
+	t.Run("instance-dir", func(t *testing.T) {
+		f := setupFCDriver(t)
+		vm := f.newVM(t, f.config(t))
+
+		if err := os.MkdirAll(filepath.Dir(vm.instancePath), 0700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(t.TempDir(), vm.instancePath); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := vm.Launch(); err == nil || !strings.Contains(err.Error(), "unable to create VM dir") {
+			t.Fatalf("Launch() = %v, want an instance directory error", err)
+		}
+		if err := vm.Flush(); err != nil {
+			t.Fatalf("Flush() = %v", err)
+		}
+		if _, err := os.Lstat(fcInstanceDir(vm.ID)); !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("instance directory exists after flush: %v", err)
+		}
+	})
+
 	t.Run("restore", func(t *testing.T) {
 		f := setupFCDriver(t)
 		cfg := f.config(t)

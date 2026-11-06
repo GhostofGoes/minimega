@@ -426,6 +426,12 @@ func fcReflinkCopy(src, dst string) error {
 // fcSparseCopy copies src to dst and leaves holes where src has holes or
 // zero blocks.
 func fcSparseCopy(src, dst string) error {
+	return fcSparseCopyProgress(src, dst, nil)
+}
+
+// fcSparseCopyProgress is fcSparseCopy that also accepts a block device as
+// src. When progress is not nil, it gets the percent of src that is copied.
+func fcSparseCopyProgress(src, dst string, progress func(float64)) error {
 	in, err := os.Open(src)
 	if err != nil {
 		return err
@@ -437,13 +443,18 @@ func fcSparseCopy(src, dst string) error {
 		return err
 	}
 	size := fi.Size()
+	if !fi.Mode().IsRegular() {
+		if size, err = in.Seek(0, io.SeekEnd); err != nil {
+			return err
+		}
+	}
 
 	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
 	if err != nil {
 		return err
 	}
 
-	if err := fcCopyData(in, out, size); err != nil {
+	if err := fcCopyData(in, out, size, progress); err != nil {
 		out.Close()
 		return fmt.Errorf("copy %v to %v: %v", src, dst, err)
 	}
@@ -455,8 +466,14 @@ func fcSparseCopy(src, dst string) error {
 	return out.Close()
 }
 
-func fcCopyData(in, out *os.File, size int64) error {
+func fcCopyData(in, out *os.File, size int64, progress func(float64)) error {
 	buf := make([]byte, 64<<10)
+
+	report := func(pos int64) {
+		if progress != nil && size > 0 {
+			progress(float64(pos) * 100 / float64(size))
+		}
+	}
 
 	for off := int64(0); off < size; {
 		data, err := in.Seek(off, unix.SEEK_DATA)
@@ -488,6 +505,7 @@ func fcCopyData(in, out *os.File, size int64) error {
 				}
 			}
 			pos += int64(m)
+			report(pos)
 
 			if err == io.EOF {
 				return nil
@@ -497,6 +515,7 @@ func fcCopyData(in, out *os.File, size int64) error {
 		}
 
 		off = end
+		report(off)
 	}
 
 	return nil
@@ -521,6 +540,7 @@ type fcDisk struct {
 	vmID         int
 	key          string
 	baseAttached bool
+	cowFile      string
 	cowLoop      string
 	dmName       string
 	aclPath      string
@@ -706,6 +726,7 @@ func fcSnapshotDisk(d *fcDisk, instanceDir string, index int) error {
 	if err != nil {
 		return fmt.Errorf("attach %v: %v: %v", cow, strings.TrimSpace(out), err)
 	}
+	d.cowFile = cow
 	d.cowLoop = strings.TrimSpace(out)
 
 	name := fcDMName(d.vmID, index)

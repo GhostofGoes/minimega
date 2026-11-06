@@ -469,6 +469,83 @@ status of in-flight migrations by invoking vm migrate with no arguments.`,
 		Call:    wrapVMTargetCLI(cliVMSave),
 		Suggest: wrapVMSuggest(VM_ANY_STATE, false),
 	},
+	{ // vm shutdown
+		HelpShort: "ask the guest of running VMs to shut down",
+		HelpLong: `
+Ask the guest of one or more running VMs to shut down. See "vm start" for a
+full description of allowable targets.
+
+The command returns immediately. The guest decides when to power off or
+reboot, and it can ignore the request. Use "vm info" to see the VM state.
+
+For KVM VMs, minimega sends the QMP command system_powerdown, which is an ACPI
+power button event.
+
+For Firecracker VMs, minimega sends Ctrl-Alt-Del. Firecracker has no ACPI
+power-off, so the guest reboots. With reboot=k, the reboot stops the VMM and
+the VM goes to the quit state. The guest kernel must have CONFIG_SERIO_I8042
+and CONFIG_KEYBOARD_ATKBD.
+
+Other VM types do not support vm shutdown.`,
+		Patterns: []string{
+			"vm shutdown <vm target>",
+		},
+		Call:    wrapVMTargetCLI(cliVMShutdown),
+		Suggest: wrapVMSuggest(VM_RUNNING, true),
+	},
+	{ // vm reset-disk
+		HelpShort: "build the disks of quit Firecracker VMs again",
+		HelpLong: `
+Build the disks of one or more Firecracker VMs again from their configuration,
+the same way that "vm launch" built them. The VM must be in the quit or error
+state. The next "vm start" boots the new disks. All changes that the guest
+made to its disks are lost. See "vm start" for a full description of allowable
+targets.
+
+If the configuration has "vm config inject" entries, minimega injects the
+files again.
+
+The VM must have snapshot true. With snapshot false, the disk is the shared
+source image, and vm reset-disk returns an error.
+
+Other VM types do not support vm reset-disk.`,
+		Patterns: []string{
+			"vm reset-disk <vm target>",
+		},
+		Call:    wrapVMTargetCLI(cliVMResetDisk),
+		Suggest: wrapVMSuggest(VM_QUIT|VM_ERROR, true),
+	},
+	{ // vm export-disk
+		HelpShort: "write the disk of a Firecracker VM to a file",
+		HelpLong: `
+Write the first disk of a Firecracker VM to a qcow2 or raw image file. The
+default format is qcow2. The VM must be in the running, paused, or quit state.
+
+A relative destination path is relative to the files directory (-filepath).
+minimega creates the parent directories. The destination must not exist.
+
+For a running VM, minimega pauses the VM, takes a fast copy of the disk, and
+resumes the VM. The log shows the pause duration. The result is
+crash-consistent: data that the guest did not write to its disk is not in the
+image.
+
+The command returns after the copy. minimega then writes the image in the
+background. To see the progress of the exports, use vm export-disk with no
+arguments. The output has the same columns and status values as "vm save"
+with no arguments. For qcow2, the complete column is the percent that
+"qemu-img convert -p" reports. For raw, it is the percent of the disk that is
+copied.
+
+Only one export of a VM can run at a time.
+
+Other VM types do not support vm export-disk.`,
+		Patterns: []string{
+			"vm export-disk",
+			"vm export-disk <vm name> <dst> [raw,qcow2]",
+		},
+		Call:    wrapVMTargetCLI(cliVMExportDisk),
+		Suggest: wrapVMSuggest(VM_RUNNING|VM_PAUSED|VM_QUIT, false),
+	},
 	{ // vm cdrom
 		HelpShort: "eject or change an active VM's cdrom",
 		HelpLong: `
@@ -1014,6 +1091,128 @@ func cliVMSave(ns *Namespace, c *minicli.Command, resp *minicli.Response) error 
 	log.Info("Saving state to file %s", state_name)
 
 	return vm.Migrate(state_name)
+}
+
+// vmShutdown asks the guest of vm to shut down.
+func vmShutdown(vm VM) error {
+	switch vm := vm.(type) {
+	case *KvmVM:
+		return vm.Shutdown()
+	case *FirecrackerVM:
+		return vm.Shutdown()
+	}
+
+	return fmt.Errorf("vm shutdown is not supported for %v VMs", vm.GetType())
+}
+
+func cliVMShutdown(ns *Namespace, c *minicli.Command, resp *minicli.Response) error {
+	return ns.VMs.Apply(c.StringArgs["vm"], func(vm VM, wild bool) (bool, error) {
+		if wild {
+			switch vm.(type) {
+			case *KvmVM, *FirecrackerVM:
+			default:
+				return false, nil
+			}
+			if vm.GetState() != VM_RUNNING {
+				return false, nil
+			}
+		}
+
+		return true, vmShutdown(vm)
+	})
+}
+
+func cliVMResetDisk(ns *Namespace, c *minicli.Command, resp *minicli.Response) error {
+	var mu sync.Mutex
+	var targets []*FirecrackerVM
+
+	// Collect the VMs, then reset them without vms.mu, because a reset copies
+	// disks.
+	err := ns.VMs.Apply(c.StringArgs["vm"], func(vm VM, wild bool) (bool, error) {
+		fc, ok := vm.(*FirecrackerVM)
+		if !ok {
+			if wild {
+				return false, nil
+			}
+			return true, fmt.Errorf("vm reset-disk is not supported for %v VMs", vm.GetType())
+		}
+		if wild && vm.GetState()&(VM_QUIT|VM_ERROR) == 0 {
+			return false, nil
+		}
+
+		mu.Lock()
+		defer mu.Unlock()
+		targets = append(targets, fc)
+
+		return true, nil
+	})
+	if err != nil {
+		return err
+	}
+
+	errs := make([]error, len(targets))
+
+	var wg sync.WaitGroup
+	for i, vm := range targets {
+		wg.Add(1)
+		go func(i int, vm *FirecrackerVM) {
+			defer wg.Done()
+			errs[i] = vm.ResetDisk()
+		}(i, vm)
+	}
+	wg.Wait()
+
+	var res []error
+	for _, err := range errs {
+		if err != nil {
+			res = append(res, err)
+		}
+	}
+
+	return makeErrSlice(res)
+}
+
+func cliVMExportDisk(ns *Namespace, c *minicli.Command, resp *minicli.Response) error {
+	target, ok := c.StringArgs["vm"]
+	if !ok {
+		resp.Header = append([]string(nil), fcExportHeader...)
+		resp.Tabular = fcExports.table(ns.Name)
+		return nil
+	}
+
+	found := ns.FindVM(target)
+	if found == nil {
+		return vmNotFound(target)
+	}
+
+	vm, ok := found.(*FirecrackerVM)
+	if !ok {
+		return fmt.Errorf("vm export-disk is not supported for %v VMs", found.GetType())
+	}
+
+	format := "qcow2"
+	if c.BoolArgs["raw"] {
+		format = "raw"
+	}
+
+	dst := c.StringArgs["dst"]
+	if !filepath.IsAbs(dst) {
+		dst = filepath.Join(*f_iomBase, dst)
+	}
+
+	if _, err := os.Lstat(dst); err == nil {
+		return fmt.Errorf("%v already exists", dst)
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+
+	if err := os.MkdirAll(filepath.Dir(dst), 0755); err != nil {
+		return err
+	}
+
+	log.Info("exporting disk of VM %v to %v as %v", vm.GetID(), dst, format)
+
+	return vm.ExportDisk(dst, format)
 }
 
 func cliVMHotplug(ns *Namespace, c *minicli.Command, resp *minicli.Response) error {
