@@ -196,8 +196,9 @@ func (vm *FirecrackerVM) ResetDisk() error {
 		return fmt.Errorf("vm %v has no instance directory", vm.Name)
 	}
 
-	fcLaunchGate.Acquire()
-	defer fcLaunchGate.Release()
+	disk := fcGetStages().disk
+	disk.acquire()
+	defer disk.release()
 
 	// A VMM can stay alive in ERROR, for example after a failed resume.
 	vm.stopVMM()

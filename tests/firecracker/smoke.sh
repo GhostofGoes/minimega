@@ -832,6 +832,116 @@ for i in $(seq 1 "$RO_VMS"); do
 done
 echo "check 14 took $((SECONDS - ro_start))s"
 
+# ---------------------------------------------------------------------------
+step "15. launch rate"
+
+# now prints the time in seconds, with nanoseconds.
+now() {
+	date +%s.%N
+}
+
+# since prints the seconds from time $1 to now, with one decimal.
+since() {
+	awk -v a="$1" -v b="$(now)" 'BEGIN { printf "%.1f", b - a }'
+}
+
+# count_state prints the number of VMs named $1<number> that are in state $2.
+count_state() {
+	mm ".annotate false .headers false .csv true .columns name,state vm info" | grep -c "^$1[0-9]*,$2" || true
+}
+
+# ready_count prints the number of VMs in file $1, one VM ID on each line,
+# whose console log shows 'init: ready'.
+ready_count() {
+	local n=0 id
+	while read -r id; do
+		if grep -qs 'init: ready' "${FC_DIR}/vm/${id}/console.log"; then
+			n=$((n + 1))
+		fi
+	done <"$1"
+	echo "$n"
+}
+
+# rate_run launches VMs $1[1-$2] with the current vm config in the
+# background and starts them while they launch. It waits until all are
+# RUNNING and each console log shows 'init: ready', then prints the minifire
+# timing line and the launch rate.
+rate_run() {
+	local prefix=$1 n=$2
+	local log_start t0 deadline launch_pid launch_s running_s ready_s ids line
+
+	log_start=$(($(wc -l <"$MM_LOG") + 1))
+	t0="$(now)"
+	deadline=$((SECONDS + RATE_TIMEOUT))
+
+	"$MM" -base "$MM_BASE" -e "vm launch firecracker ${prefix}[1-${n}]" >"${TMP}/${prefix}.out" 2>&1 &
+	launch_pid=$!
+	while kill -0 "$launch_pid" 2>/dev/null; do
+		((SECONDS < deadline)) || fail "vm launch firecracker ${prefix}[1-${n}] did not end in ${RATE_TIMEOUT}s"
+		mm "vm start all" >/dev/null
+		sleep 1
+	done
+	if ! wait "$launch_pid"; then
+		cat "${TMP}/${prefix}.out" >&2
+		fail "vm launch firecracker ${prefix}[1-${n}] did not exit 0"
+	fi
+	launch_s="$(since "$t0")"
+	if grep -q 'Error (' "${TMP}/${prefix}.out"; then
+		cat "${TMP}/${prefix}.out" >&2
+		fail "vm launch firecracker ${prefix}[1-${n}] failed"
+	fi
+	mm "vm start all"
+
+	until [[ "$(count_state "$prefix" RUNNING)" -eq "$n" ]]; do
+		if ((SECONDS >= deadline)); then
+			mm ".columns name,state,tags vm info" >&2 || true
+			fail "not all ${n} ${prefix} VMs are RUNNING after ${RATE_TIMEOUT}s"
+		fi
+		sleep 0.5
+	done
+	running_s="$(since "$t0")"
+
+	ids="${TMP}/${prefix}.ids"
+	mm ".annotate false .headers false .csv true .columns id,name vm info" |
+		awk -F, -v p="$prefix" '$2 ~ "^" p "[0-9]+$" {print $1}' >"$ids"
+	[[ "$(grep -c . "$ids")" -eq "$n" ]] || fail "vm info has $(grep -c . "$ids") ${prefix} VMs, not ${n}"
+	until [[ "$(ready_count "$ids")" -eq "$n" ]]; do
+		if ((SECONDS >= deadline)); then
+			fail "$(ready_count "$ids") of ${n} ${prefix} consoles show 'init: ready' after ${RATE_TIMEOUT}s"
+		fi
+		sleep 0.5
+	done
+	ready_s="$(since "$t0")"
+
+	line="$(tail -n "+${log_start}" "$MM_LOG" | grep -F "minifire: ${n} microVMs lit in" | tail -n 1 || true)"
+	[[ -n "$line" ]] || fail "the minimega log has no 'minifire: ${n} microVMs lit in' line"
+	echo "$line"
+	echo "${n} ${prefix} VMs: launched in ${launch_s}s, RUNNING in ${running_s}s, ready in ${ready_s}s"
+	echo "launch rate: $(awk -v n="$n" -v s="$ready_s" 'BEGIN { printf "%.1f", (s > 0 ? n / s : 0) }') VMs/s"
+}
+
+RATE_VMS=100
+RATE_NIC_VMS=20
+RATE_TIMEOUT=240
+
+mm "clear vm config"
+mm "vm config vcpus 1"
+mm "vm config memory 64"
+mm "vm config kernel ${KERNEL}"
+mm "vm config disk ${MINIMAL},ro"
+mm "vm config backchannel false"
+mm "vm config append root=/dev/vda ro rootfstype=squashfs init=/init"
+rate_run scale "$RATE_VMS"
+kill_flush_all
+check_clean
+
+# A static address keeps udhcpc out of the boot. The check does not use it.
+mm "vm config append root=/dev/vda ro rootfstype=squashfs init=/init mm.ip=192.0.2.1/32"
+mm "vm config net ${VLAN}"
+rate_run scalenic "$RATE_NIC_VMS"
+kill_flush_all
+check_clean
+
 mm "tap delete ${HOST_TAP}"
 
 echo

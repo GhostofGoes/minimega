@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"text/tabwriter"
 	"time"
@@ -54,7 +55,8 @@ var (
 	fcJailerCommand  = func(bin string, args []string) *exec.Cmd {
 		return exec.Command(bin, args...)
 	}
-	fcProcDir = "/proc"
+	fcStartVMMFn = (*FirecrackerVM).startVMM
+	fcProcDir    = "/proc"
 )
 
 // fcCCServer is the part of the ron server that Firecracker VMs use. Tests
@@ -68,9 +70,12 @@ type fcCCServer interface {
 
 var _ fcCCServer = (*ron.Server)(nil)
 
-// fcLaunchGate limits the number of Firecracker VMs that launch at the same
-// time. It is separate from fcLaunchSem, which launches acquire inside it.
-var fcLaunchGate fcSemaphore
+// fcTapAdds holds the bridge port add of each tap that fcCreateTapDefault
+// created, until fcWaitTapAdd returns its result.
+var fcTapAdds = struct {
+	sync.Mutex
+	m map[string]chan error
+}{m: map[string]chan error{}}
 
 type FirecrackerConfig struct {
 	// Set the Firecracker binary to use. The value is a path on the host or
@@ -192,6 +197,8 @@ type FirecrackerVM struct {
 	client  *fcClient
 	loaded  bool
 	gen     int // changes at each launch and at flush
+
+	times fcLaunchTimes // of the last launch
 
 	// cc is the ron server from Connect. ccPath is the cc listener of the
 	// current jail, or empty.
@@ -317,13 +324,43 @@ func fcCheckHostDefault(fcPath, jailerPath string) (string, string, error) {
 	return fc.Path, jailer.Path, nil
 }
 
+// fcCreateTapDefault creates the links of a NIC in ns, and starts the bridge
+// port add of the host end. The add can wait on the OVS batcher, so the launch
+// waits for it with fcWaitTapAdd after the network stage.
 func fcCreateTapDefault(nic NetConfig, ns *bridge.Netns, index, uid int) (string, int, error) {
 	br, err := getBridge(nic.Bridge)
 	if err != nil {
 		return "", 0, fmt.Errorf("unable to get bridge %v: %v", nic.Bridge, err)
 	}
 
-	return br.CreateNetnsTap(ns, nic.MAC, nic.VLAN, index, uid)
+	tap, mtu, err := br.CreateNetnsLinks(ns, nic.MAC, nic.VLAN, index, uid)
+	if err != nil {
+		return "", 0, err
+	}
+
+	done := make(chan error, 1)
+	fcTapAdds.Lock()
+	fcTapAdds.m[tap] = done
+	fcTapAdds.Unlock()
+
+	go func() { done <- br.AddNetnsTap(tap, nic.MAC, nic.VLAN) }()
+
+	return tap, mtu, nil
+}
+
+// fcWaitTapAdd returns the result of the bridge port add of tap, or nil when
+// fcCreateTapDefault started none.
+func fcWaitTapAdd(tap string) error {
+	fcTapAdds.Lock()
+	done, ok := fcTapAdds.m[tap]
+	delete(fcTapAdds.m, tap)
+	fcTapAdds.Unlock()
+
+	if !ok {
+		return nil
+	}
+
+	return <-done
 }
 
 func fcDestroyTapDefault(nic NetConfig) error {
@@ -358,14 +395,36 @@ func fcCacheBootFile(src string, vmID int) (fcCachedFile, error) {
 func (vm *FirecrackerVM) Launch() error {
 	defer vm.lock.Unlock()
 
-	return vm.launch()
+	return vm.launch(true)
+}
+
+// launchTimes returns the times of the last launch.
+func (vm *FirecrackerVM) launchTimes() fcLaunchTimes {
+	vm.lock.Lock()
+	defer vm.lock.Unlock()
+
+	return vm.times
 }
 
 // launch prepares the VM on first use, then starts and configures a new VMM.
-// The VM stays in its state; the caller holds vm.lock.
-func (vm *FirecrackerVM) launch() error {
-	fcLaunchGate.Acquire()
-	defer fcLaunchGate.Release()
+// The VM stays in its state; the caller holds vm.lock. A first launch waits
+// for the in-flight bound. Each step runs in its stage, and a launch skips the
+// disk and network stages when they have no work left.
+func (vm *FirecrackerVM) launch(first bool) error {
+	st := fcGetStages()
+
+	var t fcLaunchTimes
+	defer func() {
+		vm.times = t
+		log.Debug("vm %v launch times: %v", vm.ID, t)
+	}()
+
+	if first {
+		start := time.Now()
+		st.inflight.acquire()
+		t.Admit = time.Since(start)
+		defer st.inflight.release()
+	}
 
 	log.Info("launching vm: %v", vm.ID)
 
@@ -424,11 +483,14 @@ func (vm *FirecrackerVM) launch() error {
 		log.Info(fcBeaconMessage)
 	}
 
-	if err := vm.prepare(); err != nil {
+	if err := vm.prepare(st, &t); err != nil {
 		return vm.setErrorf("%v", err)
 	}
 
-	if err := vm.startVMM(cfg, fcBin, jailerBin); err != nil {
+	err = st.vmm.run(&t.VMM, func() error {
+		return fcStartVMMFn(vm, cfg, fcBin, jailerBin)
+	})
+	if err != nil {
 		return vm.setErrorf("%v", err)
 	}
 
@@ -456,10 +518,74 @@ func (vm *FirecrackerVM) createInstanceDir() error {
 }
 
 // prepare creates the disks, the boot file cache entries, the netns, and the
-// taps that are not there yet. Flush removes them.
-func (vm *FirecrackerVM) prepare() error {
-	uid := fcVMUID(vm.ID)
+// taps that are not there yet, in the disk and network stages. The bridge port
+// adds run after the network stage. Flush removes these objects.
+func (vm *FirecrackerVM) prepare(st *fcLaunchStages, t *fcLaunchTimes) error {
+	if err := st.disk.runIf(!vm.filesReady(), &t.Disk, vm.prepareFiles); err != nil {
+		return err
+	}
 
+	var created []int
+	err := st.network.runIf(!vm.networkReady(), &t.Network, func() (err error) {
+		created, err = vm.createLinks()
+		return err
+	})
+
+	start := time.Now()
+	if err2 := vm.addTaps(created); err == nil {
+		err = err2
+	}
+	t.Bridge = time.Since(start)
+	if err != nil {
+		return err
+	}
+
+	if len(vm.Networks) > 0 {
+		if err := vm.writeTaps(); err != nil {
+			return fmt.Errorf("unable to write taps: %v", err)
+		}
+	}
+
+	return nil
+}
+
+// filesReady returns true when prepareFiles has no work left.
+func (vm *FirecrackerVM) filesReady() bool {
+	want := len(vm.Disks)
+	if size, err := fcParseSize(vm.FirecrackerScratch); err != nil {
+		return false
+	} else if size > 0 {
+		want++
+	}
+
+	switch {
+	case len(vm.disks) < want, vm.kernel.key == "", vm.InitrdPath != "" && vm.initrd.key == "":
+		return false
+	case !vm.injected && vm.Snapshot && len(vm.Injects) > 0:
+		return false
+	}
+
+	return true
+}
+
+// networkReady returns true when createLinks has no work left.
+func (vm *FirecrackerVM) networkReady() bool {
+	if vm.netns == nil {
+		return false
+	}
+
+	for _, nic := range vm.Networks {
+		if nic.Tap == "" {
+			return false
+		}
+	}
+
+	return true
+}
+
+// prepareFiles creates the disks and the boot file cache entries that are not
+// there yet.
+func (vm *FirecrackerVM) prepareFiles() error {
 	if err := vm.prepareDisks(); err != nil {
 		return err
 	}
@@ -480,10 +606,17 @@ func (vm *FirecrackerVM) prepare() error {
 		vm.initrd = f
 	}
 
+	return nil
+}
+
+// createLinks creates the netns and the links of each NIC that has no tap
+// yet. It returns the NICs that it gave a tap. addTaps waits for their bridge
+// port adds.
+func (vm *FirecrackerVM) createLinks() ([]int, error) {
 	if vm.netns == nil {
 		ns, err := fcCreateNetns()
 		if err != nil {
-			return err
+			return nil, err
 		}
 		vm.netns = ns
 	}
@@ -492,6 +625,9 @@ func (vm *FirecrackerVM) prepare() error {
 		vm.mtus = make([]int, len(vm.Networks))
 	}
 
+	uid := fcVMUID(vm.ID)
+
+	var created []int
 	for i := range vm.Networks {
 		nic := &vm.Networks[i]
 		if nic.Tap != "" {
@@ -500,20 +636,31 @@ func (vm *FirecrackerVM) prepare() error {
 
 		tap, mtu, err := fcCreateTap(*nic, vm.netns, i, uid)
 		if err != nil {
-			return fmt.Errorf("unable to create tap %v: %v", i, err)
+			return created, fmt.Errorf("unable to create tap %v: %v", i, err)
 		}
 
 		nic.Tap = tap
 		vm.mtus[i] = mtu
+		created = append(created, i)
 	}
 
-	if len(vm.Networks) > 0 {
-		if err := vm.writeTaps(); err != nil {
-			return fmt.Errorf("unable to write taps: %v", err)
+	return created, nil
+}
+
+// addTaps waits for the bridge port adds of the NICs that createLinks gave a
+// tap. When an add fails, the bridge deletes the links, and the NIC gets no
+// tap.
+func (vm *FirecrackerVM) addTaps(created []int) error {
+	var errs []error
+	for _, i := range created {
+		nic := &vm.Networks[i]
+		if err := fcWaitTapAdd(nic.Tap); err != nil {
+			errs = append(errs, fmt.Errorf("unable to create tap %v: %v", i, err))
+			nic.Tap = ""
 		}
 	}
 
-	return nil
+	return errors.Join(errs...)
 }
 
 // prepareDisks creates the disks that are not there yet, then the scratch
@@ -971,7 +1118,7 @@ func (vm *FirecrackerVM) Start() error {
 		vm.kill = make(chan bool)
 
 		// launch handles setting the VM to error state
-		if err := vm.launch(); err != nil {
+		if err := vm.launch(false); err != nil {
 			return err
 		}
 	}

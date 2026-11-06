@@ -165,6 +165,23 @@ func DeleteLink(name string) error {
 // Only the OVS port and the tap table update hold the bridge lock. With
 // OVSBatching, the OVS port add waits on the batcher without the lock.
 func (b *Bridge) CreateNetnsTap(ns *Netns, mac string, vlan, index, uid int) (string, int, error) {
+	tap, mtu, err := b.CreateNetnsLinks(ns, mac, vlan, index, uid)
+	if err != nil {
+		return "", 0, err
+	}
+
+	if err := b.AddNetnsTap(tap, mac, vlan); err != nil {
+		return "", 0, err
+	}
+
+	return tap, mtu, nil
+}
+
+// CreateNetnsLinks is the netlink part of CreateNetnsTap: the veth pair, the
+// tap, and the tc redirects. It returns the host end name and its MTU.
+// AddNetnsTap then adds the host end to the bridge. On failure, it deletes the
+// veth pair.
+func (b *Bridge) CreateNetnsLinks(ns *Netns, mac string, vlan, index, uid int) (string, int, error) {
 	tap := <-b.tapChan
 	peer := fmt.Sprintf("vm%d", index)
 
@@ -174,36 +191,41 @@ func (b *Bridge) CreateNetnsTap(ns *Netns, mac string, vlan, index, uid int) (st
 		return "", 0, err
 	}
 
-	mtu, err := b.setupNetnsTap(tap, ns, mac, vlan, index, uid)
+	mtu, err := netnsSetupHost(tap)
+	if err == nil {
+		err = netnsSetupTap(ns, index, uid, mtu)
+	}
 	if err != nil {
-		if err := netnsDelLink(tap); err != nil {
-			log.Error("zombie tap -- %v %v", tap, err)
-		}
-
+		deleteNetnsLink(tap)
 		return "", 0, err
 	}
 
 	return tap, mtu, nil
 }
 
-func (b *Bridge) setupNetnsTap(tap string, ns *Netns, mac string, vlan, index, uid int) (int, error) {
-	mtu, err := netnsSetupHost(tap)
-	if err != nil {
-		return 0, err
-	}
-
-	if err := netnsSetupTap(ns, index, uid, mtu); err != nil {
-		return 0, err
-	}
-
+// AddNetnsTap adds the host end tap from CreateNetnsLinks to the bridge. On
+// failure, it deletes the veth pair.
+func (b *Bridge) AddNetnsTap(tap, mac string, vlan int) error {
+	var err error
 	if OVSBatching {
-		return mtu, b.addNetnsTapBatched(tap, mac, vlan)
+		err = b.addNetnsTapBatched(tap, mac, vlan)
+	} else {
+		bridgeLock.Lock()
+		err = netnsAddTap(b, tap, mac, vlan)
+		bridgeLock.Unlock()
 	}
 
-	bridgeLock.Lock()
-	defer bridgeLock.Unlock()
+	if err != nil {
+		deleteNetnsLink(tap)
+	}
 
-	return mtu, netnsAddTap(b, tap, mac, vlan)
+	return err
+}
+
+func deleteNetnsLink(tap string) {
+	if err := netnsDelLink(tap); err != nil {
+		log.Error("zombie tap -- %v %v", tap, err)
+	}
 }
 
 // DestroyNetnsTap marks a tap that CreateNetnsTap created as defunct and

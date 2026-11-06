@@ -16,7 +16,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -61,11 +60,7 @@ type fcSemaphore struct {
 
 func (s *fcSemaphore) Acquire() {
 	s.once.Do(func() {
-		n := *f_firecrackerLaunchParallel
-		if n <= 0 {
-			n = runtime.NumCPU()
-		}
-		s.ch = make(chan struct{}, n)
+		s.ch = make(chan struct{}, fcLaunchParallel())
 	})
 	s.ch <- struct{}{}
 }

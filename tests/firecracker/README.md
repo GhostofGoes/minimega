@@ -60,6 +60,37 @@ Check 14 of `smoke.sh` boots 10 VMs, `ro1` to `ro10`, from the minimal guest
 - After `vm kill all` and `vm flush`, no jail is left and the cached copy has
   one link.
 
+## Launch rate check
+
+Check 15 of `smoke.sh` measures the launch rate. It launches 100 VMs,
+`scale1` to `scale100`, from the minimal guest `rootfs.squashfs` with
+`vm config disk <image>,ro`, 64 MiB of memory, and no NIC. So the check
+measures the disk, jail, VMM, and boot steps, not the network setup.
+
+The check runs `vm launch firecracker scale[1-100]` in the background, and
+runs `vm start all` one time each second until the launch ends. Then it
+measures the seconds until all 100 VMs are `RUNNING` and until each console
+log shows `init: ready`. All 100 VMs must be ready in 240 seconds. The check
+prints these items:
+
+- The `minifire: 100 microVMs lit in ...` line from the minimega log. This
+  line gives the launch time of the batch, the p50 and p95 times of the disk,
+  network, and vmm stages, and the p95 time that the launches waited for a
+  stage.
+- The seconds until the launch ended, until all VMs were `RUNNING`, and until
+  all VMs were ready.
+- The launch rate in VMs each second: 100 divided by the seconds until all
+  VMs were ready.
+
+Then the check kills and flushes the VMs, and makes sure that no host objects
+are left, as check 12 does.
+
+The check then does the same steps for 20 VMs, `scalenic1` to `scalenic20`,
+with one NIC each on VLAN `LAN`. This part sends the netlink setup and the OVS
+port adds of many VMs at the same time. Each of these guests gets the static
+address `192.0.2.1/32`, so that it does not start DHCP. The check does not use
+the guest addresses.
+
 ## Files
 
 | File | Use |
