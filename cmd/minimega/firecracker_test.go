@@ -166,6 +166,7 @@ func TestFirecrackerConfigDefaults(t *testing.T) {
 		"jailer-path":          "jailer",
 		"vsock-cid":            "3",
 		"firecracker-snapshot": "",
+		"firecracker-scratch":  "",
 	}
 
 	for field, want := range tests {

@@ -178,6 +178,10 @@ func init() {
 }
 
 func NewVM(name, namespace string, vmType VMType, config VMConfig) (VM, error) {
+	if err := fcCheckDiskOptions(vmType, config.KVMConfig.Disks); err != nil {
+		return nil, err
+	}
+
 	switch vmType {
 	case KVM:
 		return NewKVM(name, namespace, config)

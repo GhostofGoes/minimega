@@ -278,7 +278,7 @@ func (vm *FirecrackerVM) ExportDisk(dst, format string) error {
 	default:
 		return fmt.Errorf("vm %v is %v: vm export-disk needs a vm in running, paused, or quit", vm.Name, vm.State)
 	}
-	if len(vm.disks) == 0 {
+	if len(vm.disks) == 0 || vm.disks[0].Scratch {
 		return fmt.Errorf("vm %v has no disk", vm.Name)
 	}
 

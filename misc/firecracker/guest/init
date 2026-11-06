@@ -88,6 +88,8 @@ else
 	echo "init: miniccc not started: no /dev/vsock, no mm.cc, or no /usr/local/bin/miniccc"
 fi
 
+echo "init: ready"
+
 # PID 1 reaps orphaned processes. wait returns early when a signal arrives.
 while :; do
 	wait

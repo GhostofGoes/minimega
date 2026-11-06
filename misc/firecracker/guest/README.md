@@ -45,7 +45,8 @@ for read-only use.
    SIGINT to PID 1.
 4. It sets the host name and the network from the kernel command line.
 5. It starts miniccc again each time miniccc stops.
-6. It reaps orphan processes.
+6. It prints `init: ready` on the console.
+7. It reaps orphan processes.
 
 On SIGINT or SIGTERM, `init` stops all processes, runs `sync`, and runs
 `reboot -f`. The Firecracker VMM then stops with exit code 0. `vm shutdown`
@@ -97,17 +98,31 @@ console, `ip=`, squashfs, ext4, overlayfs, tmpfs, and devtmpfs.
 ```text
 vm config kernel /path/to/vmlinux
 vm config append root=/dev/vda ro rootfstype=squashfs quiet i8042.noaux i8042.nomux i8042.nopnp i8042.dumbkbd
-vm config disk /path/to/rootfs.squashfs
+vm config disk /path/to/rootfs.squashfs,ro
+vm config firecracker-scratch 64M
 vm config memory 64
 vm launch firecracker guest[1-10]
 vm start all
 ```
 
-- For the ext4 image, use `rootfstype=ext4` and `rootfs.ext4`.
+- For the ext4 image, use `rootfstype=ext4` and `rootfs.ext4,ro`.
 - The `i8042` parameters make the keyboard controller probe shorter.
 - Use 64 to 96 MiB of memory. With this kernel, the guest uses about 28 MiB
   after boot.
-- Keep the default `vm config snapshot true`. Each VM then gets a copy (a
-  reflink clone or a device-mapper snapshot) of the raw image. A shared
-  read-only root disk for all VMs is a separate minimega change. Until it is
-  available, do not use `snapshot false` to share the image.
+- The `ro` disk option attaches the image read-only. minimega copies the
+  image into its disk cache one time. Then it hard-links the cached copy into
+  the jail of each VM.
+- The host page cache holds one copy of the image for all VMs. minimega makes
+  no copy, loop device, or device-mapper target for each VM. The `snapshot`
+  setting does not apply to a disk with `ro`.
+- The `firecracker-scratch` line is optional. It adds an empty writable disk,
+  `/dev/vdb` here, after the other disks. Use it only for a VM that must keep
+  data, for example as an overlayfs upper layer.
+- minimega creates the scratch disk as a sparse file at the first launch. The
+  file uses only the blocks that the guest writes. `vm reset-disk` makes the
+  scratch disk empty again.
+- `vm config inject` needs a writable disk 0. Do not use it with a `ro` disk 0.
+- minimega reads the Firecracker log through a named pipe. It keeps at most
+  4 MiB of it in `firecracker.log` in the VM instance directory.
+- minimega does not configure Firecracker metrics, so Firecracker writes no
+  metrics file.

@@ -114,6 +114,13 @@ To attach a disk using the "ide" interface with the "unsafe" cache mode:
 
 Disk images launched in snapshot mode may safely be used for multiple VMs.
 
+For Firecracker VMs, you may add the option "ro" at the end of a diskspec. The
+VM then gets the disk read-only. All VMs that use the image share one cached
+copy of it, and the snapshot setting does not apply to the disk. Other VM types
+do not support "ro". For example:
+
+	vm config disk rootfs.squashfs,ro
+
 Calling vm config disks with no arguments prints the current configuration.
 
 Note: this configuration only applies to KVM-based and Firecracker-based VMs.`,

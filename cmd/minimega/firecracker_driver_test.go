@@ -526,3 +526,119 @@ func TestFCDriverErrors(t *testing.T) {
 		}
 	})
 }
+
+func TestFCDriverReadOnlyScratch(t *testing.T) {
+	f := setupFCDriver(t)
+
+	shared := filepath.Join(f.dir, "shared.raw")
+	if err := os.WriteFile(shared, make([]byte, 4096), 0444); err != nil {
+		t.Fatal(err)
+	}
+	fcPrepareDiskFn = func(instanceDir string, index int, dc DiskConfig, snapshot bool, vmID, uid int) (fcDisk, error) {
+		f.count("prepare-disk")
+		return fcDisk{HostPath: shared, ReadOnly: dc.ReadOnly, CacheType: "Writeback"}, nil
+	}
+
+	cfg := f.config(t)
+	cfg.Disks = DiskConfigs{{Path: filepath.Join(f.dir, "rootfs.squashfs"), ReadOnly: true}}
+	cfg.FirecrackerScratch = "16M"
+	vm := f.newVM(t, cfg)
+
+	err := vm.Launch()
+	skipNoFIFO(t, err)
+	if err != nil {
+		t.Fatalf("Launch() = %v", err)
+	}
+	cleanupFCVM(t, vm)
+	waitFCState(t, vm, VM_BUILDING)
+
+	want := []string{
+		"GET /",
+		"PUT /logger",
+		"PUT /machine-config",
+		"PUT /boot-source",
+		"PUT /drives/disk0",
+		"PUT /drives/scratch",
+		"PUT /network-interfaces/eth0",
+		"PUT /vsock",
+		"PUT /entropy",
+		"PUT /serial",
+	}
+	if got := f.requests(1); !reflect.DeepEqual(got, want) {
+		t.Fatalf("requests =\n%q\nwant\n%q", got, want)
+	}
+
+	root := f.body(1, "PUT", "/drives/disk0")
+	if root["path_on_host"] != "/disk0" || root["is_root_device"] != true || root["is_read_only"] != true {
+		t.Errorf("root drive = %v", root)
+	}
+	scratch := f.body(1, "PUT", "/drives/scratch")
+	if scratch["drive_id"] != "scratch" || scratch["path_on_host"] != "/scratch" || scratch["is_root_device"] != false || scratch["is_read_only"] != false {
+		t.Errorf("scratch drive = %v", scratch)
+	}
+
+	j := newFCJail(vm.ID, f.fcBin)
+	instanceDir := fcInstanceDir(vm.ID)
+	scratchFile := filepath.Join(instanceDir, "scratch.raw")
+
+	sameFile := func(a, b string) bool {
+		fa, err1 := os.Stat(a)
+		fb, err2 := os.Stat(b)
+		return err1 == nil && err2 == nil && os.SameFile(fa, fb)
+	}
+	if !sameFile(j.HostPath("/disk0"), shared) {
+		t.Errorf("jail /disk0 is not a link to %v", shared)
+	}
+	if !sameFile(j.HostPath("/scratch"), scratchFile) {
+		t.Errorf("jail /scratch is not a link to %v", scratchFile)
+	}
+	if fi, err := os.Stat(scratchFile); err != nil || fi.Size() != 16<<20 {
+		t.Errorf("scratch disk: %v, %v, want 16 MiB", fi, err)
+	}
+
+	// The VMM log goes through a pipe in the jail to the instance directory.
+	logFIFO := j.HostPath("/firecracker.log")
+	if fi, err := os.Lstat(logFIFO); err != nil || fi.Mode()&os.ModeNamedPipe == 0 {
+		t.Fatalf("jail firecracker.log is not a named pipe: %v, %v", fi, err)
+	}
+	w, err := os.OpenFile(logFIFO, os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.WriteString("Running Firecracker\n"); err != nil {
+		t.Fatal(err)
+	}
+	w.Close()
+	waitFileContent(t, filepath.Join(instanceDir, "firecracker.log"), "Running Firecracker\n")
+
+	if err := vm.Kill(); err != nil {
+		t.Fatalf("Kill() = %v", err)
+	}
+	waitFCState(t, vm, VM_QUIT)
+
+	// vm reset-disk makes the scratch disk empty again.
+	sf, err := os.OpenFile(scratchFile, os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sf.WriteAt([]byte("guest data"), 0); err != nil {
+		t.Fatal(err)
+	}
+	sf.Close()
+
+	if err := vm.ResetDisk(); err != nil {
+		t.Fatalf("ResetDisk() = %v", err)
+	}
+	data, err := os.ReadFile(scratchFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(data) != 16<<20 || !fcAllZero(data) {
+		t.Errorf("scratch disk after reset has %d bytes, all zero %v", len(data), fcAllZero(data))
+	}
+	for k, want := range map[string]int{"prepare-disk": 2, "release-disk": 2} {
+		if got := f.get(k); got != want {
+			t.Errorf("%v calls = %d, want %d", k, got, want)
+		}
+	}
+}

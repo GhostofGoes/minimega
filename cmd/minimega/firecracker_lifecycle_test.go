@@ -71,8 +71,40 @@ func TestFCValidateConfigErrors(t *testing.T) {
 			edit: func(c *VMConfig) { c.Injects = FCInjects{{Partition: 1, Src: "a", Dst: "/a"}} },
 		},
 		{
+			name: "inject with ro disk 0",
+			edit: func(c *VMConfig) {
+				c.Disks = DiskConfigs{{Path: "root.squashfs", ReadOnly: true}}
+				c.Injects = FCInjects{{Partition: 1, Src: "a", Dst: "/a"}}
+			},
+			want: "vm config inject needs a writable disk 0: disk 0 has option ro",
+		},
+		{
+			name: "inject with ro disk 1",
+			edit: func(c *VMConfig) {
+				c.Disks = DiskConfigs{{Path: "data.raw"}, {Path: "root.squashfs", ReadOnly: true}}
+				c.Injects = FCInjects{{Partition: 1, Src: "a", Dst: "/a"}}
+			},
+		},
+		{
+			name: "ro disk without snapshot",
+			edit: func(c *VMConfig) {
+				c.Snapshot = false
+				c.Disks = DiskConfigs{{Path: "root.squashfs", ReadOnly: true}}
+			},
+		},
+		{name: "scratch", edit: func(c *VMConfig) { c.FirecrackerScratch = "64M" }},
+		{name: "bad scratch", edit: func(c *VMConfig) { c.FirecrackerScratch = "12x" }, want: "firecracker-scratch: invalid size"},
+		{
 			name: "17 devices",
 			edit: func(c *VMConfig) { c.Disks, c.Networks = testDisks(1), testNICs(14) },
+		},
+		{
+			name: "18 devices with scratch",
+			edit: func(c *VMConfig) {
+				c.Disks, c.Networks = testDisks(1), testNICs(14)
+				c.FirecrackerScratch = "1G"
+			},
+			want: "VM web1 needs 18 devices (1 disk, scratch, 14 NICs, vsock, entropy); the limit is 17 without firecracker-pci",
 		},
 		{
 			name: "18 devices",
@@ -210,6 +242,26 @@ func TestFCDeviceCount(t *testing.T) {
 				t.Errorf("fcDeviceCount() = %v, %v, %q, want %v, %v, %q", n, limit, detail, test.n, test.limit, test.detail)
 			}
 		})
+	}
+}
+
+func TestFCDeviceCountScratch(t *testing.T) {
+	cfg := NewVMConfig()
+	cfg.Disks, cfg.Networks = testDisks(1), testNICs(2)
+	cfg.Backchannel, cfg.FirecrackerEntropy = true, false
+
+	for scratch, want := range map[string]struct {
+		n      int
+		detail string
+	}{
+		"":    {4, "1 disk, 2 NICs, vsock"},
+		"0":   {4, "1 disk, 2 NICs, vsock"},
+		"64M": {5, "1 disk, scratch, 2 NICs, vsock"},
+	} {
+		cfg.FirecrackerScratch = scratch
+		if n, _, detail := fcDeviceCount(cfg); n != want.n || detail != want.detail {
+			t.Errorf("fcDeviceCount() with scratch %q = %v, %q, want %v, %q", scratch, n, detail, want.n, want.detail)
+		}
 	}
 }
 
@@ -520,6 +572,66 @@ func TestFCConsoleFIFO(t *testing.T) {
 	case <-done:
 	case <-time.After(5 * time.Second):
 		t.Fatal("Stop() did not return")
+	}
+}
+
+func TestFCLogFIFO(t *testing.T) {
+	old := fcChown
+	defer func() { fcChown = old }()
+	fcChown = func(string, int, int) error { return nil }
+
+	dir := t.TempDir()
+	fifo := filepath.Join(dir, "vmm.fifo")
+	log := filepath.Join(dir, "firecracker.log")
+
+	if err := fcMakeConsoleFIFO(fifo, os.Getuid()); err != nil {
+		t.Skipf("mkfifo not supported here: %v", err)
+	}
+	if err := os.WriteFile(log, []byte("old launch\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	write := func(s string) {
+		t.Helper()
+		w, err := os.OpenFile(fifo, os.O_WRONLY, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := w.WriteString(s); err != nil {
+			t.Fatal(err)
+		}
+		if err := w.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	c := &fcConsole{Label: "firecracker log"}
+	if err := c.Start(fifo, log, 16); err != nil {
+		t.Fatal(err)
+	}
+	waitFileContent(t, log+".1", "old launch\n")
+
+	write(strings.Repeat("y", 20))
+	capped := strings.Repeat("y", 16) + "\n[firecracker log truncated at 16 bytes]\n"
+	waitFileContent(t, log, capped)
+	c.Stop()
+
+	// The next Start rotates the log, and Stop copies what the pipe holds.
+	if err := c.Start(fifo, log, fcLogMaxBytes); err != nil {
+		t.Fatal(err)
+	}
+	waitFileContent(t, log+".1", capped)
+
+	data := strings.Repeat("0123456789abcdef", 3<<10)
+	write(data)
+	c.Stop()
+
+	got, err := os.ReadFile(log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != data {
+		t.Errorf("firecracker.log has %d bytes after Stop(), want %d", len(got), len(data))
 	}
 }
 

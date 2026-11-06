@@ -15,6 +15,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -747,6 +748,266 @@ func TestFCPrepareDisk(t *testing.T) {
 			t.Errorf("inUse() = %v, want 0", got)
 		}
 	})
+}
+
+func TestFCPrepareDiskReadOnly(t *testing.T) {
+	for _, format := range []string{"raw", "qcow2"} {
+		t.Run(format, func(t *testing.T) {
+			src := fcWriteFile(t, filepath.Join(t.TempDir(), "rootfs."+format), []byte("image"))
+			info := fcImageJSON(t, fcImage{Filename: src, Format: format, VirtualSize: 1 << 20})
+			cmds := setFCDiskSeams(t, func(args []string) (string, error) {
+				if args[0] == "qemu-img" && args[1] == "info" {
+					return info, nil
+				}
+				return "", nil
+			})
+
+			var fills []string
+			fcCacheFill = func(src, dst, format string) error {
+				fills = append(fills, format)
+				return os.WriteFile(dst, []byte("image"), 0600)
+			}
+			fcReflinkOK = func() bool { t.Error("read-only disk checked reflink"); return true }
+			fcDMUsable = func() bool { t.Error("read-only disk checked device-mapper"); return true }
+			fcCloneFile = func(string, string) error { t.Error("read-only disk made a clone"); return nil }
+			var chowns int
+			fcChown = func(string, int, int) error { chowns++; return nil }
+
+			inst1, inst2 := t.TempDir(), t.TempDir()
+			dc := DiskConfig{Path: src, ReadOnly: true}
+
+			// The snapshot setting does not apply to a read-only disk.
+			d1, err := fcPrepareDisk(inst1, 0, dc, false, 7, 200007)
+			if err != nil {
+				t.Fatal(err)
+			}
+			d2, err := fcPrepareDisk(inst2, 0, dc, true, 8, 200008)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			id, _ := fcStatSource(src)
+			key := fcCacheKey(id)
+			cached := filepath.Join(fcCacheDir(), key+".raw")
+			infoCmd := fcCmd("qemu-img", "info", "--output=json", "--backing-chain", fcResolve(src))
+
+			if want := [][]string{infoCmd, infoCmd}; !reflect.DeepEqual(cmds.get(), want) {
+				t.Errorf("commands =\n%q\nwant\n%q", cmds.get(), want)
+			}
+			for i, d := range []fcDisk{d1, d2} {
+				if d.HostPath != cached || !d.ReadOnly || d.IsBlock || d.Scratch || d.CacheType != "Writeback" {
+					t.Errorf("disk %d = %+v, want the cache entry %v, read-only", i, d, cached)
+				}
+			}
+			if fi, err := os.Stat(cached); err != nil || fi.Mode().Perm() != 0444 {
+				t.Errorf("cache entry: %v, %v, want mode 0444", fi, err)
+			}
+			if !reflect.DeepEqual(fills, []string{format}) {
+				t.Errorf("fills = %q, want [%v]", fills, format)
+			}
+			if chowns != 0 {
+				t.Errorf("chown calls = %d, want 0", chowns)
+			}
+			for _, inst := range []string{inst1, inst2} {
+				if entries, _ := os.ReadDir(inst); len(entries) != 0 {
+					t.Errorf("instance directory %v has %d files, want 0", inst, len(entries))
+				}
+			}
+			if got := fcCache.inUse(key); got != 2 {
+				t.Errorf("inUse() = %v, want 2", got)
+			}
+
+			cmds.reset()
+			for _, d := range []fcDisk{d1, d2} {
+				if err := fcReleaseDisk(d); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if len(cmds.get()) != 0 {
+				t.Errorf("release commands = %q, want none", cmds.get())
+			}
+			if got := fcCache.inUse(key); got != 0 {
+				t.Errorf("inUse() after release = %v, want 0", got)
+			}
+		})
+	}
+}
+
+func TestFCPrepareDiskReadOnlyChain(t *testing.T) {
+	dir := t.TempDir()
+	src := fcWriteFile(t, filepath.Join(dir, "ov.qcow2"), []byte("overlay"))
+	base := fcWriteFile(t, filepath.Join(dir, "base.raw"), []byte("base"))
+	info := fcImageJSON(t,
+		fcImage{Filename: src, Format: "qcow2", BackingFilename: base, VirtualSize: 1 << 20},
+		fcImage{Filename: base, Format: "raw", VirtualSize: 1 << 20},
+	)
+	setFCDiskSeams(t, func(args []string) (string, error) {
+		if args[0] == "qemu-img" && args[1] == "info" {
+			return info, nil
+		}
+		return "", nil
+	})
+	fcCacheFill = func(string, string, string) error {
+		t.Error("ro disk with a backing chain filled the cache")
+		return nil
+	}
+
+	_, err := fcPrepareDisk(t.TempDir(), 0, DiskConfig{Path: src, ReadOnly: true}, true, 7, 200007)
+	if err == nil || !strings.Contains(err.Error(), "without a backing file") {
+		t.Fatalf("fcPrepareDisk() = %v, want a backing file error", err)
+	}
+}
+
+func TestFCCacheClearOrphans(t *testing.T) {
+	setFCDiskSeams(t, nil)
+
+	dir := fcCacheDir()
+	for _, name := range []string{
+		"aaaa.raw", "aaaa.json",
+		"bbbb.raw.tmp-1", "bbbb.json.tmp-1",
+		"cccc.json",
+		"dddd.raw.tmp-2",
+	} {
+		fcWriteFile(t, filepath.Join(dir, name), []byte("x"))
+	}
+	fcCache.inflight["dddd"] = &fcInflight{done: make(chan struct{})}
+
+	n, err := fcCacheClear()
+	if err != nil || n != 1 {
+		t.Fatalf("fcCacheClear() = %v, %v, want 1 entry", n, err)
+	}
+
+	var names []string
+	entries, _ := os.ReadDir(dir)
+	for _, e := range entries {
+		names = append(names, e.Name())
+	}
+	if want := []string{"dddd.raw.tmp-2"}; !reflect.DeepEqual(names, want) {
+		t.Errorf("cache directory has %q, want %q", names, want)
+	}
+}
+
+func TestFCPrepareScratch(t *testing.T) {
+	setFCDiskSeams(t, nil)
+
+	var chowns []string
+	fcChown = func(p string, uid, gid int) error {
+		chowns = append(chowns, fmt.Sprintf("%v:%d:%d", p, uid, gid))
+		return nil
+	}
+
+	dir := t.TempDir()
+	p := filepath.Join(dir, "scratch.raw")
+
+	d, err := fcPrepareScratch(dir, 64<<20, 200007)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d.HostPath != p || !d.Scratch || d.ReadOnly || d.IsBlock || d.CacheType != "Writeback" {
+		t.Errorf("scratch disk = %+v", d)
+	}
+	if want := []string{p + ":200007:200007"}; !reflect.DeepEqual(chowns, want) {
+		t.Errorf("chowns = %q, want %q", chowns, want)
+	}
+
+	fi, err := os.Stat(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi.Size() != 64<<20 {
+		t.Errorf("size = %d, want %d", fi.Size(), 64<<20)
+	}
+	if st, ok := fi.Sys().(*syscall.Stat_t); ok && st.Blocks*512 >= 1<<20 {
+		t.Errorf("scratch disk uses %d bytes, want a sparse file", st.Blocks*512)
+	}
+
+	f, err := os.OpenFile(p, os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteAt([]byte("guest data"), 4096); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+
+	// A new scratch disk is empty.
+	if _, err := fcPrepareScratch(dir, 1<<20, 200007); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(data) != 1<<20 || !fcAllZero(data) {
+		t.Errorf("new scratch disk has %d bytes, all zero %v", len(data), fcAllZero(data))
+	}
+
+	if got := fcDriveID(1, d); got != "scratch" {
+		t.Errorf("fcDriveID(scratch) = %q", got)
+	}
+	if got := fcDriveID(1, fcDisk{}); got != "disk1" {
+		t.Errorf("fcDriveID(disk 1) = %q", got)
+	}
+}
+
+func TestFCParseSize(t *testing.T) {
+	for in, want := range map[string]int64{
+		"":     0,
+		"0":    0,
+		"512":  512,
+		"4k":   4 << 10,
+		"64M":  64 << 20,
+		"1G":   1 << 30,
+		"2T":   2 << 40,
+		"100m": 100 << 20,
+	} {
+		if got, err := fcParseSize(in); err != nil || got != want {
+			t.Errorf("fcParseSize(%q) = %v, %v, want %v", in, got, err, want)
+		}
+		if err := validFCScratch(NewVMConfig(), in); err != nil {
+			t.Errorf("validFCScratch(%q) = %v", in, err)
+		}
+	}
+
+	for _, in := range []string{"M", "abc", "-1M", "1.5G", "64MB", "100", "9999999999T"} {
+		if got, err := fcParseSize(in); err == nil {
+			t.Errorf("fcParseSize(%q) = %v, want error", in, got)
+		}
+		if err := validFCScratch(NewVMConfig(), in); err == nil {
+			t.Errorf("validFCScratch(%q) = nil, want error", in)
+		}
+	}
+}
+
+func TestFCCheckDiskOptions(t *testing.T) {
+	plain := DiskConfigs{{Path: "/img/a.qcow2", Interface: "virtio", Cache: "unsafe"}}
+	ro := DiskConfigs{{Path: "/img/a.qcow2"}, {Path: "/img/root.squashfs", ReadOnly: true}}
+	want := "disk option ro is supported only for firecracker VMs"
+
+	for _, vmType := range []VMType{KVM, CONTAINER, ANDROID, FIRECRACKER} {
+		if err := fcCheckDiskOptions(vmType, plain); err != nil {
+			t.Errorf("fcCheckDiskOptions(%v, plain) = %v", vmType, err)
+		}
+	}
+
+	for _, vmType := range []VMType{KVM, CONTAINER, ANDROID} {
+		cfg := NewVMConfig()
+		cfg.Disks = ro
+		if _, err := NewVM("ro1", DefaultNamespace, vmType, cfg); err == nil || err.Error() != want {
+			t.Errorf("NewVM(%v) error = %v, want %q", vmType, err, want)
+		}
+	}
+
+	cfg := NewVMConfig()
+	cfg.Disks = ro
+	vm, err := NewVM("ro1", DefaultNamespace, FIRECRACKER, cfg)
+	if err != nil {
+		t.Fatalf("NewVM(firecracker) = %v", err)
+	}
+	// NewVM returns the VM locked, so read the field directly.
+	if got := vm.(*FirecrackerVM).Disks.String(); got != "/img/a.qcow2 /img/root.squashfs,ro" {
+		t.Errorf("disks = %q, want /img/a.qcow2 /img/root.squashfs,ro", got)
+	}
 }
 
 func TestCLIDiskCache(t *testing.T) {

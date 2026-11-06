@@ -12,11 +12,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -535,6 +537,7 @@ type fcDisk struct {
 	HostPath  string
 	IsBlock   bool
 	ReadOnly  bool
+	Scratch   bool
 	CacheType string
 
 	vmID         int
@@ -565,7 +568,8 @@ func fcCacheType(cache string) string {
 }
 
 // fcPrepareDisk builds disk index of VM vmID from dc in instanceDir. The VMM
-// runs as uid.
+// runs as uid. A read-only disk is the cache entry itself, which all VMs
+// share, and snapshot does not apply to it.
 func fcPrepareDisk(instanceDir string, index int, dc DiskConfig, snapshot bool, vmID, uid int) (d fcDisk, err error) {
 	d = fcDisk{CacheType: fcCacheType(dc.Cache), vmID: vmID}
 
@@ -583,6 +587,27 @@ func fcPrepareDisk(instanceDir string, index int, dc DiskConfig, snapshot bool, 
 	chain, err := fcDiskChain(src)
 	if err != nil {
 		return d, err
+	}
+
+	if dc.ReadOnly {
+		// The cache key covers only src, so a change to a backing file would
+		// not be seen.
+		if len(chain) != 1 {
+			return d, fmt.Errorf("firecracker needs an image without a backing file for a disk with ro: %v", dc.Path)
+		}
+
+		d.key, d.HostPath, err = fcCache.get(src, chain[0].Format, vmID)
+		if err != nil {
+			return d, err
+		}
+
+		// The VMM reads the hard link in the jail as the VM uid.
+		if err := os.Chmod(d.HostPath, 0444); err != nil {
+			return d, err
+		}
+		d.ReadOnly = true
+
+		return d, nil
 	}
 
 	if !snapshot {
@@ -657,6 +682,95 @@ func fcPrepareDisk(instanceDir string, index int, dc DiskConfig, snapshot bool, 
 	d.HostPath = dst
 
 	return d, nil
+}
+
+// fcPrepareScratch creates an empty sparse scratch disk of size bytes in
+// instanceDir. uid owns it.
+func fcPrepareScratch(instanceDir string, size int64, uid int) (fcDisk, error) {
+	p := filepath.Join(instanceDir, "scratch.raw")
+
+	f, err := os.OpenFile(p, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
+	if err != nil {
+		return fcDisk{}, fmt.Errorf("create scratch disk: %v", err)
+	}
+	if err := f.Truncate(size); err != nil {
+		f.Close()
+		return fcDisk{}, fmt.Errorf("create scratch disk: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		return fcDisk{}, fmt.Errorf("create scratch disk: %v", err)
+	}
+
+	if err := fcChown(p, uid, uid); err != nil {
+		return fcDisk{}, fmt.Errorf("chown %v: %v", p, err)
+	}
+
+	return fcDisk{HostPath: p, Scratch: true, CacheType: fcCacheType("")}, nil
+}
+
+// fcDriveID returns the drive ID of disk i of a VM. It is also the name of
+// the disk in the jail.
+func fcDriveID(i int, d fcDisk) string {
+	if d.Scratch {
+		return "scratch"
+	}
+	return fmt.Sprintf("disk%d", i)
+}
+
+// fcParseSize parses a size such as 4096, 64M, or 1G. The K, M, G, and T
+// suffixes are powers of 1024. An empty size is 0.
+func fcParseSize(s string) (int64, error) {
+	if s == "" {
+		return 0, nil
+	}
+
+	num, mult := s, int64(1)
+	switch strings.ToUpper(s[len(s)-1:]) {
+	case "K":
+		mult = 1 << 10
+	case "M":
+		mult = 1 << 20
+	case "G":
+		mult = 1 << 30
+	case "T":
+		mult = 1 << 40
+	}
+	if mult > 1 {
+		num = s[:len(s)-1]
+	}
+
+	n, err := strconv.ParseInt(num, 10, 64)
+	if err != nil || n < 0 || n > math.MaxInt64/mult {
+		return 0, fmt.Errorf("invalid size %q: use a number of bytes with an optional K, M, G, or T suffix", s)
+	}
+
+	n *= mult
+	if n%512 != 0 {
+		return 0, fmt.Errorf("invalid size %q: the size must be a multiple of 512 bytes", s)
+	}
+
+	return n, nil
+}
+
+func validFCScratch(_ VMConfig, s string) error {
+	_, err := fcParseSize(s)
+	return err
+}
+
+// fcCheckDiskOptions returns an error when disks use an option that VMs of
+// type t do not support.
+func fcCheckDiskOptions(t VMType, disks DiskConfigs) error {
+	if t == FIRECRACKER {
+		return nil
+	}
+
+	for _, d := range disks {
+		if d.ReadOnly {
+			return errors.New("disk option ro is supported only for firecracker VMs")
+		}
+	}
+
+	return nil
 }
 
 func fcFullCopy(src, dst string) error {
@@ -868,5 +982,46 @@ func fcCacheClear() (int, error) {
 		n++
 	}
 
+	if err := fcCache.removeOrphans(dir); err != nil {
+		errs = append(errs, err)
+	}
+
 	return n, errors.Join(errs...)
+}
+
+// removeOrphans removes the temporary files of interrupted cache fills, and
+// each <key>.json that has no <key>.raw, when no fill of the key runs.
+//
+// LOCK: Assumes c.mu is held.
+func (c *fcCacheState) removeOrphans(dir string) error {
+	files, err := os.ReadDir(dir)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	} else if err != nil {
+		return err
+	}
+
+	var errs []error
+	for _, f := range files {
+		name := f.Name()
+		key, _, _ := strings.Cut(name, ".")
+		if f.IsDir() || c.inflight[key] != nil {
+			continue
+		}
+
+		orphan := strings.Contains(name, ".tmp-")
+		if name == key+".json" {
+			_, err := os.Lstat(filepath.Join(dir, key+".raw"))
+			orphan = errors.Is(err, os.ErrNotExist)
+		}
+		if !orphan {
+			continue
+		}
+
+		if err := os.Remove(filepath.Join(dir, name)); err != nil && !errors.Is(err, os.ErrNotExist) {
+			errs = append(errs, err)
+		}
+	}
+
+	return errors.Join(errs...)
 }

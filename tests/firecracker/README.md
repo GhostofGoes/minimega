@@ -15,8 +15,30 @@ runs them on a hosted x86_64 Ubuntu 24.04 runner. The job runs two times:
 
 The workflow installs Firecracker v1.17.0. It downloads a guest kernel and an
 Ubuntu root filesystem from the Firecracker CI artifact bucket and verifies
-their SHA-256 sums. When a test fails, the workflow uploads the minimega log
-and the VM logs as an artifact.
+their SHA-256 sums. It also builds the minimal guest root image with
+[`misc/firecracker/guest/build-rootfs.sh`](../../misc/firecracker/guest/build-rootfs.sh).
+When a test fails, the workflow uploads the minimega log and the VM logs as an
+artifact.
+
+## Shared read-only root check
+
+Check 14 of `smoke.sh` boots 10 VMs, `ro1` to `ro10`, from the minimal guest
+`rootfs.squashfs` with `vm config disk <image>,ro`. The even VMs also get
+`vm config firecracker-scratch 16M`. The check makes sure of these items:
+
+- All 10 VMs are `RUNNING`, and each console log shows `init: ready` and a
+  read-only squashfs root.
+- Each VM answers ping at its `mm.ip` address.
+- The jail of each VM has a hard link to the one cached copy of the image.
+  The cached copy has mode `0444` and at least 11 links.
+- No VM has a `disk-0.*` file, and no VM has a device-mapper target or a loop
+  device.
+- Only the even VMs have `scratch.raw`. It is 16 MiB, it uses less than 1 MiB,
+  and the guest kernel finds it as `vdb`.
+- Each jail has `firecracker.log` as a named pipe, and each instance directory
+  has a `firecracker.log` file that is not empty.
+- After `vm kill all` and `vm flush`, no jail is left and the cached copy has
+  one link.
 
 ## Files
 
@@ -65,6 +87,7 @@ create taps, network namespaces, loop devices, and device-mapper targets.
 
    ```bash
    sudo MINICCC="$PWD/bin/miniccc" tests/firecracker/prepare-guest.sh <workdir>
+   misc/firecracker/guest/build-rootfs.sh <workdir>/minimal --miniccc bin/miniccc
    ```
 
 6. Make the Firecracker directory `/var/lib/mmfc`. The directory and its
@@ -86,7 +109,7 @@ create taps, network namespaces, loop devices, and device-mapper targets.
    ```
 
 The checks use VLAN `LAN`, the host tap `mmfc_host`, and the addresses in
-`172.16.0.0/28`. The cc checks put one file in the minimega files directory
-(`<base>/files`) and remove it at the end. Use a minimega instance that has no
-other VMs. To use other paths, set `MM`, `MM_BASE`, `MM_LOG`, `MM_FILES`, and
-`FC_DIR`.
+`172.16.0.0/28` and `172.16.1.0/26`. The cc checks put one file in the minimega files
+directory (`<base>/files`) and remove it at the end. Use a minimega instance
+that has no other VMs. To use other paths, set `MM`, `MM_BASE`, `MM_LOG`,
+`MM_FILES`, `FC_DIR`, and `MINIMAL`.

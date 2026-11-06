@@ -176,7 +176,8 @@ To remove the entries that no VM uses:
 
 	disk cache clear
 
-disk cache clear shows the number of entries that it removed.`,
+disk cache clear shows the number of entries that it removed. It also removes
+the temporary files of cache copies that did not complete.`,
 		Patterns: []string{"disk cache [clear,]"},
 		Call:     wrapSimpleCLI(cliDiskCache),
 	},

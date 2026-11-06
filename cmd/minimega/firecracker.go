@@ -124,6 +124,16 @@ type FirecrackerConfig struct {
 	// Note: this configuration only applies to Firecracker-based VMs.
 	FirecrackerSnapshotPath string `config:"firecracker-snapshot" path:"false"`
 
+	// Add an empty writable scratch disk of this size to a VM, for example
+	// 64M or 1G. The K, M, G, and T suffixes are powers of 1024, and the size
+	// must be a multiple of 512 bytes. The scratch disk is a sparse file, so
+	// it uses only the blocks that the guest writes. It is the last disk of
+	// the VM. vm reset-disk makes it empty again. Empty or 0 adds no scratch
+	// disk.
+	//
+	// Note: this configuration only applies to Firecracker-based VMs.
+	FirecrackerScratch string `config:"firecracker-scratch" validate:"validFCScratch"`
+
 	// Files to inject into the first disk at launch, handler is not generated
 	// by vmconfiger.
 	Injects FCInjects `config:"inject"`
@@ -148,6 +158,7 @@ type FirecrackerVM struct {
 	// Objects of the current VMM.
 	jail    fcJail
 	console *fcConsole
+	vmmLog  *fcConsole
 	vmm     *fcProcess
 	client  *fcClient
 	gen     int // changes at each launch and at flush
@@ -199,6 +210,7 @@ func (vm *FirecrackerConfig) String() string {
 	fmt.Fprintf(w, "Entropy:\t%v\n", vm.FirecrackerEntropy)
 	fmt.Fprintf(w, "Vsock CID:\t%v\n", vm.VsockCID)
 	fmt.Fprintf(w, "Snapshot:\t%v\n", vm.FirecrackerSnapshotPath)
+	fmt.Fprintf(w, "Scratch:\t%v\n", vm.FirecrackerScratch)
 	fmt.Fprintf(w, "Injects:\t%v\n", vm.Injects)
 	w.Flush()
 	fmt.Fprintln(&o)
@@ -460,8 +472,8 @@ func (vm *FirecrackerVM) prepare() error {
 	return nil
 }
 
-// prepareDisks creates the disks that are not there yet, and applies the
-// injects to disk 0 once.
+// prepareDisks creates the disks that are not there yet, then the scratch
+// disk as the last disk, and applies the injects to disk 0 once.
 func (vm *FirecrackerVM) prepareDisks() error {
 	dir := fcInstanceDir(vm.ID)
 	uid := fcVMUID(vm.ID)
@@ -470,6 +482,18 @@ func (vm *FirecrackerVM) prepareDisks() error {
 		d, err := fcPrepareDiskFn(dir, i, vm.Disks[i], vm.Snapshot, vm.ID, uid)
 		if err != nil {
 			return fmt.Errorf("unable to prepare disk %v: %v", i, err)
+		}
+		vm.disks = append(vm.disks, d)
+	}
+
+	size, err := fcParseSize(vm.FirecrackerScratch)
+	if err != nil {
+		return fmt.Errorf("firecracker-scratch: %v", err)
+	}
+	if size > 0 && len(vm.disks) == len(vm.Disks) {
+		d, err := fcPrepareScratch(dir, size, uid)
+		if err != nil {
+			return err
 		}
 		vm.disks = append(vm.disks, d)
 	}
@@ -501,7 +525,7 @@ func (vm *FirecrackerVM) startVMM(cfg VMConfig, fcBin, jailerBin string) error {
 	uid := fcVMUID(vm.ID)
 
 	devices, _, _ := fcDeviceCount(cfg)
-	bootArgs, rootIndex, err := fcBootArgs(vm.Append, len(vm.disks), devices, vm.FirecrackerPCI)
+	bootArgs, rootIndex, err := fcBootArgs(vm.Append, len(vm.Disks), devices, vm.FirecrackerPCI)
 	if err != nil {
 		return err
 	}
@@ -532,7 +556,7 @@ func (vm *FirecrackerVM) startVMM(cfg VMConfig, fcBin, jailerBin string) error {
 	}
 
 	for i, d := range vm.disks {
-		if _, err := j.Link(d.HostPath, fmt.Sprintf("/disk%d", i)); err != nil {
+		if _, err := j.Link(d.HostPath, "/"+fcDriveID(i, d)); err != nil {
 			return fail(err)
 		}
 	}
@@ -546,12 +570,15 @@ func (vm *FirecrackerVM) startVMM(cfg VMConfig, fcBin, jailerBin string) error {
 		}
 	}
 
-	fcLog := filepath.Join(dir, "firecracker.log")
-	if err := fcCreateLog(fcLog, uid); err != nil {
+	logFIFO := j.HostPath("/firecracker.log")
+	if err := fcMakeConsoleFIFO(logFIFO, uid); err != nil {
 		return fail(err)
 	}
-	if _, err := j.Link(fcLog, "/firecracker.log"); err != nil {
-		return fail(err)
+	if vm.vmmLog == nil {
+		vm.vmmLog = &fcConsole{Label: "firecracker log"}
+	}
+	if err := vm.vmmLog.Start(logFIFO, filepath.Join(dir, "firecracker.log"), fcLogMaxBytes); err != nil {
+		return fail(fmt.Errorf("unable to start firecracker log reader: %v", err))
 	}
 
 	fifo := j.HostPath("/console.fifo")
@@ -661,7 +688,8 @@ func (vm *FirecrackerVM) configure(c *fcClient, bootArgs string, rootIndex int) 
 	}
 
 	for i, d := range vm.disks {
-		if err := c.PutDrive(fmt.Sprintf("disk%d", i), fmt.Sprintf("/disk%d", i), i == rootIndex, d.ReadOnly, d.CacheType); err != nil {
+		id := fcDriveID(i, d)
+		if err := c.PutDrive(id, "/"+id, i == rootIndex && !d.Scratch, d.ReadOnly, d.CacheType); err != nil {
 			return err
 		}
 	}
@@ -685,27 +713,6 @@ func (vm *FirecrackerVM) configure(c *fcClient, bootArgs string, rootIndex int) 
 	}
 
 	return c.PutSerial("/console.fifo")
-}
-
-// fcCreateLog rotates path to path.1 and creates an empty path that uid owns.
-func fcCreateLog(path string, uid int) error {
-	if err := os.Rename(path, path+".1"); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("rotate %v: %v", path, err)
-	}
-
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
-	if err != nil {
-		return err
-	}
-	if err := f.Close(); err != nil {
-		return err
-	}
-
-	if err := fcChown(path, uid, uid); err != nil {
-		return fmt.Errorf("chown %v: %v", path, err)
-	}
-
-	return nil
 }
 
 // fcResetOOMScore sets the oom_score_adj of process pid to 0, so that a VMM
@@ -786,9 +793,13 @@ func (vm *FirecrackerVM) stopVMM() {
 	<-p.exited
 }
 
+// stopConsole stops the console and log readers.
 func (vm *FirecrackerVM) stopConsole() {
 	if vm.console != nil {
 		vm.console.Stop()
+	}
+	if vm.vmmLog != nil {
+		vm.vmmLog.Stop()
 	}
 }
 

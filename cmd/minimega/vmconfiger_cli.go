@@ -627,6 +627,36 @@ Note: this configuration only applies to Firecracker-based VMs.
 		}),
 	},
 	{
+		HelpShort: "configures firecracker-scratch",
+		HelpLong: `Add an empty writable scratch disk of this size to a VM, for example
+64M or 1G. The K, M, G, and T suffixes are powers of 1024, and the size
+must be a multiple of 512 bytes. The scratch disk is a sparse file, so
+it uses only the blocks that the guest writes. It is the last disk of
+the VM. vm reset-disk makes it empty again. Empty or 0 adds no scratch
+disk.
+
+Note: this configuration only applies to Firecracker-based VMs.
+`,
+		Patterns: []string{
+			"vm config firecracker-scratch [value]",
+		},
+
+		Call: wrapSimpleCLI(func(ns *Namespace, c *minicli.Command, r *minicli.Response) error {
+			if len(c.StringArgs) == 0 {
+				r.Response = ns.vmConfig.FirecrackerScratch
+				return nil
+			}
+
+			if err := validFCScratch(ns.vmConfig, c.StringArgs["value"]); err != nil {
+				return err
+			}
+
+			ns.vmConfig.FirecrackerScratch = c.StringArgs["value"]
+
+			return nil
+		}),
+	},
+	{
 		HelpShort: "configures qemu",
 		HelpLong: `Set the QEMU binary name to invoke. Relative paths are ok.
 
@@ -1463,6 +1493,7 @@ Default: empty map
 			"clear vm config <firecracker-entropy,>",
 			"clear vm config <firecracker-pci,>",
 			"clear vm config <firecracker-path,>",
+			"clear vm config <firecracker-scratch,>",
 			"clear vm config <firecracker-snapshot,>",
 			"clear vm config <android-grpc-base-port,>",
 			"clear vm config <hostname,>",
@@ -1956,6 +1987,9 @@ func (v *FirecrackerConfig) Info(field string) (string, error) {
 	if field == "firecracker-snapshot" {
 		return v.FirecrackerSnapshotPath, nil
 	}
+	if field == "firecracker-scratch" {
+		return v.FirecrackerScratch, nil
+	}
 	if field == "inject" {
 		return fmt.Sprintf("%v", v.Injects), nil
 	}
@@ -1982,6 +2016,9 @@ func (v *FirecrackerConfig) Clear(mask string) {
 	if mask == Wildcard || mask == "firecracker-snapshot" {
 		v.FirecrackerSnapshotPath = ""
 	}
+	if mask == Wildcard || mask == "firecracker-scratch" {
+		v.FirecrackerScratch = ""
+	}
 	if mask == Wildcard || mask == "inject" {
 		v.Injects = nil
 	}
@@ -2005,6 +2042,9 @@ func (v *FirecrackerConfig) WriteConfig(w io.Writer) error {
 	}
 	if v.FirecrackerSnapshotPath != "" {
 		fmt.Fprintf(w, "vm config firecracker-snapshot %v\n", v.FirecrackerSnapshotPath)
+	}
+	if v.FirecrackerScratch != "" {
+		fmt.Fprintf(w, "vm config firecracker-scratch %v\n", v.FirecrackerScratch)
 	}
 	if err := v.Injects.WriteConfig(w); err != nil {
 		return err
@@ -2039,6 +2079,8 @@ func (v *FirecrackerConfig) ReadConfig(r io.Reader, ns string, vmConfig *VMConfi
 			v.VsockCID, _ = strconv.ParseUint(config[1], 10, 64)
 		case "firecracker-snapshot":
 			v.FirecrackerSnapshotPath = config[1]
+		case "firecracker-scratch":
+			v.FirecrackerScratch = config[1]
 		case "inject":
 			if err := v.ReadFieldConfig(strings.NewReader(line), "inject", ns, vmConfig); err != nil {
 				return err

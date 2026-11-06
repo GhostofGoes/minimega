@@ -5,7 +5,8 @@
 # Usage: sudo -E smoke.sh <workdir>
 #
 # <workdir> holds the files from prepare-guest.sh: vmlinux, rootfs.qcow2, and
-# rootfs-part.raw.
+# rootfs-part.raw. <workdir>/minimal holds rootfs.squashfs from
+# misc/firecracker/guest/build-rootfs.sh.
 #
 # Environment:
 #   FS       xfs or ext4: the filesystem of FC_DIR (required)
@@ -14,6 +15,7 @@
 #   MM_LOG   minimega -logfile (default: /tmp/mm.log)
 #   MM_FILES minimega -filepath (default: $MM_BASE/files)
 #   FC_DIR   minimega -firecracker-dir (default: /var/lib/mmfc)
+#   MINIMAL  minimal guest root image (default: <workdir>/minimal/rootfs.squashfs)
 #
 # fc1, fc2, and fc3 use vm config backchannel true. The guest root filesystem
 # starts miniccc over vsock (prepare-guest.sh), and the cc checks use it.
@@ -28,6 +30,10 @@
 #   fc2   06:00:ac:10:00:06  172.16.0.6   172.16.0.5/30
 #   fc3   06:00:ac:10:00:0a  172.16.0.10  172.16.0.9/30
 #   fc4   06:00:ac:10:00:0e  172.16.0.14  172.16.0.13/30
+#
+# Check 14 boots the minimal guest, which reads its address from the kernel
+# command line (mm.ip= and mm.gw=). VM roN gets 172.16.1.(4N-2)/30, and the
+# host tap holds 172.16.1.(4N-3)/30.
 
 set -euo pipefail
 
@@ -50,6 +56,8 @@ FC_DIR="${FC_DIR:-/var/lib/mmfc}"
 KERNEL="${WORKDIR}/vmlinux"
 QCOW2="${WORKDIR}/rootfs.qcow2"
 PART="${WORKDIR}/rootfs-part.raw"
+MINIMAL="${MINIMAL:-${WORKDIR}/minimal/rootfs.squashfs}"
+RO_VMS=10
 
 VLAN=LAN
 BRIDGE=mega_bridge
@@ -235,6 +243,29 @@ cc_recv_matches() {
 	[[ -n "$p" ]] && cmp -s "$CC_SEND_SRC" "$p"
 }
 
+ro_mac() {
+	printf '06:00:ac:10:01:%02x' $((4 * $1 - 2))
+}
+
+ro_ip() {
+	echo "172.16.1.$((4 * $1 - 2))"
+}
+
+ro_host_ip() {
+	echo "172.16.1.$((4 * $1 - 3))"
+}
+
+ro_running() {
+	local n
+	n="$(mm ".annotate false .headers false .csv true .columns name,state vm info" | grep -c '^ro[0-9]*,RUNNING' || true)"
+	[[ "$n" -eq "$RO_VMS" ]]
+}
+
+# jail_root prints the jail root directory of VM id.
+jail_root() {
+	find "${FC_DIR}/jail" -mindepth 3 -maxdepth 3 -type d -path "*/vm$1/root" | head -n 1
+}
+
 # instance_disk prints the host path of disk 0 of VM id: a file on xfs, a
 # device-mapper snapshot on ext4.
 instance_disk() {
@@ -322,9 +353,10 @@ xfs | ext4) ;;
 esac
 
 [[ $EUID -eq 0 ]] || fail "run $0 as root"
-for f in "$MM" "$KERNEL" "$QCOW2" "$PART"; do
+for f in "$MM" "$KERNEL" "$QCOW2" "$PART" "$MINIMAL"; do
 	[[ -s "$f" ]] || fail "$f is missing or empty"
 done
+MINIMAL="$(readlink -f "$MINIMAL")"
 "$MM" -base "$MM_BASE" -e version >/dev/null || fail "minimega does not answer on ${MM_BASE}"
 
 # ---------------------------------------------------------------------------
@@ -626,6 +658,103 @@ wait_for 30 "the log has the beacon message" beacon_lit
 echo "the log has the beacon message"
 kill_flush_all
 check_clean
+
+# ---------------------------------------------------------------------------
+step "14. shared read-only root"
+
+ro_start=$SECONDS
+for i in $(seq 1 "$RO_VMS"); do
+	ip addr add "$(ro_host_ip "$i")/30" dev "$HOST_TAP"
+done
+
+mm "clear vm config"
+mm "vm config vcpus 1"
+mm "vm config memory 64"
+mm "vm config kernel ${KERNEL}"
+mm "vm config disk ${MINIMAL},ro"
+mm "vm config backchannel false"
+for i in $(seq 1 "$RO_VMS"); do
+	mm "vm config append root=/dev/vda ro rootfstype=squashfs init=/init mm.ip=$(ro_ip "$i")/30 mm.gw=$(ro_host_ip "$i") mm.hostname=ro${i}"
+	if ((i % 2 == 0)); then
+		mm "vm config firecracker-scratch 16M"
+	else
+		mm "clear vm config firecracker-scratch"
+	fi
+	mm "vm config net ${VLAN},$(ro_mac "$i")"
+	mm "vm launch firecracker ro${i}"
+done
+mm "vm start all"
+if ! wait_for_quiet 30 ro_running; then
+	mm ".columns name,state,tags vm info" >&2 || true
+	fail "not all ${RO_VMS} ro VMs are RUNNING after 30s"
+fi
+echo "${RO_VMS} ro VMs are RUNNING"
+
+ro_entry="$(mm ".annotate false .headers false .csv true disk cache" | awk -F, -v src="$MINIMAL" '$2 == src')"
+[[ "$(grep -c . <<<"$ro_entry")" -eq 1 ]] ||
+	fail "disk cache has $(grep -c . <<<"$ro_entry") entries for ${MINIMAL}, not 1"
+ro_inuse="$(cut -d, -f6 <<<"$ro_entry" | tr -d '[:space:]')"
+[[ "$ro_inuse" == "$RO_VMS" ]] || fail "the cache entry of ${MINIMAL} has ${ro_inuse} users, not ${RO_VMS}"
+cached="${FC_DIR}/cache/$(cut -d, -f1 <<<"$ro_entry" | tr -d '[:space:]').raw"
+[[ "$(stat -c %a "$cached")" == 444 ]] || fail "${cached} has mode $(stat -c %a "$cached"), not 444"
+
+for i in $(seq 1 "$RO_VMS"); do
+	name="ro${i}"
+	id="$(vm_id "$name")"
+	inst="${FC_DIR}/vm/${id}"
+	console="${inst}/console.log"
+	jail="$(jail_root "$id")"
+	[[ -n "$jail" ]] || fail "no jail for ${name}"
+
+	wait_for 60 "the console of ${name} shows 'init: ready'" grep -q 'init: ready' "$console"
+	grep -q 'Mounted root (squashfs filesystem) readonly' "$console" ||
+		fail "${name} did not mount a read-only squashfs root"
+	[[ "${jail}/disk0" -ef "$cached" ]] || fail "${jail}/disk0 of ${name} is not a hard link to ${cached}"
+	if compgen -G "${inst}/disk-0.*" >/dev/null; then
+		fail "${name} has per-VM disk files: $(echo "${inst}"/disk-0.*)"
+	fi
+	[[ -p "${jail}/firecracker.log" ]] || fail "${jail}/firecracker.log of ${name} is not a named pipe"
+	[[ -s "${inst}/firecracker.log" ]] || fail "${inst}/firecracker.log of ${name} is empty"
+
+	scratch="${inst}/scratch.raw"
+	if ((i % 2 == 0)); then
+		[[ -f "$scratch" ]] || fail "${name} has no scratch.raw"
+		[[ "$(stat -c %s "$scratch")" -eq $((16 << 20)) ]] || fail "scratch.raw of ${name} is $(stat -c %s "$scratch") bytes, not 16 MiB"
+		blocks="$(stat -c %b "$scratch")"
+		bsize="$(stat -c %B "$scratch")"
+		((blocks * bsize < 1 << 20)) || fail "scratch.raw of ${name} uses $((blocks * bsize)) bytes"
+		[[ "${jail}/scratch" -ef "$scratch" ]] || fail "${jail}/scratch of ${name} is not a hard link to ${scratch}"
+		grep -q '\[vdb\]' "$console" || fail "the kernel of ${name} did not find the scratch disk vdb"
+		echo "${name}: scratch.raw uses $((blocks * bsize)) bytes"
+	else
+		[[ ! -e "$scratch" ]] || fail "${name} has a scratch.raw without firecracker-scratch"
+		if grep -q '\[vdb\]' "$console"; then
+			fail "the kernel of ${name} found a vdb without firecracker-scratch"
+		fi
+	fi
+
+	wait_for 30 "${name} answers ping at $(ro_ip "$i")" ping_ok "$(ro_ip "$i")"
+	echo "${name} booted from ${cached} and answers at $(ro_ip "$i")"
+done
+
+links="$(stat -c %h "$cached")"
+((links >= RO_VMS + 1)) || fail "${cached} has ${links} links, not at least $((RO_VMS + 1))"
+echo "${cached} has ${links} links"
+
+dm="$(dmsetup ls 2>/dev/null | awk '{print $1}' | grep '^mm-fc-' || true)"
+[[ -z "$dm" ]] || fail "read-only VMs have device-mapper targets: ${dm//$'\n'/ }"
+loops="$(losetup -a | grep -F "${FC_DIR}/" || true)"
+[[ -z "$loops" ]] || fail "read-only VMs have loop devices: ${loops//$'\n'/ }"
+echo "no device-mapper targets or loop devices for the ro VMs"
+
+kill_flush_all
+check_clean
+links="$(stat -c %h "$cached")"
+[[ "$links" -eq 1 ]] || fail "${cached} has ${links} links after the flush, not 1"
+for i in $(seq 1 "$RO_VMS"); do
+	ip addr del "$(ro_host_ip "$i")/30" dev "$HOST_TAP"
+done
+echo "check 14 took $((SECONDS - ro_start))s"
 
 mm "tap delete ${HOST_TAP}"
 

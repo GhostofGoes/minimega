@@ -12,6 +12,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
@@ -31,6 +32,12 @@ const (
 
 	// fcConsoleMaxBytes is the default size limit of console.log.
 	fcConsoleMaxBytes = 16 << 20
+
+	// fcLogMaxBytes is the size limit of firecracker.log.
+	fcLogMaxBytes = 4 << 20
+
+	// fcDrainTimeout is how long Stop waits for a reader to empty its pipe.
+	fcDrainTimeout = 500 * time.Millisecond
 
 	fcBeaconMessage = "the miniature beacons of gondor have been lit, it's a minifire!"
 )
@@ -73,6 +80,12 @@ func fcValidateConfig(name string, cfg VMConfig) (warnings []string, err error) 
 	}
 	if err := fcCheckInjects(base.Snapshot, fc.Injects); err != nil {
 		fail("%v", err)
+	}
+	if len(fc.Injects) > 0 && len(kvm.Disks) > 0 && kvm.Disks[0].ReadOnly {
+		fail("vm config inject needs a writable disk 0: disk 0 has option ro")
+	}
+	if _, err := fcParseSize(fc.FirecrackerScratch); err != nil {
+		fail("firecracker-scratch: %v", err)
 	}
 
 	if n, limit, detail := fcDeviceCount(cfg); n > limit {
@@ -132,8 +145,14 @@ func fcDeviceCount(cfg VMConfig) (n, limit int, detail string) {
 	disks := len(cfg.KVMConfig.Disks)
 	nics := len(cfg.BaseConfig.Networks)
 
-	parts := []string{fcPlural(disks, "disk"), fcPlural(nics, "NIC")}
+	parts := []string{fcPlural(disks, "disk")}
 	n = disks + nics
+
+	if size, _ := fcParseSize(cfg.FirecrackerConfig.FirecrackerScratch); size > 0 {
+		n++
+		parts = append(parts, "scratch")
+	}
+	parts = append(parts, fcPlural(nics, "NIC"))
 
 	if cfg.BaseConfig.Backchannel {
 		n++
@@ -207,8 +226,8 @@ func fcBootArgs(appendArgs []string, numDisks, numDevices int, pci bool) (args s
 	return args, rootIndex, nil
 }
 
-// fcMakeConsoleFIFO creates the named pipe that the VMM, which runs as uid,
-// writes the serial console to.
+// fcMakeConsoleFIFO creates a named pipe that the VMM, which runs as uid,
+// writes the serial console or its log to.
 func fcMakeConsoleFIFO(path string, uid int) error {
 	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
@@ -225,9 +244,12 @@ func fcMakeConsoleFIFO(path string, uid int) error {
 	return nil
 }
 
-// fcConsole copies the serial console of a VM from a named pipe to a log
-// file with a size limit.
+// fcConsole copies the serial console or the VMM log of a VM from a named
+// pipe to a log file with a size limit.
 type fcConsole struct {
+	// Label names the output in the truncation line. Empty is "console log".
+	Label string
+
 	mu   sync.Mutex
 	in   *os.File
 	done chan struct{}
@@ -259,6 +281,11 @@ func (c *fcConsole) Start(fifo, logPath string, maxBytes int64) error {
 		return err
 	}
 
+	label := c.Label
+	if label == "" {
+		label = "console log"
+	}
+
 	done := make(chan struct{})
 	c.in, c.done = in, done
 
@@ -266,13 +293,14 @@ func (c *fcConsole) Start(fifo, logPath string, maxBytes int64) error {
 		defer close(done)
 		defer out.Close()
 
-		fcCopyConsole(out, in, maxBytes)
+		fcCopyCapped(out, in, maxBytes, label)
 	}()
 
 	return nil
 }
 
-// Stop closes the pipe and waits for the copy to end.
+// Stop waits until the pipe is empty, closes it, and waits for the copy to
+// end.
 func (c *fcConsole) Stop() {
 	c.mu.Lock()
 	in, done := c.in, c.done
@@ -283,13 +311,45 @@ func (c *fcConsole) Stop() {
 		return
 	}
 
+	fcDrain(in, done, fcDrainTimeout)
 	in.Close()
 	<-done
 }
 
-// fcCopyConsole copies r to w until r fails. After maxBytes, it writes one
-// truncation line and discards the rest.
+// fcDrain returns when in has no unread bytes, done is closed, or the timeout
+// passes.
+func fcDrain(in *os.File, done <-chan struct{}, timeout time.Duration) {
+	rc, err := in.SyscallConn()
+	if err != nil {
+		return
+	}
+
+	deadline := time.Now().Add(timeout)
+	for {
+		// TIOCINQ is FIONREAD on Linux.
+		var n int
+		if err := rc.Control(func(fd uintptr) {
+			n, _ = unix.IoctlGetInt(int(fd), unix.TIOCINQ)
+		}); err != nil || n <= 0 || time.Now().After(deadline) {
+			return
+		}
+
+		select {
+		case <-done:
+			return
+		case <-time.After(time.Millisecond):
+		}
+	}
+}
+
+// fcCopyConsole is fcCopyCapped for the serial console.
 func fcCopyConsole(w io.Writer, r io.Reader, maxBytes int64) {
+	fcCopyCapped(w, r, maxBytes, "console log")
+}
+
+// fcCopyCapped copies r to w until r fails. After maxBytes, it writes one
+// truncation line that names label and discards the rest.
+func fcCopyCapped(w io.Writer, r io.Reader, maxBytes int64, label string) {
 	buf := make([]byte, 32<<10)
 
 	var written int64
@@ -318,7 +378,7 @@ func fcCopyConsole(w io.Writer, r io.Reader, maxBytes int64) {
 				if last != '\n' {
 					sep = "\n"
 				}
-				fmt.Fprintf(w, "%v[console log truncated at %d bytes]\n", sep, maxBytes)
+				fmt.Fprintf(w, "%v[%v truncated at %d bytes]\n", sep, label, maxBytes)
 			}
 		}
 
