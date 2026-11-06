@@ -47,8 +47,8 @@ not use firmware or a boot loader, so a boot loader in the disk image has no
 effect. The Firecracker project tests its releases on the host kernels 5.10,
 6.1, and 6.18.
 
-To install Firecracker in the minimega Docker image, see the Firecracker
-section of the
+The minimega Docker image includes Firecracker and the jailer. For the build
+arguments that set the version, see the Firecracker section of the
 [Docker guide](https://github.com/sandia-minimega/minimega/blob/master/docker/README.md#firecracker-vms).
 
 <a id="TOC_2.1."></a>
