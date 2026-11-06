@@ -256,6 +256,10 @@ values as for KVM VMs, and it makes a raw disk for each VM:
   minimega copies or converts the image into the cache one time. Then each VM gets
   a reflink copy or a device-mapper snapshot of the cached image. When neither
   is available, each VM gets a full sparse copy.
+- After minimega creates a device-mapper snapshot, it runs `dmsetup mknodes`.
+  Then it waits up to 5 seconds for the `/dev/mapper` node. A container without
+  udev needs this step. When the node does not appear, minimega returns an
+  error.
 - A qcow2 overlay with one backing file, as `disk snapshot` makes, gets a copy
   of its cached backing file. Then minimega commits the overlay into the copy.
   A longer chain of backing files gets a full `qemu-img convert`.
@@ -707,6 +711,15 @@ mark guest memory as mergeable.
 - `nuke` kills the VMM and jailer processes of this minimega instance. It
   removes their jails, instance directories, network namespaces,
   device-mapper targets, loop devices, and cgroups. It keeps the image cache.
+- At startup, minimega removes the Firecracker state that an earlier minimega
+  process with the same `-base` and `-firecracker-dir` left. It does the
+  Firecracker steps of `nuke`, and it also removes the `<base>/<ID>` links to
+  the instance directories. It keeps the image cache and the other entries of
+  the base directory. minimega logs each removal and a summary. It does this
+  before it accepts commands and before `-recover` runs. When the Firecracker
+  directory does not exist, it does nothing.
+- Do not use `-force` while a minimega process with the same `-base` runs. The
+  startup cleanup kills the Firecracker VMs of that process.
 - In a cluster, each host that can get a Firecracker VM needs the Firecracker
   and jailer binaries. The scheduler does not know which hosts have them.
 

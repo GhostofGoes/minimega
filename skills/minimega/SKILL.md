@@ -225,6 +225,9 @@ Consult command help before mutating state; subcommand requirements evolve.
   (`firecracker-entropy true`) also use one each, and both are on by default.
 - **Firecracker VMs are not recovered** after a minimega restart, and they
   have no VNC, screenshots, CD-ROM, hotplug, `vm net add`, or bonds.
+- **Startup removes old Firecracker VMs.** minimega kills the VMMs that an
+  earlier process with the same `-base` and `-firecracker-dir` left, and
+  removes their host objects. It keeps the image cache.
 - **`-firecracker-dir` must be one filesystem** that is not `nodev` or
   `noexec`. Only the owner can write to it and to its parent directories.
   Run `check` and read the log for the Firecracker results.
