@@ -59,7 +59,8 @@ func DestroyNetns(ns string) error {
 // in ns, then a tap fc<index> in ns that uid owns, and redirects all traffic
 // between vm<index> and fc<index> with tc. mac is the guest MAC address, used
 // to snoop the guest IP addresses. It returns the host end name and its MTU.
-// Only the OVS port and the tap table update hold the bridge lock.
+// Only the OVS port and the tap table update hold the bridge lock. With
+// OVSBatching, the OVS port add waits on the batcher without the lock.
 func (b *Bridge) CreateNetnsTap(ns, mac string, vlan, index, uid int) (string, int, error) {
 	tap := <-b.tapChan
 	peer := fmt.Sprintf("vm%d", index)
@@ -102,10 +103,52 @@ func (b *Bridge) setupNetnsTap(tap, ns, mac string, vlan, index, uid int) (int, 
 		}
 	}
 
+	if OVSBatching {
+		return mtu, b.addNetnsTapBatched(tap, mac, vlan)
+	}
+
 	bridgeLock.Lock()
 	defer bridgeLock.Unlock()
 
 	return mtu, netnsAddTap(b, tap, mac, vlan)
+}
+
+// addNetnsTapBatched adds the host end to the bridge through the OVS batcher.
+// It holds bridgeLock only to reap taps and to update the tap table.
+func (b *Bridge) addNetnsTapBatched(tap, mac string, vlan int) error {
+	log.Info("adding tap on bridge: %v %v %v %v %v", b.Name, tap, mac, vlan, false)
+
+	bridgeLock.Lock()
+	b.reapTaps()
+	_, exists := b.taps[tap]
+	bridgeLock.Unlock()
+
+	if exists {
+		return fmt.Errorf("tap already on bridge")
+	}
+
+	err := ovsAddPortBatched(b.Name, tap, vlan, false)
+	if err == errAlreadyExists {
+		log.Info("tap %v is already on bridge, adding again", tap)
+		if err = ovsDelPort(b.Name, tap); err == nil {
+			err = ovsAddPortBatched(b.Name, tap, vlan, false)
+		}
+	}
+	if err != nil {
+		return err
+	}
+
+	bridgeLock.Lock()
+	defer bridgeLock.Unlock()
+
+	b.taps[tap] = &Tap{
+		Name:   tap,
+		Bridge: b.Name,
+		VLAN:   vlan,
+		MAC:    mac,
+	}
+
+	return nil
 }
 
 // netnsTapCommands returns the commands that create tap fc<index> in ns and

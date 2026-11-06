@@ -28,10 +28,11 @@ type fakeNetns struct {
 func (f *fakeNetns) install(t *testing.T) {
 	t.Helper()
 
-	oldRun, oldDir, oldSys, oldAdd := netnsRun, netnsDir, netnsSysNet, netnsAddTap
+	oldRun, oldDir, oldSys, oldAdd, oldBatch := netnsRun, netnsDir, netnsSysNet, netnsAddTap, OVSBatching
 	t.Cleanup(func() {
-		netnsRun, netnsDir, netnsSysNet, netnsAddTap = oldRun, oldDir, oldSys, oldAdd
+		netnsRun, netnsDir, netnsSysNet, netnsAddTap, OVSBatching = oldRun, oldDir, oldSys, oldAdd, oldBatch
 	})
+	OVSBatching = false
 
 	netnsRun = func(args ...string) (string, error) {
 		f.cmds = append(f.cmds, args)
