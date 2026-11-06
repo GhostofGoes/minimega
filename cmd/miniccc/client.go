@@ -23,6 +23,15 @@ var client struct {
 	ron.Client // embed
 	sync.Mutex // embed
 
+	// claim is the UUID that miniccc sends until the server acknowledges the
+	// handshake on a connection: the -uuid flag or the guest's own UUID. It is
+	// empty on a host-bound channel, so that the host sets the UUID of the VM
+	// that the channel is bound to on every connection.
+	claim string
+	// acked is true when the server acknowledged the handshake on the
+	// current connection.
+	acked bool
+
 	Processes map[int]*Process
 
 	lastHeartbeat time.Time
@@ -44,7 +53,8 @@ type Process struct {
 }
 
 func NewClient() {
-	client.UUID = resolveClientUUID(*f_uuid, getUUID)
+	client.claim = resolveClientUUID(*f_uuid, getUUID)
+	client.UUID = client.claim
 	client.Arch = runtime.GOARCH
 	client.OS = runtime.GOOS
 	client.Version = version.Revision
@@ -61,6 +71,36 @@ func resolveClientUUID(configured string, discover func() string) string {
 	}
 
 	return discover()
+}
+
+// ackHandshake records that the server acknowledged the handshake on the
+// current connection and returns the client UUID. A client that claimed no
+// UUID takes the one in the ack. That UUID can change between connections,
+// for example when a VM snapshot is restored into another VM.
+func ackHandshake(ack *ron.Client) string {
+	client.Lock()
+	defer client.Unlock()
+
+	client.acked = true
+
+	if client.claim == "" && ack != nil && ack.UUID != "" && ack.UUID != client.UUID {
+		if client.UUID == "" {
+			log.Info("adopted serial-bound UUID: %v", ack.UUID)
+		} else {
+			log.Info("cc channel now bound to %v", ack.UUID)
+		}
+		client.UUID = ack.UUID
+	}
+
+	return client.UUID
+}
+
+// clientUUID returns the client UUID.
+func clientUUID() string {
+	client.Lock()
+	defer client.Unlock()
+
+	return client.UUID
 }
 
 func sendMessage(m *ron.Message) error {

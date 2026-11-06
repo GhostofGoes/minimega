@@ -67,7 +67,9 @@ func (s *Server) CloseForward(uuid string, id int) error {
 
 // Reverse creates a reverse tunnel from guest->host. It is possible to have
 // multiple clients create a reverse tunnel simultaneously. filter allows
-// specifying which clients to have create the tunnel.
+// specifying which clients to have create the tunnel. Under the strict cc
+// policy, the host connects only to the destinations of reverse tunnels that
+// were created here for that client.
 func (s *Server) Reverse(filter *Filter, source int, host string, dest int) error {
 	s.clientLock.Lock()
 	defer s.clientLock.Unlock()
@@ -81,7 +83,11 @@ func (s *Server) Reverse(filter *Filter, source int, host string, dest int) erro
 			return fmt.Errorf("tunnel has not been initialized for %v", c.UUID)
 		}
 
+		// the strict policy accepts the CONNECT requests for this tunnel
+		c.allowReverse(host, dest)
+
 		if err := c.tunnel.Reverse(source, host, dest); err != nil {
+			c.disallowReverse(host, dest)
 			return err
 		}
 	}

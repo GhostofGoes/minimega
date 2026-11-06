@@ -24,15 +24,16 @@ import (
 )
 
 var (
-	f_port    = flag.Int("port", 9002, "port to connect to")
-	f_version = flag.Bool("version", false, "print the version")
-	f_parent  = flag.String("parent", "", "parent to connect to (if relay or client)")
-	f_path    = flag.String("path", "/tmp/miniccc", "path to store files in")
-	f_serial  = flag.String("serial", "", "use serial device instead of tcp")
-	f_uuid    = flag.String("uuid", "", "override the client UUID")
-	f_family  = flag.String("family", "tcp", "[tcp,unix] family to dial on")
-	f_tag     = flag.Bool("tag", false, "add a key value tag in minimega for this vm")
-	f_pipe    = flag.String("pipe", "", "read/write to or from a named pipe")
+	f_port     = flag.Int("port", 9002, "port to connect to (tcp and vsock)")
+	f_version  = flag.Bool("version", false, "print the version")
+	f_parent   = flag.String("parent", "", "parent to connect to (if relay or client)")
+	f_path     = flag.String("path", "/tmp/miniccc", "path to store files in")
+	f_serial   = flag.String("serial", "", "use serial device instead of tcp")
+	f_uuid     = flag.String("uuid", "", "override the client UUID")
+	f_family   = flag.String("family", "tcp", "[tcp,unix,vsock] family to dial on; vsock dials -vsock-cid on -port and lets the host set the UUID")
+	f_vsockCID = flag.Uint("vsock-cid", 2, "vsock CID to dial with -family vsock (2 is the host)")
+	f_tag      = flag.Bool("tag", false, "add a key value tag in minimega for this vm")
+	f_pipe     = flag.String("pipe", "", "read/write to or from a named pipe")
 )
 
 const banner = `miniccc, Copyright (2014) Sandia Corporation.

@@ -11,6 +11,7 @@ import (
 	"math"
 	"net"
 	"sort"
+	"syscall"
 	"time"
 
 	"github.com/sandia-minimega/minimega/v2/internal/minitunnel"
@@ -53,7 +54,7 @@ func mux(done chan struct{}) {
 			return
 		})
 
-		if errors.Is(err, errTimeout) || errors.Is(err, io.EOF) {
+		if connectionLost(err) {
 			log.Warn("server connection lost: resetting client")
 
 			// server connection lost, so reset client
@@ -70,12 +71,9 @@ func mux(done chan struct{}) {
 		switch m.Type {
 		case ron.MESSAGE_CLIENT:
 			// ACK of the handshake
-			if client.UUID == "" && m.Client != nil && m.Client.UUID != "" {
-				client.UUID = m.Client.UUID
-				log.Info("adopted serial-bound UUID: %v", client.UUID)
-			}
+			uuid := ackHandshake(m.Client)
 			if !tunnelStarted {
-				go ron.Trunk(remote, client.UUID, sendMessage)
+				go ron.Trunk(remote, uuid, sendMessage)
 				tunnelStarted = true
 			}
 			log.Info("handshake complete")
@@ -102,6 +100,14 @@ func mux(done chan struct{}) {
 	}
 
 	log.Info("mux exit: %v", err)
+}
+
+// connectionLost reports whether err means that the connection to the server
+// is gone. A vsock transport reset, for example during a VM snapshot, gives
+// ECONNRESET.
+func connectionLost(err error) bool {
+	return errors.Is(err, errTimeout) || errors.Is(err, io.EOF) ||
+		errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, syscall.ECONNRESET)
 }
 
 func commandHandler(done chan struct{}) {

@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/gob"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -17,9 +18,16 @@ const RetryInterval = 15 * time.Second
 
 var errTimeout = fmt.Errorf("timeout waiting for function")
 
+var errVsockUnsupported = errors.New("-family vsock is only supported on Linux")
+
+// vsockDialer dials the host for -family vsock. Tests replace it.
+var vsockDialer = dialVsock
+
 func dial() error {
 	client.Lock()
 	defer client.Unlock()
+
+	client.acked = false
 
 	var err error
 
@@ -33,11 +41,19 @@ func dial() error {
 				addr = fmt.Sprintf("%v:%v", *f_parent, *f_port)
 			case "unix":
 				addr = *f_parent
+			case "vsock":
 			default:
 				log.Fatal("invalid ron dial network family: %v", *f_family)
 			}
 
-			client.conn, err = net.Dial(*f_family, addr)
+			if *f_family == "vsock" {
+				client.conn, err = vsockDialer(*f_port)
+				if errors.Is(err, errVsockUnsupported) {
+					log.Fatal("%v", err)
+				}
+			} else {
+				client.conn, err = net.Dial(*f_family, addr)
+			}
 		} else {
 			err = timeout(ron.CLIENT_RECONNECT_RATE*time.Second, func() (err error) {
 				client.conn, err = dialSerial(*f_serial)
