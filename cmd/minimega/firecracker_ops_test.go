@@ -26,11 +26,11 @@ func setFCOpsSeams(t *testing.T) {
 
 	oldExports, oldConvert := fcExports, fcConvertQcow2
 	oldReflink, oldClone, oldRun := fcReflinkOK, fcCloneFile, fcRunCmd
-	oldInjects := fcApplyInjectsFn
+	oldInjects, oldWait := fcApplyInjectsFn, fcWaitDev
 	t.Cleanup(func() {
 		fcExports, fcConvertQcow2 = oldExports, oldConvert
 		fcReflinkOK, fcCloneFile, fcRunCmd = oldReflink, oldClone, oldRun
-		fcApplyInjectsFn = oldInjects
+		fcApplyInjectsFn, fcWaitDev = oldInjects, oldWait
 	})
 
 	fcExports = &fcExportRegistry{m: map[int]*fcExport{}}
@@ -459,6 +459,12 @@ func TestFCExportDiskDM(t *testing.T) {
 		return os.WriteFile(dst, []byte("qcow2"), 0600)
 	}
 
+	var waited []string
+	fcWaitDev = func(dev string, timeout time.Duration) error {
+		waited = append(waited, dev)
+		return nil
+	}
+
 	vm := f.newVM(t, f.config(t))
 	vm.lock.Unlock()
 
@@ -510,11 +516,15 @@ func TestFCExportDiskDM(t *testing.T) {
 		{"blockdev", "--flushbufs", "/dev/mapper/mm-fc-t-0"},
 		{"losetup", "--find", "--show", xcow},
 		{"dmsetup", "create", name, "--table", fcDMSnapshotTable(8192, "/dev/loop1", "/dev/loop9")},
+		{"dmsetup", "mknodes", name},
 		{"dmsetup", "remove", name},
 		{"losetup", "-d", "/dev/loop9"},
 	}
 	if got := cmds.get(); !reflect.DeepEqual(got, want) {
 		t.Errorf("commands =\n%q\nwant\n%q", got, want)
+	}
+	if want := []string{"/dev/mapper/" + name}; !reflect.DeepEqual(waited, want) {
+		t.Errorf("waited for %q, want %q", waited, want)
 	}
 
 	if convertSrc != "/dev/mapper/"+name {

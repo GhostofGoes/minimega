@@ -430,7 +430,10 @@ func fcFreezeDM(d fcDisk, instanceDir string, vmID, n int) (fcFrozenDisk, error)
 		return fail(fmt.Errorf("dmsetup create %v: %v: %v", name, strings.TrimSpace(out), err))
 	}
 	f.dmName = name
-	f.Path = filepath.Join("/dev/mapper", name)
+
+	if f.Path, err = fcDMNode(name); err != nil {
+		return fail(err)
+	}
 
 	return f, nil
 }
