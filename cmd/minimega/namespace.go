@@ -7,6 +7,7 @@ package main
 import (
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -519,6 +520,12 @@ Outer:
 // Launch wraps VMs.Launch, registering the launched VMs with ron. It blocks
 // until all the VMs are launched.
 func (n *Namespace) Launch(requestor string, q *QueuedVMs) []error {
+	if q.VMType == FIRECRACKER {
+		for _, w := range fcIgnoredLaunchSettings(q.VMConfig, n.hugepagesMountPath) {
+			log.Warn("%v", w)
+		}
+	}
+
 	// collect all the errors
 	errs := []error{}
 	for err := range n.VMs.Launch(requestor, n.Name, q) {
@@ -700,7 +707,8 @@ func (n *Namespace) processVMBonds(vals []string) error {
 
 // Save creates a restorable namespace launch script and saves runtime state for
 // VM types that support minimega save semantics. KVM VMs have state and disk
-// files saved. Container and Android VMs are saved as configuration only.
+// files saved. Container, Android, and Firecracker VMs are saved as
+// configuration only.
 // Android Emulator runtime state, AVD data changes, and guest-side network
 // configuration are not captured. If dir is not an absolute path, it will be a
 // subdirectory of iomBase.
@@ -803,30 +811,10 @@ func (n *Namespace) Save(dir string) error {
 
 			fmt.Fprintf(f, "vm config disks %s\n", diskConfigs.String())
 
-		} else if vm.GetType() == CONTAINER {
-			log.Warn("Saving configuration only for container: %q\n", vm.GetName())
-			fmt.Fprintf(f, "clear vm config\n")
-
-			if err := vm.WriteConfig(f); err != nil {
-				return err
-			}
-		} else if vm.GetType() == ANDROID {
-			log.Warn("Saving configuration only for Android VM: %q\n", vm.GetName())
-
-			fmt.Fprintf(f, "# Android VM %q is saved as configuration only.\n", vm.GetName())
-			fmt.Fprintf(f, "# Android Emulator runtime state, AVD data changes, guest IP addresses,\n")
-			fmt.Fprintf(f, "# guest policy routing, and guest firewall state are not captured.\n")
-
-			fmt.Fprintf(f, "clear vm config\n")
-
-			if err := vm.WriteConfig(f); err != nil {
-				return err
-			}
-		} else {
-			return fmt.Errorf("namespace save does not support VM type %v for VM %q", vm.GetType(), vm.GetName())
+			fmt.Fprintf(f, "vm launch %v %q\n\n", vm.GetType(), vm.GetName())
+		} else if err := saveVMConfigOnly(f, vm); err != nil {
+			return err
 		}
-
-		fmt.Fprintf(f, "vm launch %v %q\n\n", vm.GetType(), vm.GetName())
 	}
 
 	if n.QueueVMs {
@@ -840,6 +828,47 @@ func (n *Namespace) Save(dir string) error {
 	fmt.Fprintf(f, "shell sleep 10\n")
 	fmt.Fprintf(f, "vm stop all\n")
 	fmt.Fprintf(f, "vm start all\n")
+
+	return nil
+}
+
+// saveVMConfigOnly writes the launch commands for a VM that namespace save
+// saves as configuration only: container, Android, and Firecracker VMs.
+func saveVMConfigOnly(f io.Writer, vm VM) error {
+	switch vm.GetType() {
+	case CONTAINER:
+		log.Warn("Saving configuration only for container: %q\n", vm.GetName())
+		fmt.Fprintf(f, "clear vm config\n")
+
+		if err := vm.WriteConfig(f); err != nil {
+			return err
+		}
+	case ANDROID:
+		log.Warn("Saving configuration only for Android VM: %q\n", vm.GetName())
+
+		fmt.Fprintf(f, "# Android VM %q is saved as configuration only.\n", vm.GetName())
+		fmt.Fprintf(f, "# Android Emulator runtime state, AVD data changes, guest IP addresses,\n")
+		fmt.Fprintf(f, "# guest policy routing, and guest firewall state are not captured.\n")
+
+		fmt.Fprintf(f, "clear vm config\n")
+
+		if err := vm.WriteConfig(f); err != nil {
+			return err
+		}
+	case FIRECRACKER:
+		log.Warn("Saving configuration only for Firecracker VM: %q\n", vm.GetName())
+
+		fmt.Fprintf(f, "# Firecracker VM %q is saved as configuration only.\n", vm.GetName())
+		fmt.Fprintf(f, "clear vm config\n")
+
+		if err := vm.WriteConfig(f); err != nil {
+			return err
+		}
+	default:
+		return fmt.Errorf("namespace save does not support VM type %v for VM %q", vm.GetType(), vm.GetName())
+	}
+
+	fmt.Fprintf(f, "vm launch %v %q\n\n", vm.GetType(), vm.GetName())
 
 	return nil
 }

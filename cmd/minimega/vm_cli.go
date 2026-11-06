@@ -37,7 +37,7 @@ info include:
 - state*     : one of (building, running, paused, quit, error)
 - uptime     : amount of time since the VM was launched
 - namespace* : namespace the VM belongs to
-- type*      : one of (kvm, container, android)
+- type*      : one of (kvm, container, android, firecracker)
 - uuid*      : QEMU system uuid
 - cc_active* : indicates whether cc is connected
 - vcpus      : the number of allocated CPUs
@@ -85,6 +85,16 @@ Additional fields are available for Android VMs:
 - android_serial       : adb serial name, e.g. emulator-5554
 - pid                  : pid of Android emulator process
 - android_grpc_port    : Android emulator gRPC control port (auto-assigned; hint via android-grpc-base-port)
+
+Additional fields are available for Firecracker VMs:
+
+- append : kernel command line string
+- disks  : disk images
+- kernel : kernel image
+- initrd : initrd image
+- pid    : pid of the Firecracker VMM process
+
+For Firecracker VMs, vnc_port is empty.
 
 The optional summary flag limits the columns to those denoted with a '*'.
 
@@ -249,6 +259,10 @@ For example, to remove the drive added above, named 0:
 
 To remove all hotplug devices, use ID "all" for the disk ID.
 
+Firecracker VMs do not support vm hotplug. For a Firecracker VM that you name
+in the target, vm hotplug returns an error. A wildcard target skips Firecracker
+VMs.
+
 See "vm start" for a full description of allowable targets.`,
 		Patterns: []string{
 			"vm hotplug",
@@ -325,7 +339,12 @@ Bonds can also be configured in "dot1q-tunnel" mode (QinQ) in OVS with the
 set to the VLAN the bonded interfaces originally belonged to. Note that a bond
 will also be configured in "dot1q-tunnel" mode if at least one of the bonded
 interfaces was configured in "dot1q-tunnel" mode, even without the "qinq"
-option.`,
+option.
+
+For Firecracker VMs, vm net connect and disconnect operate on the host end of
+the veth pair of the NIC. vm net add and vm net bond return an error for
+Firecracker VMs: Firecracker VMs get all their NICs at launch, and do not
+support bonds.`,
 		Patterns: []string{
 			"vm net <add,> <vm target> [netspec]...",
 			"vm net <connect,> <vm target> <tap position> <vlan> [bridge]",
@@ -374,7 +393,12 @@ and the maximum output is 1048576 bytes.
 Examples:
 
 	vm serial freertos
-	vm serial freertos 0 1500 131072`,
+	vm serial freertos 0 1500 131072
+
+Firecracker VMs have one serial port, port 0. For a Firecracker VM, vm serial
+returns the last part of the console log of the VM, with the output limit as
+its size. The default size is 64 KiB. The read interval has no effect. Other
+port numbers are an error.`,
 		Patterns: []string{
 			"vm serial <vm name>",
 			"vm serial <vm name> <port>",
@@ -430,7 +454,9 @@ Note: This will overwrite any prior saved files.
 
 Note: vm save is currently supported for KVM VMs only. Android VM save is not
 supported because Android Emulator snapshot/AVD state is managed separately
-from minimega's KVM migration state.`,
+from minimega's KVM migration state. For other VM types, vm save returns the
+error "vm save is not supported for <type> VMs". The old names vm snapshot and
+vm migrate do the same as vm save.`,
 		Patterns: []string{
 			"vm save",
 			"vm save <vm name>",
@@ -573,6 +599,9 @@ Change a VM to use a new ISO:
 
 "vm cdrom change" ejects the current ISO, if there is one.
 
+Firecracker VMs do not have a cdrom. For a Firecracker VM that you name in the
+target, vm cdrom returns an error. A wildcard target skips Firecracker VMs.
+
 See "vm start" for a full description of allowable targets.`,
 		Patterns: []string{
 			"vm cdrom <eject,> <vm target> [force,]",
@@ -658,7 +687,7 @@ Returned columns include:
 - res       : resident memory size (MB)
 - shr       : shared memory size (MB)
 - cpu       : host CPU usage (%%)
-- vcpu      : guest CPU usage (%%) (KVM only)
+- vcpu      : guest CPU usage (%%) (KVM and Firecracker only)
 - time      : total CPU time
 - procs     : number of processes inspected (limited to %d)
 - rx        : total received data rate (MB/s)
@@ -716,7 +745,7 @@ func cliVMCdrom(ns *Namespace, c *minicli.Command, resp *minicli.Response) error
 		return ns.VMs.Apply(target, func(vm VM, wild bool) (bool, error) {
 			kvm, ok := vm.(*KvmVM)
 			if !ok {
-				return false, nil
+				return vmUnsupported(vm, wild, "vm cdrom")
 			}
 
 			err := kvm.EjectCD(force)
@@ -736,7 +765,7 @@ func cliVMCdrom(ns *Namespace, c *minicli.Command, resp *minicli.Response) error
 		return ns.VMs.Apply(target, func(vm VM, wild bool) (bool, error) {
 			kvm, ok := vm.(*KvmVM)
 			if !ok {
-				return false, nil
+				return vmUnsupported(vm, wild, "vm cdrom")
 			}
 
 			return true, kvm.ChangeCD(f, force)
@@ -911,34 +940,73 @@ func cliVMQmp(ns *Namespace, c *minicli.Command, resp *minicli.Response) error {
 	return nil
 }
 
-func cliVMSerial(ns *Namespace, c *minicli.Command, resp *minicli.Response) error {
-	vm, err := ns.FindKvmVM(c.StringArgs["vm"])
-	if err != nil {
-		return err
-	}
-
-	port, milliseconds, limit := 0, 750, 65536
+// serialArgs returns the port, read interval, and output limit of a vm serial
+// command.
+func serialArgs(c *minicli.Command) (port, milliseconds, limit int, err error) {
+	port, milliseconds, limit = 0, 750, 65536
 	for key, target := range map[string]*int{
 		"port":         &port,
 		"milliseconds": &milliseconds,
 		"bytes":        &limit,
 	} {
 		if value := c.StringArgs[key]; value != "" {
-			parsed, err := strconv.Atoi(value)
-			if err != nil {
-				return fmt.Errorf("invalid serial %s: %q", key, value)
+			parsed, perr := strconv.Atoi(value)
+			if perr != nil {
+				return 0, 0, 0, fmt.Errorf("invalid serial %s: %q", key, value)
 			}
 			*target = parsed
 		}
 	}
-	if port < 0 || uint64(port) >= vm.SerialPorts {
-		return fmt.Errorf("serial port %d is not configured for VM %s", port, vm.GetName())
-	}
+
+	return port, milliseconds, limit, nil
+}
+
+func checkSerialLimits(milliseconds, limit int) error {
 	if milliseconds < 1 || milliseconds > 5000 {
 		return errors.New("serial read interval must be between 1 and 5000 milliseconds")
 	}
 	if limit < 1 || limit > 1048576 {
 		return errors.New("serial output limit must be between 1 and 1048576 bytes")
+	}
+
+	return nil
+}
+
+func cliVMSerial(ns *Namespace, c *minicli.Command, resp *minicli.Response) error {
+	if fc, ok := ns.FindVM(c.StringArgs["vm"]).(*FirecrackerVM); ok {
+		port, milliseconds, limit, err := serialArgs(c)
+		if err != nil {
+			return err
+		}
+		if port != 0 {
+			return errors.New("firecracker VMs have one serial port: 0")
+		}
+		if err := checkSerialLimits(milliseconds, limit); err != nil {
+			return err
+		}
+
+		out, err := fcSerialTail(fc, limit)
+		if err != nil {
+			return err
+		}
+		resp.Response = string(out)
+		return nil
+	}
+
+	vm, err := ns.FindKvmVM(c.StringArgs["vm"])
+	if err != nil {
+		return err
+	}
+
+	port, milliseconds, limit, err := serialArgs(c)
+	if err != nil {
+		return err
+	}
+	if port < 0 || uint64(port) >= vm.SerialPorts {
+		return fmt.Errorf("serial port %d is not configured for VM %s", port, vm.GetName())
+	}
+	if err := checkSerialLimits(milliseconds, limit); err != nil {
+		return err
 	}
 
 	path := filepath.Join(vm.GetInstancePath(), fmt.Sprintf("serial%d", port))
@@ -1058,15 +1126,16 @@ func cliVMSave(ns *Namespace, c *minicli.Command, resp *minicli.Response) error 
 		return vmNotFound(target)
 	}
 
-	vm, ok := found.(*KvmVM)
-	if !ok {
-		return fmt.Errorf("vm save is only supported for KVM VMs; %q is type %v", found.GetName(), found.GetType())
+	vm, isKVM := found.(*KvmVM)
+	saver, isSaver := found.(vmSaver)
+	if !isKVM && !isSaver {
+		return fmt.Errorf("vm save is not supported for %v VMs", found.GetType())
 	}
 
 	fname := c.StringArgs["filename"]
 	if c.StringArgs["filename"] == "" {
 		// Default to the VM name
-		fname = filepath.Join("saved", vm.GetName())
+		fname = filepath.Join("saved", found.GetName())
 	}
 
 	if !filepath.IsAbs(fname) {
@@ -1079,6 +1148,11 @@ func cliVMSave(ns *Namespace, c *minicli.Command, resp *minicli.Response) error 
 		}
 	} else if err != nil {
 		return err
+	}
+
+	if !isKVM {
+		log.Info("Saving VM %v to %s", found.GetName(), fname)
+		return saver.Save(fname)
 	}
 
 	// Saving disk
@@ -1094,6 +1168,23 @@ func cliVMSave(ns *Namespace, c *minicli.Command, resp *minicli.Response) error 
 	log.Info("Saving state to file %s", state_name)
 
 	return vm.Migrate(state_name)
+}
+
+// vmSaver is a VM type other than KVM that vm save supports. Save writes the
+// files of the VM with the path prefix dst. KVM VMs have their own path in
+// cliVMSave.
+type vmSaver interface {
+	Save(dst string) error
+}
+
+// vmUnsupported is the vmApplyFunc result for a VM that a command does not
+// support: an error when the target names a Firecracker VM, else a skip.
+func vmUnsupported(vm VM, wild bool, cmd string) (bool, error) {
+	if vm.GetType() == FIRECRACKER && !wild {
+		return true, fmt.Errorf("%v is not supported for firecracker VMs", cmd)
+	}
+
+	return false, nil
 }
 
 // vmShutdown asks the guest of vm to shut down.
@@ -1235,7 +1326,7 @@ func cliVMHotplug(ns *Namespace, c *minicli.Command, resp *minicli.Response) err
 				return true, kvm.Hotplug(f, version, serial)
 			}
 
-			return false, nil
+			return vmUnsupported(vm, wild, "vm hotplug")
 		})
 	} else if c.BoolArgs["remove"] {
 		disk := c.StringArgs["disk"]
@@ -1248,7 +1339,7 @@ func cliVMHotplug(ns *Namespace, c *minicli.Command, resp *minicli.Response) err
 		return ns.VMs.Apply(target, func(vm VM, wild bool) (bool, error) {
 			kvm, ok := vm.(*KvmVM)
 			if !ok {
-				return false, nil
+				return vmUnsupported(vm, wild, "vm hotplug")
 			}
 
 			if disk == Wildcard {
@@ -1304,7 +1395,14 @@ func cliVMNetMod(ns *Namespace, c *minicli.Command, resp *minicli.Response) erro
 
 	if c.BoolArgs["add"] {
 		// this will do the work of adding the interface to the vm
-		fn = func(vm VM, _ bool) (bool, error) {
+		fn = func(vm VM, wild bool) (bool, error) {
+			if vm.GetType() == FIRECRACKER {
+				if wild {
+					return false, nil
+				}
+				return true, errors.New("adding NICs to a launched firecracker VM is not supported")
+			}
+
 			nics, err := ns.parseVMNets(c.ListArgs["netspec"])
 			if err != nil {
 				return true, err
@@ -1402,7 +1500,14 @@ func cliVMNetMod(ns *Namespace, c *minicli.Command, resp *minicli.Response) erro
 			ifaces = append(ifaces, idx)
 		}
 
-		fn = func(vm VM, _ bool) (bool, error) {
+		fn = func(vm VM, wild bool) (bool, error) {
+			if vm.GetType() == FIRECRACKER {
+				if wild {
+					return false, nil
+				}
+				return true, errors.New("firecracker VMs do not support bonds")
+			}
+
 			bond := &BondConfig{
 				Name:       name,
 				Fallback:   !noFallback,

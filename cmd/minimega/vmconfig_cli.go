@@ -42,6 +42,10 @@ Clone reparses the original network "vm config net". If the cloned VM was
 configured with a static MAC, the VM config will not be launchable. Clone also
 clears the UUID.
 
+For a Firecracker VM, clone copies the base settings, the kernel, initrd,
+append, and disk settings, and the Firecracker settings. It clears the
+snapshot paths of the disks.
+
 Calling clear vm config will clear all VM configuration options, but will not
 remove saved configurations.
 
@@ -112,7 +116,7 @@ Disk images launched in snapshot mode may safely be used for multiple VMs.
 
 Calling vm config disks with no arguments prints the current configuration.
 
-Note: this configuration only applies to KVM-based VMs.`,
+Note: this configuration only applies to KVM-based and Firecracker-based VMs.`,
 		Patterns: []string{
 			"vm config disks [diskspec]...",
 		},
@@ -353,27 +357,8 @@ func cliVMConfig(ns *Namespace, c *minicli.Command, resp *minicli.Response) erro
 			return vmNotFound(name)
 		}
 
-		switch vm := found.(type) {
-		case *KvmVM:
-			ns.vmConfig.BaseConfig = vm.BaseConfig.Copy()
-			ns.vmConfig.KVMConfig = vm.KVMConfig.Copy()
-
-			// Clear SnapshotPaths since we can't launch VMs with the same SnapshotPath
-			for i, _ := range ns.vmConfig.KVMConfig.Disks {
-				ns.vmConfig.KVMConfig.Disks[i].SnapshotPath = ""
-			}
-		case *ContainerVM:
-			ns.vmConfig.BaseConfig = vm.BaseConfig.Copy()
-			ns.vmConfig.ContainerConfig = vm.ContainerConfig.Copy()
-		case *AndroidVM:
-			ns.vmConfig.BaseConfig = vm.BaseVM.BaseConfig.Copy()
-			ns.vmConfig.KVMConfig = vm.KVMConfig.Copy()
-			ns.vmConfig.AndroidConfig = vm.AndroidConfig.Copy()
-
-			// Clear SnapshotPaths since we can't launch VMs with the same SnapshotPath.
-			for i := range ns.vmConfig.KVMConfig.Disks {
-				ns.vmConfig.KVMConfig.Disks[i].SnapshotPath = ""
-			}
+		if err := cloneVMConfig(&ns.vmConfig, found); err != nil {
+			return err
 		}
 
 		// clear UUID since we can't launch VMs with the same UUID
@@ -400,6 +385,45 @@ func cliVMConfig(ns *Namespace, c *minicli.Command, resp *minicli.Response) erro
 
 	// Print the config
 	resp.Response = ns.vmConfig.String(ns.Name)
+	return nil
+}
+
+// cloneVMConfig copies the launch configuration of vm into cfg. It clears the
+// per-VM disk snapshot paths.
+func cloneVMConfig(cfg *VMConfig, vm VM) error {
+	switch vm := vm.(type) {
+	case *KvmVM:
+		cfg.BaseConfig = vm.BaseConfig.Copy()
+		cfg.KVMConfig = vm.KVMConfig.Copy()
+
+		// Clear SnapshotPaths since we can't launch VMs with the same SnapshotPath
+		for i := range cfg.KVMConfig.Disks {
+			cfg.KVMConfig.Disks[i].SnapshotPath = ""
+		}
+	case *ContainerVM:
+		cfg.BaseConfig = vm.BaseConfig.Copy()
+		cfg.ContainerConfig = vm.ContainerConfig.Copy()
+	case *AndroidVM:
+		cfg.BaseConfig = vm.BaseVM.BaseConfig.Copy()
+		cfg.KVMConfig = vm.KVMConfig.Copy()
+		cfg.AndroidConfig = vm.AndroidConfig.Copy()
+
+		// Clear SnapshotPaths since we can't launch VMs with the same SnapshotPath.
+		for i := range cfg.KVMConfig.Disks {
+			cfg.KVMConfig.Disks[i].SnapshotPath = ""
+		}
+	case *FirecrackerVM:
+		cfg.BaseConfig = vm.BaseConfig.Copy()
+		cfg.KVMConfig = vm.KVMConfig.Copy()
+		cfg.FirecrackerConfig = vm.FirecrackerConfig.Copy()
+
+		for i := range cfg.KVMConfig.Disks {
+			cfg.KVMConfig.Disks[i].SnapshotPath = ""
+		}
+	default:
+		return fmt.Errorf("vm config clone is not supported for %v VMs", vm.GetType())
+	}
+
 	return nil
 }
 
