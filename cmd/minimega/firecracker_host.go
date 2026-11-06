@@ -559,6 +559,122 @@ func checkFirecracker() {
 			log.Info("%v found at: %v", b.name, path)
 		}
 	}
+
+	warns, infos := fcTuningProblems(fcReadHostTuning(fcCgroupRoot))
+	for _, w := range warns {
+		log.Warn("firecracker host tuning: %v", w)
+	}
+	for _, i := range infos {
+		log.Info("firecracker host tuning: %v", i)
+	}
+}
+
+// fcMinNofile is the lowest RLIMIT_NOFILE soft limit that does not warn.
+const fcMinNofile = 100000
+
+// fcHostTuning holds the host settings that break or slow a host with many
+// Firecracker VMs. The string fields hold the contents of the named files.
+type fcHostTuning struct {
+	CgroupVersion int
+	Mounts        string // /proc/self/mounts
+	NofileOK      bool   // getrlimit returned NofileSoft
+	NofileSoft    uint64
+	THP           string // /sys/kernel/mm/transparent_hugepage/enabled
+	KSM           string // /sys/kernel/mm/ksm/run
+	OOMScoreAdj   string // /proc/self/oom_score_adj
+	RootIsChild   bool   // the cgroup root has cgroup.type, so it is not the host root
+	RootProcs     string // cgroup.procs of the cgroup root
+}
+
+// fcReadHostTuning reads the host settings. root is the cgroup root that holds
+// the parent cgroup of the jails. A file that cannot be read gives an empty
+// string, which no check reports.
+func fcReadHostTuning(root string) fcHostTuning {
+	read := func(path string) string {
+		data, _ := os.ReadFile(path)
+		return string(data)
+	}
+
+	t := fcHostTuning{
+		CgroupVersion: hostCgroupVersion,
+		Mounts:        read("/proc/self/mounts"),
+		THP:           read("/sys/kernel/mm/transparent_hugepage/enabled"),
+		KSM:           read("/sys/kernel/mm/ksm/run"),
+		OOMScoreAdj:   read("/proc/self/oom_score_adj"),
+		RootProcs:     read(filepath.Join(root, "cgroup.procs")),
+	}
+
+	var rl unix.Rlimit
+	if err := unix.Getrlimit(unix.RLIMIT_NOFILE, &rl); err == nil {
+		t.NofileOK, t.NofileSoft = true, rl.Cur
+	}
+
+	if _, err := os.Stat(filepath.Join(root, "cgroup.type")); err == nil {
+		t.RootIsChild = true
+	}
+
+	return t
+}
+
+// fcCgroup2Options returns the mount options of the cgroup2 mount at
+// cgroupRoot, or of the first cgroup2 mount when none is at cgroupRoot.
+func fcCgroup2Options(mounts string) ([]string, bool) {
+	var res []string
+	found := false
+
+	for _, line := range strings.Split(mounts, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 4 || fields[2] != "cgroup2" {
+			continue
+		}
+
+		if fields[1] == cgroupRoot {
+			return strings.Split(fields[3], ","), true
+		}
+		if !found {
+			res, found = strings.Split(fields[3], ","), true
+		}
+	}
+
+	return res, found
+}
+
+// fcTuningProblems returns the warnings and the information messages for the
+// host settings in t.
+func fcTuningProblems(t fcHostTuning) (warns, infos []string) {
+	if t.CgroupVersion == 2 {
+		if opts, ok := fcCgroup2Options(t.Mounts); ok {
+			favor := false
+			for _, o := range opts {
+				favor = favor || o == "favordynmods"
+			}
+			if !favor {
+				warns = append(warns, "cgroup2 is mounted without favordynmods, so each jailer cgroup change is slow with many VMs; on the host, run: mount -o remount,favordynmods /sys/fs/cgroup")
+			}
+		}
+	}
+
+	if t.NofileOK && t.NofileSoft < fcMinNofile {
+		warns = append(warns, fmt.Sprintf("the open file limit (RLIMIT_NOFILE) is %v; minimega uses several file descriptors for each firecracker VM, so set it to %v or more (in Docker: --ulimit nofile=1048576:1048576)", t.NofileSoft, fcMinNofile))
+	}
+
+	if strings.Contains(t.THP, "[always]") {
+		warns = append(warns, "transparent hugepages are set to always, which increases the host memory that each small VM uses; set /sys/kernel/mm/transparent_hugepage/enabled to madvise")
+	}
+
+	if strings.TrimSpace(t.KSM) == "1" {
+		warns = append(warns, "KSM is on (/sys/kernel/mm/ksm/run is 1); it uses host CPU to scan guest memory; set it to 0")
+	}
+
+	if v, err := strconv.Atoi(strings.TrimSpace(t.OOMScoreAdj)); err == nil && v > -1000 {
+		infos = append(infos, fmt.Sprintf("minimega oom_score_adj is %v, so the OOM killer can stop minimega; a lower value also applies to the VMs that minimega starts", v))
+	}
+
+	if t.CgroupVersion == 2 && t.RootIsChild && strings.TrimSpace(t.RootProcs) != "" {
+		warns = append(warns, fmt.Sprintf("%v holds processes, so the parent cgroup of the jails cannot enable controllers; move the processes into a child cgroup first (docker/start-minimega.sh does this in a container)", fcCgroupRoot))
+	}
+
+	return warns, infos
 }
 
 // detectCgroupVersion returns 2 when the cgroup root is a cgroup2 filesystem,

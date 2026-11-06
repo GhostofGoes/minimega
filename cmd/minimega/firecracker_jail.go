@@ -5,6 +5,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -161,6 +162,9 @@ func fcEnableController(path, ctrl string) error {
 	}
 
 	if err := os.WriteFile(path, []byte("+"+ctrl), 0644); err != nil {
+		if errors.Is(err, unix.EBUSY) {
+			return fmt.Errorf("enable %v controller in %v: %v: the cgroup holds processes, so move them into a child cgroup first (docker/start-minimega.sh does this in a container)", ctrl, path, err)
+		}
 		return fmt.Errorf("enable %v controller in %v: %v", ctrl, path, err)
 	}
 
