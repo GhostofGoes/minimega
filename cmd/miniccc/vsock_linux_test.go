@@ -7,12 +7,7 @@
 
 package main
 
-import (
-	"fmt"
-	"io"
-	"syscall"
-	"testing"
-)
+import "testing"
 
 func TestVsockSockaddr(t *testing.T) {
 	sa, err := vsockSockaddr(2, 9002)
@@ -55,22 +50,5 @@ func TestHostBoundChannel(t *testing.T) {
 		if got := hostBoundChannel(); got != tt.want {
 			t.Errorf("hostBoundChannel(%v, %q) = %v, want %v", tt.family, tt.serial, got, tt.want)
 		}
-	}
-}
-
-func TestConnectionLost(t *testing.T) {
-	for _, err := range []error{
-		errTimeout,
-		io.EOF,
-		fmt.Errorf("decoding cc message: %w", io.ErrUnexpectedEOF),
-		fmt.Errorf("decoding cc message: %w", syscall.ECONNRESET),
-	} {
-		if !connectionLost(err) {
-			t.Errorf("connectionLost(%v) = false", err)
-		}
-	}
-
-	if connectionLost(fmt.Errorf("unknown message type: 42")) {
-		t.Error("connectionLost(unknown message type) = true")
 	}
 }

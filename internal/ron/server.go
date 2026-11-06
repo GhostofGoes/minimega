@@ -844,11 +844,17 @@ func (s *Server) serveConn(addr string, conn net.Conn, expectedUUID string) {
 		if err != io.EOF && refusals.allow(addr+":handshake") {
 			// supress EOF, VM was probably never started
 			log.Error("handshake failed on %v: %v", addr, err)
+		} else {
+			log.Debug("handshake failed on %v: %v", addr, err)
 		}
 		return
 	}
 
 	conn.SetReadDeadline(time.Time{})
+
+	if expectedUUID != "" {
+		log.Info("cc client %v connected on %v", c.uuid, addr)
+	}
 
 	s.clientHandler(c)
 	log.Debug("client disconnected: %v", addr)

@@ -31,9 +31,12 @@ const (
 	// fcSocketTimeout is how long launch waits for the API socket.
 	fcSocketTimeout = 10 * time.Second
 
-	// fcVsockPortSuffix is the longest suffix that a vsock listener adds to
-	// v.sock.
-	fcVsockPortSuffix = "_4294967295"
+	// fcVsockUDS is the uds_path of the vsock device in the jail.
+	fcVsockUDS = "/v.sock"
+
+	// fcCCPort is the vsock port that miniccc dials for cc, the default
+	// -port of miniccc.
+	fcCCPort = 9002
 
 	fcTailBytes = 4096
 )
@@ -51,7 +54,19 @@ var (
 	fcJailerCommand  = func(bin string, args []string) *exec.Cmd {
 		return exec.Command(bin, args...)
 	}
+	fcProcDir = "/proc"
 )
+
+// fcCCServer is the part of the ron server that Firecracker VMs use. Tests
+// replace it.
+type fcCCServer interface {
+	RegisterVM(ron.VM)
+	UnregisterVM(ron.VM)
+	ListenUnixBound(path, uuid string, uid int) error
+	CloseUnix(path string) error
+}
+
+var _ fcCCServer = (*ron.Server)(nil)
 
 // fcLaunchGate limits the number of Firecracker VMs that launch at the same
 // time. It is separate from fcLaunchSem, which launches acquire inside it.
@@ -135,6 +150,11 @@ type FirecrackerVM struct {
 	vmm     *fcProcess
 	client  *fcClient
 	gen     int // changes at each launch and at flush
+
+	// cc is the ron server from Connect. ccPath is the cc listener of the
+	// current jail, or empty.
+	cc     fcCCServer
+	ccPath string
 }
 
 // fcProcess is one jailer process, which execs the VMM in place.
@@ -471,6 +491,7 @@ func (vm *FirecrackerVM) prepareDisks() error {
 func (vm *FirecrackerVM) startVMM(cfg VMConfig, fcBin, jailerBin string) error {
 	vm.stopVMM()
 	vm.stopConsole()
+	vm.stopCCListener()
 
 	vm.gen++
 	gen := vm.gen
@@ -491,7 +512,7 @@ func (vm *FirecrackerVM) startVMM(cfg VMConfig, fcBin, jailerBin string) error {
 		return err
 	}
 	if vm.Backchannel {
-		if err := fcCheckSocketPath(j.HostPath("/v.sock") + fcVsockPortSuffix); err != nil {
+		if err := fcCheckSocketPath(j.CCSocket()); err != nil {
 			return err
 		}
 	}
@@ -502,6 +523,7 @@ func (vm *FirecrackerVM) startVMM(cfg VMConfig, fcBin, jailerBin string) error {
 
 	fail := func(err error) error {
 		vm.stopConsole()
+		vm.stopCCListener()
 		if err2 := j.Destroy(); err2 != nil {
 			log.Error("vm %v: remove jail: %v", vm.ID, err2)
 		}
@@ -566,6 +588,10 @@ func (vm *FirecrackerVM) startVMM(cfg VMConfig, fcBin, jailerBin string) error {
 
 	vm.Pid = cmd.Process.Pid
 	log.Debug("vm %v has pid %v", vm.ID, vm.Pid)
+
+	if err := fcResetOOMScore(vm.Pid); err != nil {
+		log.Warn("vm %v: unable to reset oom_score_adj: %v", vm.ID, err)
+	}
 
 	p := &fcProcess{
 		cmd:    cmd,
@@ -645,7 +671,7 @@ func (vm *FirecrackerVM) configure(c *fcClient, bootArgs string, rootIndex int) 
 	}
 
 	if vm.Backchannel {
-		if err := c.PutVsock(uint32(vm.VsockCID), "/v.sock"); err != nil {
+		if err := c.PutVsock(uint32(vm.VsockCID), fcVsockUDS); err != nil {
 			return err
 		}
 	}
@@ -680,9 +706,61 @@ func fcCreateLog(path string, uid int) error {
 	return nil
 }
 
-// startCCListener creates the cc listener in the jail before boot.
+// fcResetOOMScore sets the oom_score_adj of process pid to 0, so that a VMM
+// does not keep the score of minimega.
+func fcResetOOMScore(pid int) error {
+	f, err := os.OpenFile(filepath.Join(fcProcDir, strconv.Itoa(pid), "oom_score_adj"), os.O_WRONLY|os.O_TRUNC, 0)
+	if err != nil {
+		return err
+	}
+
+	if _, err := f.WriteString("0"); err != nil {
+		f.Close()
+		return err
+	}
+
+	return f.Close()
+}
+
+// CCSocket returns the host path of the cc listener in the jail. The guest
+// dials vsock CID 2, port fcCCPort, and the VMM connects to this socket.
+func (j fcJail) CCSocket() string {
+	return j.HostPath(fmt.Sprintf("%v_%d", fcVsockUDS, fcCCPort))
+}
+
+// startCCListener creates the cc listener in jail j, when the VM has a cc
+// server and the jail has no listener yet.
+//
+// LOCK: Assumes vm.lock is held. ListenUnixBound takes only the ron listener
+// lock and never calls back into the VM, so it is safe under vm.lock.
 func (vm *FirecrackerVM) startCCListener(j fcJail) error {
+	if !vm.Backchannel || vm.cc == nil || vm.ccPath != "" {
+		return nil
+	}
+
+	p := j.CCSocket()
+	if err := vm.cc.ListenUnixBound(p, vm.UUID, j.GID); err != nil {
+		return fmt.Errorf("unable to create cc listener: %v", err)
+	}
+	vm.ccPath = p
+
 	return nil
+}
+
+// stopCCListener closes the cc listener of the current jail and the cc
+// connections on it.
+//
+// LOCK: Assumes vm.lock is held. CloseUnix takes only the ron listener and
+// accept locks and never calls back into the VM, so it is safe under vm.lock.
+func (vm *FirecrackerVM) stopCCListener() {
+	if vm.ccPath == "" {
+		return
+	}
+
+	if err := vm.cc.CloseUnix(vm.ccPath); err != nil {
+		log.Error("vm %v: close cc listener: %v", vm.ID, err)
+	}
+	vm.ccPath = ""
 }
 
 // stopVMM kills the current VMM and waits for it to exit. The caller holds
@@ -748,6 +826,7 @@ func (vm *FirecrackerVM) waitForExit(p *fcProcess, gen int) {
 
 		state, msg := vm.classifyExit(p)
 
+		vm.stopCCListener()
 		if err := vm.jail.Destroy(); err != nil {
 			log.Error("vm %v: remove jail: %v", vm.ID, err)
 		}
@@ -857,6 +936,7 @@ func (vm *FirecrackerVM) Flush() error {
 	vm.gen++
 	vm.stopVMM()
 	vm.stopConsole()
+	vm.stopCCListener()
 	vm.client = nil
 
 	if vm.jail.ID != "" {
@@ -951,10 +1031,54 @@ func (vm *FirecrackerVM) Screenshot(size int) ([]byte, error) {
 }
 
 func (vm *FirecrackerVM) Connect(cc *ron.Server, reconnect bool) error {
-	return nil
+	return vm.connectCC(cc)
 }
 
 func (vm *FirecrackerVM) Disconnect(cc *ron.Server) error {
+	return vm.disconnectCC(cc)
+}
+
+// connectCC registers the VM with cc once, and creates the cc listener when a
+// VMM runs without one. A relaunch creates the listener before boot, but the
+// first boot gets it here: the namespace calls Connect after the first Start.
+func (vm *FirecrackerVM) connectCC(cc fcCCServer) error {
+	if !vm.Backchannel {
+		return nil
+	}
+
+	vm.lock.Lock()
+	known := vm.cc == cc
+	vm.lock.Unlock()
+
+	// RegisterVM takes the ron client lock, which comes before vm.lock.
+	if !known {
+		cc.RegisterVM(vm)
+	}
+
+	vm.lock.Lock()
+	defer vm.lock.Unlock()
+
+	vm.cc = cc
+	if vm.client == nil {
+		return nil
+	}
+
+	return vm.startCCListener(vm.jail)
+}
+
+// disconnectCC closes the cc listener and unregisters the VM from cc.
+func (vm *FirecrackerVM) disconnectCC(cc fcCCServer) error {
+	if !vm.Backchannel {
+		return nil
+	}
+
+	vm.lock.Lock()
+	vm.stopCCListener()
+	vm.cc = nil
+	vm.lock.Unlock()
+
+	cc.UnregisterVM(vm)
+
 	return nil
 }
 

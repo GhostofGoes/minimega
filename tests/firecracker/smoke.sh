@@ -12,7 +12,11 @@
 #   MM       minimega binary (default: bin/minimega)
 #   MM_BASE  minimega -base (default: /tmp/mm)
 #   MM_LOG   minimega -logfile (default: /tmp/mm.log)
+#   MM_FILES minimega -filepath (default: $MM_BASE/files)
 #   FC_DIR   minimega -firecracker-dir (default: /var/lib/mmfc)
+#
+# fc1, fc2, and fc3 use vm config backchannel true. The guest root filesystem
+# starts miniccc over vsock (prepare-guest.sh), and the cc checks use it.
 #
 # Guest addresses: the guest root filesystem runs fcnet-setup.sh from the
 # Firecracker CI images. It reads a MAC of the form 06:00:AA:BB:CC:DD, sets
@@ -40,6 +44,7 @@ FS="${FS:-}"
 MM="${MM:-${root_dir}/bin/minimega}"
 MM_BASE="${MM_BASE:-/tmp/mm}"
 MM_LOG="${MM_LOG:-/tmp/mm.log}"
+MM_FILES="${MM_FILES:-${MM_BASE}/files}"
 FC_DIR="${FC_DIR:-/var/lib/mmfc}"
 
 KERNEL="${WORKDIR}/vmlinux"
@@ -55,6 +60,10 @@ BANNER="minifire: Firecracker microVMs for minimega"
 TMP="$(mktemp -d)"
 INJECT_LOOP=""
 INJECT_MNT=""
+
+# The file for cc send and cc recv, in the minimega files directory.
+CC_SEND_NAME="minifire-cc-$$"
+CC_SEND_SRC=""
 
 fail() {
 	echo "FAIL: $*" >&2
@@ -74,6 +83,9 @@ cleanup() {
 	fi
 	if [[ -n "$INJECT_LOOP" ]]; then
 		losetup -d "$INJECT_LOOP" || true
+	fi
+	if [[ -n "$CC_SEND_SRC" ]]; then
+		rm -f "$CC_SEND_SRC" || true
 	fi
 
 	if [[ $rc -ne 0 ]]; then
@@ -181,6 +193,46 @@ guest_ip() {
 
 host_ip() {
 	echo "172.16.0.$((4 * $1 - 3))"
+}
+
+# cc_clients prints one "uuid,mac" line for each cc client.
+cc_clients() {
+	mm ".annotate false .headers false .csv true .columns uuid,mac cc clients" 2>/dev/null
+}
+
+cc_has_client() {
+	grep -qiF "$1," <<<"$(cc_clients)"
+}
+
+cc_no_client() {
+	local out
+	out="$(cc_clients)" || return 1
+	! grep -qiF "$1," <<<"$out"
+}
+
+# cc_client_has_mac returns 0 when the cc client with UUID $1 reports MAC $2.
+cc_client_has_mac() {
+	local row
+	row="$(grep -iF "$1," <<<"$(cc_clients)")" || return 1
+	grep -qiF "$2" <<<"$row"
+}
+
+# cc_response_has returns 0 when the responses to the cc commands with prefix
+# $1 contain the text $2.
+cc_response_has() {
+	grep -qF -- "$2" <<<"$(mm "cc responses $1 raw" 2>/dev/null)"
+}
+
+# cc_recv_path prints the path of the file that cc recv got from the VM with
+# UUID $1.
+cc_recv_path() {
+	find "${MM_FILES}/miniccc_responses" -type f -path "*/$1/tmp/miniccc/files/${CC_SEND_NAME}" 2>/dev/null | head -n 1 || true
+}
+
+cc_recv_matches() {
+	local p
+	p="$(cc_recv_path "$1")"
+	[[ -n "$p" ]] && cmp -s "$CC_SEND_SRC" "$p"
 }
 
 # instance_disk prints the host path of disk 0 of VM id: a file on xfs, a
@@ -307,11 +359,13 @@ ip -br addr show dev "$HOST_TAP"
 step "3. launch fc1, fc2, and fc3 from rootfs.qcow2"
 
 base_config
+mm "vm config backchannel true"
 for i in 1 2 3; do
 	mm "vm config net ${VLAN},$(guest_mac "$i")"
 	mm "vm launch firecracker fc${i}"
 	wait_state "fc${i}" BUILDING 60
 done
+mm "vm config backchannel false"
 mm ".columns name,state,type,vlan,mac,tap vm info"
 
 # ---------------------------------------------------------------------------
@@ -325,6 +379,57 @@ for i in 1 2 3; do
 	wait_for 90 "fc${i} answers ping at $(guest_ip "$i")" ping_ok "$(guest_ip "$i")"
 	echo "fc${i} answers at $(guest_ip "$i")"
 done
+
+# ---------------------------------------------------------------------------
+step "4a. cc clients over vsock"
+
+for i in 1 2 3; do
+	u="$(vm_field "fc${i}" uuid)"
+	[[ -n "$u" ]] || fail "no UUID for fc${i}"
+	wait_for 90 "fc${i} (${u}) is a cc client" cc_has_client "$u"
+	wait_for 30 "the cc client of fc${i} reports MAC $(guest_mac "$i")" cc_client_has_mac "$u" "$(guest_mac "$i")"
+	echo "fc${i} is a cc client with MAC $(guest_mac "$i")"
+done
+mm "cc clients"
+
+# ---------------------------------------------------------------------------
+step "4b. cc exec on fc1"
+
+mm "cc filter name=fc1"
+mm "cc prefix smoke-exec"
+mm "cc exec ip -br link"
+wait_for 60 "cc exec on fc1 returns the MAC of fc1" cc_response_has smoke-exec "$(guest_mac 1)"
+mm "cc responses smoke-exec"
+for i in 2 3; do
+	if cc_response_has smoke-exec "$(guest_mac "$i")"; then
+		fail "cc exec with cc filter name=fc1 ran on fc${i}"
+	fi
+done
+
+# ---------------------------------------------------------------------------
+step "4c. cc send and cc recv with fc1"
+
+mkdir -p "$MM_FILES"
+CC_SEND_SRC="${MM_FILES}/${CC_SEND_NAME}"
+echo "minifire cc send test $(date +%s) $$" >"$CC_SEND_SRC"
+send_text="$(cat "$CC_SEND_SRC")"
+guest_file="/tmp/miniccc/files/${CC_SEND_NAME}"
+
+mm "cc prefix smoke-send"
+mm "cc send ${CC_SEND_NAME}"
+mm "cc prefix smoke-cat"
+mm "cc exec cat ${guest_file}"
+wait_for 60 "fc1 has ${guest_file} from cc send" cc_response_has smoke-cat "$send_text"
+echo "fc1 has ${guest_file} from cc send"
+
+fc1_uuid="$(vm_field fc1 uuid)"
+mm "cc prefix smoke-recv"
+mm "cc recv ${guest_file}"
+wait_for 60 "cc recv of ${guest_file} from fc1 matches ${CC_SEND_SRC}" cc_recv_matches "$fc1_uuid"
+echo "cc recv from fc1 wrote $(cc_recv_path "$fc1_uuid")"
+
+mm "clear cc prefix"
+mm "clear cc filter"
 
 # ---------------------------------------------------------------------------
 step "5. stop and resume fc1"
@@ -341,12 +446,21 @@ echo "resumed fc1 answers"
 # ---------------------------------------------------------------------------
 step "6. kill and relaunch fc2"
 
+fc2_uuid="$(vm_field fc2 uuid)"
 mm "vm kill fc2"
 wait_state fc2 QUIT 30
+wait_for 20 "the cc client of killed fc2 is gone" cc_no_client "$fc2_uuid"
+echo "killed fc2 is not a cc client"
 mm "vm start fc2"
 wait_state fc2 RUNNING 30
 wait_for 90 "relaunched fc2 answers ping" ping_ok "$(guest_ip 2)"
 echo "relaunched fc2 answers"
+
+# ---------------------------------------------------------------------------
+step "6a. cc client of relaunched fc2"
+
+wait_for 90 "relaunched fc2 (${fc2_uuid}) is a cc client" cc_has_client "$fc2_uuid"
+echo "relaunched fc2 is a cc client again"
 
 # ---------------------------------------------------------------------------
 step "7. console logs"

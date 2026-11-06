@@ -1,7 +1,8 @@
 # Firecracker functional tests
 
 These scripts boot real Firecracker VMs through minimega. They check the VM
-lifecycle, the network, the disk paths, and the cleanup of host objects.
+lifecycle, the network, cc over vsock, the disk paths, and the cleanup of host
+objects.
 
 The GitHub Actions workflow
 [`.github/workflows/firecracker.yml`](../../.github/workflows/firecracker.yml)
@@ -21,7 +22,7 @@ and the VM logs as an artifact.
 
 | File | Use |
 |---|---|
-| `prepare-guest.sh` | Builds `rootfs.ext4`, `rootfs.qcow2`, and `rootfs-part.raw` from a kernel and a squashfs root filesystem. It downloads nothing. |
+| `prepare-guest.sh` | Builds `rootfs.ext4`, `rootfs.qcow2`, and `rootfs-part.raw` from a kernel and a squashfs root filesystem. It adds miniccc and a systemd unit that starts `miniccc -family vsock -port 9002`. It downloads nothing. |
 | `smoke.sh` | Runs the checks against a running minimega. |
 
 ## Guest network addresses
@@ -85,5 +86,7 @@ create taps, network namespaces, loop devices, and device-mapper targets.
    ```
 
 The checks use VLAN `LAN`, the host tap `mmfc_host`, and the addresses in
-`172.16.0.0/28`. Use a minimega instance that has no other VMs. To use other
-paths, set `MM`, `MM_BASE`, `MM_LOG`, and `FC_DIR`.
+`172.16.0.0/28`. The cc checks put one file in the minimega files directory
+(`<base>/files`) and remove it at the end. Use a minimega instance that has no
+other VMs. To use other paths, set `MM`, `MM_BASE`, `MM_LOG`, `MM_FILES`, and
+`FC_DIR`.

@@ -225,6 +225,8 @@ jobs:
           d="${RUNNER_TEMP}/diag"
           mkdir -p "$d"
           sudo bin/minimega -base "$MM_BASE" -e 'vm info' > "${d}/vm-info.txt" 2>&1
+          sudo bin/minimega -base "$MM_BASE" -e 'cc clients' > "${d}/cc-clients.txt" 2>&1
+          sudo bin/minimega -base "$MM_BASE" -e 'cc commands' > "${d}/cc-commands.txt" 2>&1
           sudo cp "$MM_LOG" /tmp/mm.stdout "$d/"
           if sudo test -d "${FC_DIR}/vm"; then
             sudo find "${FC_DIR}/vm" -maxdepth 2 -type f \( -name 'console.log*' -o -name 'firecracker.log*' -o -name jailer.log \) -exec cp --parents -t "$d" {} +

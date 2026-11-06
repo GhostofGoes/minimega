@@ -15,6 +15,7 @@ import (
 	"sync"
 	"time"
 
+	log "github.com/sandia-minimega/minimega/v2/pkg/minilog"
 	"golang.org/x/sys/unix"
 )
 
@@ -26,6 +27,10 @@ var (
 	fcCgroupRoot    = cgroupRoot
 	fcMountinfoPath = "/proc/self/mountinfo"
 	fcChown         = os.Chown
+	fcHardLink      = os.Link
+	fcBindMount     = func(src, dst string) error {
+		return unix.Mount(src, dst, "", unix.MS_BIND, "")
+	}
 )
 
 var (
@@ -192,7 +197,9 @@ func (j fcJail) Prepare() error {
 
 // Link makes src available at name inside the jail. A block device gets a new
 // device node, a file on the jail filesystem gets a hard link, and any other
-// file gets a bind mount. It returns the method it used.
+// file gets a bind mount. A hard link that fails with EXDEV, for example
+// between two mounts of one filesystem, also gets a bind mount. It returns
+// the method it used.
 func (j fcJail) Link(src, name string) (string, error) {
 	dst := j.HostPath(name)
 
@@ -223,10 +230,14 @@ func (j fcJail) Link(src, name string) (string, error) {
 	}
 
 	if st.Dev == root.Dev {
-		if err := os.Link(src, dst); err != nil {
+		err := fcHardLink(src, dst)
+		if err == nil {
+			return "hard link", nil
+		}
+		if !errors.Is(err, unix.EXDEV) {
 			return "", fmt.Errorf("hard link %v to %v: %v", src, dst, err)
 		}
-		return "hard link", nil
+		log.Debug("hard link %v to %v: %v; using a bind mount", src, dst, err)
 	}
 
 	f, err := os.OpenFile(dst, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
@@ -235,7 +246,7 @@ func (j fcJail) Link(src, name string) (string, error) {
 	}
 	f.Close()
 
-	if err := unix.Mount(src, dst, "", unix.MS_BIND, ""); err != nil {
+	if err := fcBindMount(src, dst); err != nil {
 		return "", fmt.Errorf("bind mount %v to %v: %v", src, dst, err)
 	}
 

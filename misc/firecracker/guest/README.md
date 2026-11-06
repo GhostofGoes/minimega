@@ -65,8 +65,8 @@ The kernel `ip=` parameter also sets the address of `eth0`. When `eth0` has
 no address from `ip=` or `mm.ip`, `init` starts `udhcpc` in the background.
 
 With `mm.cc`, miniccc connects over TCP. Without `mm.cc`, miniccc uses
-`-family vsock` when `/dev/vsock` exists. This needs a miniccc build with
-vsock support.
+`-family vsock -port 9002` when `/dev/vsock` exists. minimega listens on vsock
+port 9002 for each VM with `vm config backchannel true`.
 
 ## Build the kernel
 

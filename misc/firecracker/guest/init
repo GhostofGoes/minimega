@@ -11,6 +11,9 @@
 PATH=/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 export PATH
 
+# The vsock port of cc. minimega listens on it for VMs with backchannel true.
+cc_vsock_port=9002
+
 mount -t proc -o nosuid,nodev,noexec proc /proc
 mount -t sysfs -o nosuid,nodev,noexec sysfs /sys
 grep -q ' /dev ' /proc/mounts || mount -t devtmpfs -o nosuid devtmpfs /dev
@@ -68,7 +71,7 @@ trap shutdown INT TERM
 if [ -n "$mm_cc" ]; then
 	set -- -family tcp -parent "${mm_cc%:*}" -port "${mm_cc##*:}"
 elif [ -c /dev/vsock ]; then
-	set -- -family vsock
+	set -- -family vsock -port "$cc_vsock_port"
 else
 	set --
 fi

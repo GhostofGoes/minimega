@@ -11,6 +11,8 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+
+	"golang.org/x/sys/unix"
 )
 
 func setFCJailGlobals(t *testing.T, dir string) {
@@ -296,6 +298,67 @@ func TestFCJailPrepareLinkDestroy(t *testing.T) {
 		if err := j.Destroy(); err != nil {
 			t.Errorf("v%d second Destroy: %v", version, err)
 		}
+	}
+}
+
+func TestFCJailLinkEXDEV(t *testing.T) {
+	dir := t.TempDir()
+	setFCJailGlobals(t, dir)
+
+	oldLink, oldMount := fcHardLink, fcBindMount
+	t.Cleanup(func() { fcHardLink, fcBindMount = oldLink, oldMount })
+
+	fcMountinfoPath = filepath.Join(dir, "mountinfo")
+	if err := os.WriteFile(fcMountinfoPath, []byte("22 1 8:1 / / rw - ext4 /dev/sda1 rw\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	fcChown = func(string, int, int) error { return nil }
+	hostCgroupVersion = 2
+	fcCgroupRoot = filepath.Join(dir, "cgroup")
+
+	j := newFCJail(3, filepath.Join(dir, "firecracker"))
+	if err := j.Prepare(); err != nil {
+		t.Fatal(err)
+	}
+
+	src := filepath.Join(dir, "disk.raw")
+	if err := os.WriteFile(src, []byte("disk"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	dst := j.HostPath("rootfs.raw")
+
+	var mounts [][2]string
+	fcBindMount = func(s, d string) error {
+		mounts = append(mounts, [2]string{s, d})
+		return nil
+	}
+
+	fcHardLink = func(oldname, newname string) error {
+		return &os.LinkError{Op: "link", Old: oldname, New: newname, Err: unix.EXDEV}
+	}
+	method, err := j.Link(src, "/rootfs.raw")
+	if err != nil {
+		t.Fatalf("Link with EXDEV: %v", err)
+	}
+	if method != "bind mount" {
+		t.Errorf("Link with EXDEV method = %q, want bind mount", method)
+	}
+	if want := [][2]string{{src, dst}}; !reflect.DeepEqual(mounts, want) {
+		t.Errorf("bind mounts = %v, want %v", mounts, want)
+	}
+	if fi, err := os.Stat(dst); err != nil || !fi.Mode().IsRegular() {
+		t.Errorf("bind mount target %v: %v", dst, err)
+	}
+
+	mounts = nil
+	fcHardLink = func(oldname, newname string) error {
+		return &os.LinkError{Op: "link", Old: oldname, New: newname, Err: unix.EPERM}
+	}
+	if _, err := j.Link(src, "/rootfs.raw"); err == nil || !strings.Contains(err.Error(), "hard link") {
+		t.Errorf("Link with EPERM = %v, want a hard link error", err)
+	}
+	if len(mounts) != 0 {
+		t.Errorf("Link with EPERM made bind mounts %v", mounts)
 	}
 }
 

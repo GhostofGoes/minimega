@@ -5,13 +5,11 @@
 package main
 
 import (
-	"errors"
+	"encoding/gob"
 	"fmt"
-	"io"
 	"math"
 	"net"
 	"sort"
-	"syscall"
 	"time"
 
 	"github.com/sandia-minimega/minimega/v2/internal/minitunnel"
@@ -19,8 +17,41 @@ import (
 	log "github.com/sandia-minimega/minimega/v2/pkg/minilog"
 )
 
-// mux routes incoming messages from the server based on message type
-func mux(done chan struct{}) {
+// serve starts to serve the connection that dial opened and sends the
+// handshake. It returns a function that waits until the connection is lost,
+// stops serving it, and returns the cause.
+func serve() func() error {
+	client.Lock()
+	conn, dec, lost := client.conn, client.dec, client.lost
+	client.Unlock()
+
+	done := make(chan struct{})
+
+	go mux(done, dec, lost)
+	heartbeat() // handshake is first heartbeat
+
+	return func() error {
+		err := <-lost
+
+		close(done)
+		conn.Close()
+
+		return err
+	}
+}
+
+// connLost reports err as the cause of the loss of the connection that lost
+// belongs to. Only the first error on a connection is kept.
+func connLost(lost chan<- error, err error) {
+	select {
+	case lost <- err:
+	default:
+	}
+}
+
+// mux routes incoming messages from the server based on message type. It
+// reports the error that ends the connection on lost.
+func mux(done chan struct{}, dec *gob.Decoder, lost chan<- error) {
 	// start piping data to minitunnel and trunking it over the ron
 	local, remote := net.Pipe()
 	defer local.Close()
@@ -46,21 +77,13 @@ func mux(done chan struct{}) {
 		)
 
 		err = timeout(d*time.Second, func() (err error) {
-			err = client.dec.Decode(&m)
+			err = dec.Decode(&m)
 			if err != nil {
 				err = fmt.Errorf("decoding cc message: %w", err)
 			}
 
 			return
 		})
-
-		if connectionLost(err) {
-			log.Warn("server connection lost: resetting client")
-
-			// server connection lost, so reset client
-			resetClient()
-			return
-		}
 
 		if err != nil {
 			break
@@ -99,15 +122,8 @@ func mux(done chan struct{}) {
 		}
 	}
 
-	log.Info("mux exit: %v", err)
-}
-
-// connectionLost reports whether err means that the connection to the server
-// is gone. A vsock transport reset, for example during a VM snapshot, gives
-// ECONNRESET.
-func connectionLost(err error) bool {
-	return errors.Is(err, errTimeout) || errors.Is(err, io.EOF) ||
-		errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, syscall.ECONNRESET)
+	log.Debug("mux exit: %v", err)
+	connLost(lost, err)
 }
 
 func commandHandler(done chan struct{}) {

@@ -6,6 +6,7 @@ package main
 
 import (
 	"encoding/gob"
+	"fmt"
 	"io"
 	"net"
 	"os"
@@ -36,11 +37,15 @@ var client struct {
 
 	lastHeartbeat time.Time
 
+	// writeMu guards enc and lost, which dial also sets with the client lock
+	// held. Take writeMu after the client lock.
 	writeMu sync.Mutex
 
 	conn io.ReadWriteCloser
 	enc  *gob.Encoder
 	dec  *gob.Decoder
+	// lost receives the first error on conn
+	lost chan error
 
 	commandChan chan map[int]*ron.Command
 	fileChan    chan *ron.Message
@@ -103,11 +108,22 @@ func clientUUID() string {
 	return client.UUID
 }
 
+// sendMessage sends m on the current connection. An error ends the
+// connection, so that miniccc connects again.
 func sendMessage(m *ron.Message) error {
 	client.writeMu.Lock()
 	defer client.writeMu.Unlock()
 
-	return client.enc.Encode(m)
+	if client.enc == nil {
+		return errNotConnected
+	}
+
+	err := client.enc.Encode(m)
+	if err != nil {
+		connLost(client.lost, fmt.Errorf("sending cc message: %w", err))
+	}
+
+	return err
 }
 
 // appendResponse allows a client to post a *Response to a given command. The

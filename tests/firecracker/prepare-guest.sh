@@ -14,6 +14,8 @@
 #   rootfs.qcow2     the same filesystem in qcow2 format
 #   rootfs-part.raw  1.2 GiB raw image; partition 1 holds the same filesystem
 #
+# The images also get a systemd unit that starts miniccc over vsock.
+#
 # Environment:
 #   MINICCC  miniccc binary to put in /usr/local/bin (default: bin/miniccc)
 
@@ -62,6 +64,30 @@ unsquashfs -no-progress -d "$tree" "${workdir}/rootfs.squashfs" >/dev/null
 
 echo "install ${miniccc} as /usr/local/bin/miniccc"
 install -D -o root -g root -m 0755 "$miniccc" "${tree}/usr/local/bin/miniccc"
+
+# miniccc dials the host over vsock on port 9002, where minimega listens for
+# VMs with backchannel true. Its log also goes to the console, so that the
+# console log of a VM shows how miniccc connects, also after a restore.
+unit=/etc/systemd/system/miniccc.service
+echo "install ${unit} and enable it"
+mkdir -p "${tree}/etc/systemd/system/multi-user.target.wants"
+cat >"${tree}${unit}" <<'EOF'
+[Unit]
+Description=minimega cc client over vsock
+After=network.target
+
+[Service]
+ExecStart=/usr/local/bin/miniccc -family vsock -port 9002 -level info
+Restart=always
+RestartSec=2
+StandardOutput=journal+console
+StandardError=journal+console
+
+[Install]
+WantedBy=multi-user.target
+EOF
+chmod 0644 "${tree}${unit}"
+ln -sf "$unit" "${tree}/etc/systemd/system/multi-user.target.wants/miniccc.service"
 
 echo "build ${ext4}"
 truncate -s 1G "$ext4"
