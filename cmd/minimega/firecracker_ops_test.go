@@ -6,6 +6,7 @@ package main
 
 import (
 	"bytes"
+	"errors"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -228,6 +229,43 @@ func TestFCResetDisk(t *testing.T) {
 	}
 }
 
+func TestFCResetDiskReleaseFailure(t *testing.T) {
+	f := setupFCDriver(t)
+	setFCOpsSeams(t)
+
+	vm := launchFCRunning(t, f)
+	if err := vm.Kill(); err != nil {
+		t.Fatalf("Kill() = %v", err)
+	}
+	waitFCState(t, vm, VM_QUIT)
+
+	var released []string
+	fail := true
+	fcReleaseDiskFn = func(d fcDisk) error {
+		if fail {
+			return errors.New("device busy")
+		}
+		released = append(released, d.HostPath)
+		return nil
+	}
+
+	vm.lock.Lock()
+	disk := vm.disks[0].HostPath
+	vm.lock.Unlock()
+
+	if err := vm.ResetDisk(); err == nil || !strings.Contains(err.Error(), "device busy") {
+		t.Fatalf("ResetDisk() = %v, want a release error", err)
+	}
+
+	fail = false
+	if err := vm.ResetDisk(); err != nil {
+		t.Fatalf("second ResetDisk() = %v", err)
+	}
+	if len(released) != 1 || released[0] != disk {
+		t.Errorf("released = %v, want the disk that failed to release, %v", released, disk)
+	}
+}
+
 func TestFCExportDiskRunning(t *testing.T) {
 	f := setupFCDriver(t)
 	setFCOpsSeams(t)
@@ -315,8 +353,18 @@ func TestFCExportDiskRunning(t *testing.T) {
 		t.Errorf("table = %q, want %q", got, want)
 	}
 
-	// raw, without reflink: a sparse copy, then a sparse copy to the
-	// destination.
+	// A failed reflink copy of a running VM is an error, not a slow copy.
+	fcCloneFile = func(string, string) error { return errors.New("EOPNOTSUPP") }
+	raw := filepath.Join(f.dir, "out", "disk.raw")
+	if err := vm.ExportDisk(raw, "raw"); err == nil || !strings.Contains(err.Error(), "Pause or stop the VM first") {
+		t.Fatalf("ExportDisk(raw) with a failed reflink = %v, want a fast copy error", err)
+	}
+	if got := vm.GetState(); got != VM_RUNNING {
+		t.Errorf("state = %v, want RUNNING", got)
+	}
+
+	// raw, without reflink: refused while running. A paused VM gets a sparse
+	// copy, then a sparse copy to the destination.
 	fcReflinkOK = func() bool { return false }
 
 	content := bytes.Repeat([]byte("x"), 4096)
@@ -324,7 +372,17 @@ func TestFCExportDiskRunning(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	raw := filepath.Join(f.dir, "out", "disk.raw")
+	before = len(f.requests(1))
+	if err := vm.ExportDisk(raw, "raw"); err == nil || !strings.Contains(err.Error(), "Pause or stop the VM first") {
+		t.Fatalf("ExportDisk(raw) without reflink = %v, want a fast copy error", err)
+	}
+	if got := f.requests(1)[before:]; len(got) != 0 {
+		t.Errorf("requests = %q, want none for a refused export", got)
+	}
+
+	if err := vm.Stop(); err != nil {
+		t.Fatalf("Stop() = %v", err)
+	}
 	if err := vm.ExportDisk(raw, "raw"); err != nil {
 		t.Fatalf("ExportDisk(raw) = %v", err)
 	}
@@ -333,8 +391,8 @@ func TestFCExportDiskRunning(t *testing.T) {
 	if data, err := os.ReadFile(raw); err != nil || !bytes.Equal(data, content) {
 		t.Errorf("raw destination = %d bytes, %v", len(data), err)
 	}
-	if got := vm.GetState(); got != VM_RUNNING {
-		t.Errorf("state = %v, want RUNNING", got)
+	if got := vm.GetState(); got != VM_PAUSED {
+		t.Errorf("state = %v, want PAUSED", got)
 	}
 }
 
@@ -342,7 +400,8 @@ func TestFCExportDiskConcurrent(t *testing.T) {
 	f := setupFCDriver(t)
 	setFCOpsSeams(t)
 
-	fcReflinkOK = func() bool { return false }
+	fcReflinkOK = func() bool { return true }
+	fcCloneFile = fcSparseCopy
 
 	release := make(chan struct{})
 	fcConvertQcow2 = func(src, dst string, progress func(float64)) error {

@@ -705,11 +705,6 @@ func instanceName(base string) string {
 	return hex.EncodeToString(sum[:])[:6]
 }
 
-// fcNetnsName returns the name of the network namespace for a Firecracker VM.
-func fcNetnsName(id int) string {
-	return fmt.Sprintf("mm-fc-%s-%d", fcInstance, id)
-}
-
 // fcParentCgroup returns the name of the parent cgroup for Firecracker VMs.
 func fcParentCgroup() string {
 	return "minimega-fc-" + fcInstance

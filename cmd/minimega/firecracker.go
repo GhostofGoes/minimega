@@ -47,8 +47,8 @@ var (
 	fcPrepareDiskFn  = fcPrepareDisk
 	fcReleaseDiskFn  = fcReleaseDisk
 	fcApplyInjectsFn = fcApplyInjects
-	fcCreateNetns    = bridge.CreateNetns
-	fcDestroyNetns   = bridge.DestroyNetns
+	fcCreateNetns    = bridge.NewNetns
+	fcCloseNetns     = (*bridge.Netns).Close
 	fcCreateTap      = fcCreateTapDefault
 	fcDestroyTap     = fcDestroyTapDefault
 	fcJailerCommand  = func(bin string, args []string) *exec.Cmd {
@@ -135,14 +135,15 @@ type FirecrackerVM struct {
 	FirecrackerConfig // embed
 
 	// Host objects that the first launch creates and flush removes.
-	dirReady   bool
-	disks      []fcDisk
-	injected   bool
-	kernel     fcCachedFile
-	initrd     fcCachedFile
-	netnsReady bool
-	mtus       []int
-	exportSeq  int
+	dirReady  bool
+	disks     []fcDisk
+	stale     []fcDisk // disks that vm reset-disk could not release
+	injected  bool
+	kernel    fcCachedFile
+	initrd    fcCachedFile
+	netns     *bridge.Netns
+	mtus      []int
+	exportSeq int
 
 	// Objects of the current VMM.
 	jail    fcJail
@@ -273,7 +274,7 @@ func fcCheckHostDefault(fcPath, jailerPath string) (string, string, error) {
 	return fc.Path, jailer.Path, nil
 }
 
-func fcCreateTapDefault(nic NetConfig, ns string, index, uid int) (string, int, error) {
+func fcCreateTapDefault(nic NetConfig, ns *bridge.Netns, index, uid int) (string, int, error) {
 	br, err := getBridge(nic.Bridge)
 	if err != nil {
 		return "", 0, fmt.Errorf("unable to get bridge %v: %v", nic.Bridge, err)
@@ -284,7 +285,7 @@ func fcCreateTapDefault(nic NetConfig, ns string, index, uid int) (string, int, 
 
 func fcDestroyTapDefault(nic NetConfig) error {
 	if nic.VLAN == DisconnectedVLAN {
-		return bridge.DestroyTap(nic.Tap)
+		return bridge.DeleteLink(nic.Tap)
 	}
 
 	br, err := getBridge(nic.Bridge)
@@ -292,7 +293,7 @@ func fcDestroyTapDefault(nic NetConfig) error {
 		return err
 	}
 
-	return br.DestroyTap(nic.Tap)
+	return br.DestroyNetnsTap(nic.Tap)
 }
 
 // fcCacheBootFile caches a kernel or initrd for VM vmID.
@@ -423,12 +424,12 @@ func (vm *FirecrackerVM) prepare() error {
 		vm.initrd = f
 	}
 
-	ns := fcNetnsName(vm.ID)
-	if !vm.netnsReady {
-		if err := fcCreateNetns(ns); err != nil {
+	if vm.netns == nil {
+		ns, err := fcCreateNetns()
+		if err != nil {
 			return err
 		}
-		vm.netnsReady = true
+		vm.netns = ns
 	}
 
 	if len(vm.mtus) != len(vm.Networks) {
@@ -441,7 +442,7 @@ func (vm *FirecrackerVM) prepare() error {
 			continue
 		}
 
-		tap, mtu, err := fcCreateTap(*nic, ns, i, uid)
+		tap, mtu, err := fcCreateTap(*nic, vm.netns, i, uid)
 		if err != nil {
 			return fmt.Errorf("unable to create tap %v: %v", i, err)
 		}
@@ -573,7 +574,8 @@ func (vm *FirecrackerVM) startVMM(cfg VMConfig, fcBin, jailerBin string) error {
 		return fail(fmt.Errorf("unable to create jailer log: %v", err))
 	}
 
-	args := fcJailerArgs(j, fcBin, filepath.Join(fcNetnsDir, fcNetnsName(vm.ID)), hostCgroupVersion, vm.FirecrackerPCI)
+	// The jailer opens the netns through the fd that minimega holds.
+	args := fcJailerArgs(j, fcBin, vm.netns.Path(), hostCgroupVersion, vm.FirecrackerPCI)
 	log.Debug("vm %v jailer args: %q", vm.ID, args)
 
 	cmd := fcJailerCommand(jailerBin, args)
@@ -945,12 +947,12 @@ func (vm *FirecrackerVM) Flush() error {
 		}
 	}
 
-	for i, d := range vm.disks {
+	for i, d := range append(vm.disks, vm.stale...) {
 		if err := fcReleaseDiskFn(d); err != nil {
 			log.Error("vm %v: release disk %v: %v", vm.ID, i, err)
 		}
 	}
-	vm.disks = nil
+	vm.disks, vm.stale = nil, nil
 
 	for _, f := range []fcCachedFile{vm.kernel, vm.initrd} {
 		if f.key != "" {
@@ -969,11 +971,11 @@ func (vm *FirecrackerVM) Flush() error {
 		}
 	}
 
-	if vm.netnsReady {
-		if err := fcDestroyNetns(fcNetnsName(vm.ID)); err != nil {
-			log.Error("vm %v: %v", vm.ID, err)
+	if vm.netns != nil {
+		if err := fcCloseNetns(vm.netns); err != nil {
+			log.Error("vm %v: close netns: %v", vm.ID, err)
 		}
-		vm.netnsReady = false
+		vm.netns = nil
 	}
 
 	// A failed launch can leave the directory with dirReady false.

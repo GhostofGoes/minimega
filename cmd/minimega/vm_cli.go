@@ -525,7 +525,10 @@ A relative destination path is relative to the files directory (-filepath).
 minimega creates the parent directories. The destination must not exist.
 
 For a running VM, minimega pauses the VM, takes a fast copy of the disk, and
-resumes the VM. The log shows the pause duration. The result is
+resumes the VM. The log shows the pause duration. A fast copy is possible only
+when the disk is a device-mapper snapshot or -firecracker-dir supports
+reflink. Otherwise, minimega refuses the export of a running VM. Pause or stop
+the VM first. The result is
 crash-consistent: data that the guest did not write to its disk is not in the
 image.
 

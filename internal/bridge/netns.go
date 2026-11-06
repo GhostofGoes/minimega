@@ -2,23 +2,31 @@
 // Under the terms of Contract DE-NA0003525 with NTESS, the U.S. Government retains certain
 // rights in this software.
 
+//go:build linux
+
 package bridge
 
 import (
 	"fmt"
 	"os"
-	"path/filepath"
-	"strconv"
-	"strings"
+	"runtime"
 
 	log "github.com/sandia-minimega/minimega/v2/pkg/minilog"
+	"golang.org/x/sys/unix"
 )
+
+// netnsSelf is the network namespace of the calling thread.
+const netnsSelf = "/proc/thread-self/ns/net"
 
 // Tests replace these.
 var (
-	netnsRun    = processWrapper
-	netnsDir    = "/var/run/netns"
-	netnsSysNet = "/sys/class/net"
+	netnsUnshare = func() error { return unix.Unshare(unix.CLONE_NEWNET) }
+	netnsSetns   = func(fd int) error { return unix.Setns(fd, unix.CLONE_NEWNET) }
+
+	netnsAddVeth   = addNetnsVeth
+	netnsSetupHost = setupNetnsHost
+	netnsSetupTap  = setupNetnsTap
+	netnsDelLink   = DeleteLink
 )
 
 // netnsAddTap adds the host end to the bridge. The caller holds bridgeLock.
@@ -27,31 +35,126 @@ var netnsAddTap = func(b *Bridge, tap, mac string, vlan int) error {
 	return b.addTap(tap, mac, vlan, false)
 }
 
-// CreateNetns creates the named network namespace. It deletes a leftover
-// namespace with the same name first.
-func CreateNetns(ns string) error {
-	if _, err := os.Stat(filepath.Join(netnsDir, ns)); err == nil {
-		if err := DestroyNetns(ns); err != nil {
-			return err
-		}
-	}
-
-	if out, err := netnsRun("ip", "netns", "add", ns); err != nil {
-		return fmt.Errorf("create netns %v failed: %v: %v", ns, err, out)
-	}
-
-	return nil
+// Netns is a network namespace that minimega holds open as a file
+// descriptor, with no name in /run/netns. The namespace exists until Close
+// and until every process in it exits.
+type Netns struct {
+	f  *os.File
+	fd int
 }
 
-// DestroyNetns deletes the named network namespace. A missing namespace is
-// not an error.
-func DestroyNetns(ns string) error {
-	out, err := netnsRun("ip", "netns", "del", ns)
-	if err != nil && !strings.Contains(out, "No such file") {
-		return fmt.Errorf("destroy netns %v failed: %v: %v", ns, err, out)
+// NewNetns creates a network namespace.
+func NewNetns() (*Netns, error) {
+	var ns *Netns
+
+	err := onNetnsThread(func() (bool, error) {
+		orig, err := os.Open(netnsSelf)
+		if err != nil {
+			return true, fmt.Errorf("create netns: %w", err)
+		}
+		defer orig.Close()
+
+		if err := netnsUnshare(); err != nil {
+			return true, fmt.Errorf("create netns: %w", err)
+		}
+
+		f, openErr := os.Open(netnsSelf)
+
+		if err := netnsSetns(int(orig.Fd())); err != nil {
+			if f != nil {
+				f.Close()
+			}
+			return false, fmt.Errorf("create netns: restore thread netns: %w", err)
+		}
+		if openErr != nil {
+			return true, fmt.Errorf("create netns: %w", openErr)
+		}
+
+		ns = &Netns{f: f, fd: int(f.Fd())}
+		return true, nil
+	})
+
+	return ns, err
+}
+
+// Path returns a path that opens the namespace while it is open in minimega,
+// for example for `jailer --netns`.
+func (ns *Netns) Path() string {
+	if ns == nil || ns.f == nil {
+		return ""
 	}
 
-	return nil
+	return fmt.Sprintf("/proc/%d/fd/%d", os.Getpid(), ns.fd)
+}
+
+// Close releases the namespace. The kernel removes it, and the links in it,
+// when no process is left in it.
+func (ns *Netns) Close() error {
+	if ns == nil || ns.f == nil {
+		return nil
+	}
+
+	err := ns.f.Close()
+	ns.f = nil
+	return err
+}
+
+// Do runs fn on an OS thread in the namespace. Goroutines that fn starts run
+// outside of it.
+func (ns *Netns) Do(fn func() error) error {
+	if ns == nil || ns.f == nil {
+		return fmt.Errorf("netns is closed")
+	}
+
+	return onNetnsThread(func() (bool, error) {
+		orig, err := os.Open(netnsSelf)
+		if err != nil {
+			return true, fmt.Errorf("enter netns: %w", err)
+		}
+		defer orig.Close()
+
+		if err := netnsSetns(ns.fd); err != nil {
+			return true, fmt.Errorf("enter netns: %w", err)
+		}
+
+		ferr := fn()
+
+		if err := netnsSetns(int(orig.Fd())); err != nil {
+			return false, fmt.Errorf("leave netns: %w", err)
+		}
+
+		return true, ferr
+	})
+}
+
+// onNetnsThread runs fn on a new locked OS thread. When fn returns false, the
+// thread stays locked and Go discards it with the goroutine, because the
+// thread is in another namespace.
+func onNetnsThread(fn func() (bool, error)) error {
+	ch := make(chan error, 1)
+
+	go func() {
+		runtime.LockOSThread()
+		restored, err := fn()
+		if restored {
+			runtime.UnlockOSThread()
+		}
+		ch <- err
+	}()
+
+	return <-ch
+}
+
+// DeleteLink deletes the named link in the network namespace of minimega.
+// Deleting one end of a veth pair deletes both ends.
+func DeleteLink(name string) error {
+	c, err := nlDial()
+	if err != nil {
+		return err
+	}
+	defer c.Close()
+
+	return c.linkDel(name)
 }
 
 // CreateNetnsTap connects a tap in the network namespace ns to the bridge. It
@@ -61,20 +164,20 @@ func DestroyNetns(ns string) error {
 // to snoop the guest IP addresses. It returns the host end name and its MTU.
 // Only the OVS port and the tap table update hold the bridge lock. With
 // OVSBatching, the OVS port add waits on the batcher without the lock.
-func (b *Bridge) CreateNetnsTap(ns, mac string, vlan, index, uid int) (string, int, error) {
+func (b *Bridge) CreateNetnsTap(ns *Netns, mac string, vlan, index, uid int) (string, int, error) {
 	tap := <-b.tapChan
 	peer := fmt.Sprintf("vm%d", index)
 
-	log.Info("creating netns tap on bridge %v: %v %v %v %v %v", b.Name, tap, ns, mac, vlan, index)
+	log.Info("creating netns tap on bridge %v: %v %v %v %v", b.Name, tap, mac, vlan, index)
 
-	if out, err := netnsRun("ip", "link", "add", tap, "type", "veth", "peer", "name", peer, "netns", ns); err != nil {
-		return "", 0, fmt.Errorf("create veth failed: %v: %v", err, out)
+	if err := netnsAddVeth(tap, peer, ns); err != nil {
+		return "", 0, err
 	}
 
 	mtu, err := b.setupNetnsTap(tap, ns, mac, vlan, index, uid)
 	if err != nil {
-		if out, err := netnsRun("ip", "link", "del", tap); err != nil {
-			log.Error("zombie tap -- %v %v: %v", tap, err, out)
+		if err := netnsDelLink(tap); err != nil {
+			log.Error("zombie tap -- %v %v", tap, err)
 		}
 
 		return "", 0, err
@@ -83,24 +186,14 @@ func (b *Bridge) CreateNetnsTap(ns, mac string, vlan, index, uid int) (string, i
 	return tap, mtu, nil
 }
 
-func (b *Bridge) setupNetnsTap(tap, ns, mac string, vlan, index, uid int) (int, error) {
-	if out, err := netnsRun("ip", "link", "set", tap, "up"); err != nil {
-		return 0, fmt.Errorf("up interface failed: %v: %v", err, out)
+func (b *Bridge) setupNetnsTap(tap string, ns *Netns, mac string, vlan, index, uid int) (int, error) {
+	mtu, err := netnsSetupHost(tap)
+	if err != nil {
+		return 0, err
 	}
 
-	data, err := os.ReadFile(filepath.Join(netnsSysNet, tap, "mtu"))
-	if err != nil {
-		return 0, fmt.Errorf("read MTU of %v: %v", tap, err)
-	}
-	mtu, err := strconv.Atoi(strings.TrimSpace(string(data)))
-	if err != nil {
-		return 0, fmt.Errorf("read MTU of %v: %v", tap, err)
-	}
-
-	for _, args := range netnsTapCommands(ns, index, uid, mtu) {
-		if out, err := netnsRun(args...); err != nil {
-			return 0, fmt.Errorf("netns tap setup failed: %v: %v: %v", strings.Join(args, " "), err, out)
-		}
+	if err := netnsSetupTap(ns, index, uid, mtu); err != nil {
+		return 0, err
 	}
 
 	if OVSBatching {
@@ -111,6 +204,98 @@ func (b *Bridge) setupNetnsTap(tap, ns, mac string, vlan, index, uid int) (int, 
 	defer bridgeLock.Unlock()
 
 	return mtu, netnsAddTap(b, tap, mac, vlan)
+}
+
+// DestroyNetnsTap marks a tap that CreateNetnsTap created as defunct and
+// deletes its veth pair. ReapTaps removes it from the bridge.
+func (b *Bridge) DestroyNetnsTap(tap string) error {
+	log.Info("destroying netns tap on bridge: %v %v", b.Name, tap)
+
+	bridgeLock.Lock()
+	t, ok := b.taps[tap]
+	if ok {
+		t.Defunct = true
+	}
+	bridgeLock.Unlock()
+
+	if !ok {
+		return fmt.Errorf("unknown tap: %v", tap)
+	}
+
+	return netnsDelLink(tap)
+}
+
+// addNetnsVeth creates the veth pair tap and peer, with peer in ns.
+func addNetnsVeth(tap, peer string, ns *Netns) error {
+	c, err := nlDial()
+	if err != nil {
+		return err
+	}
+	defer c.Close()
+
+	return c.linkAddVethPeerNetns(tap, peer, ns)
+}
+
+// setupNetnsHost sets the host end tap up and returns its MTU.
+func setupNetnsHost(tap string) (int, error) {
+	c, err := nlDial()
+	if err != nil {
+		return 0, err
+	}
+	defer c.Close()
+
+	if err := c.linkSet(tap, 0, true); err != nil {
+		return 0, err
+	}
+
+	l, err := c.linkGet(tap)
+	if err != nil {
+		return 0, err
+	}
+
+	return l.MTU, nil
+}
+
+// setupNetnsTap creates tap fc<index> in ns, sets it and vm<index> up with
+// mtu, and redirects traffic both ways between them.
+func setupNetnsTap(ns *Netns, index, uid, mtu int) error {
+	veth := fmt.Sprintf("vm%d", index)
+	tap := fmt.Sprintf("fc%d", index)
+
+	return ns.Do(func() error {
+		if err := createTunTap(tap, uid); err != nil {
+			return err
+		}
+
+		c, err := nlDial()
+		if err != nil {
+			return err
+		}
+		defer c.Close()
+
+		var idx [2]int32
+		for i, name := range []string{veth, tap} {
+			if err := c.linkSet(name, mtu, true); err != nil {
+				return err
+			}
+			l, err := c.linkGet(name)
+			if err != nil {
+				return err
+			}
+			idx[i] = l.Index
+		}
+
+		for _, p := range [][2]int32{{idx[0], idx[1]}, {idx[1], idx[0]}} {
+			if err := c.qdiscAddIngress(p[0]); err != nil {
+				return err
+			}
+			if err := c.filterAddRedirect(p[0], p[1]); err != nil {
+				return err
+			}
+		}
+
+		return nil
+	})
 }
 
 // addNetnsTapBatched adds the host end to the bridge through the OVS batcher.
@@ -149,30 +334,4 @@ func (b *Bridge) addNetnsTapBatched(tap, mac string, vlan int) error {
 	}
 
 	return nil
-}
-
-// netnsTapCommands returns the commands that create tap fc<index> in ns and
-// redirect traffic both ways between it and vm<index>.
-func netnsTapCommands(ns string, index, uid, mtu int) [][]string {
-	veth := fmt.Sprintf("vm%d", index)
-	tap := fmt.Sprintf("fc%d", index)
-	id := strconv.Itoa(uid)
-	m := strconv.Itoa(mtu)
-
-	cmds := [][]string{
-		{"ip", "-n", ns, "tuntap", "add", "dev", tap, "mode", "tap", "user", id, "group", id},
-		{"ip", "-n", ns, "link", "set", "dev", veth, "mtu", m},
-		{"ip", "-n", ns, "link", "set", "dev", tap, "mtu", m},
-		{"ip", "-n", ns, "link", "set", "dev", veth, "up"},
-		{"ip", "-n", ns, "link", "set", "dev", tap, "up"},
-	}
-
-	for _, p := range [][2]string{{veth, tap}, {tap, veth}} {
-		cmds = append(cmds,
-			[]string{"tc", "-n", ns, "qdisc", "add", "dev", p[0], "ingress"},
-			[]string{"tc", "-n", ns, "filter", "add", "dev", p[0], "parent", "ffff:", "matchall", "action", "mirred", "egress", "redirect", "dev", p[1]},
-		)
-	}
-
-	return cmds
 }

@@ -21,10 +21,12 @@ func setFCJailGlobals(t *testing.T, dir string) {
 	oldDir, oldBase := *f_firecrackerDir, *f_firecrackerUIDBase
 	oldInstance, oldVersion := fcInstance, hostCgroupVersion
 	oldRoot, oldMounts, oldChown := fcCgroupRoot, fcMountinfoPath, fcChown
+	oldMount, oldUnmount := fcMount, fcUnmount
 	t.Cleanup(func() {
 		*f_firecrackerDir, *f_firecrackerUIDBase = oldDir, oldBase
 		fcInstance, hostCgroupVersion = oldInstance, oldVersion
 		fcCgroupRoot, fcMountinfoPath, fcChown = oldRoot, oldMounts, oldChown
+		fcMount, fcUnmount = oldMount, oldUnmount
 	})
 
 	*f_firecrackerDir = dir
@@ -47,7 +49,7 @@ func TestFCJailerArgs(t *testing.T) {
 			"--parent-cgroup", "minimega-fc-a1b2c3",
 			"--cgroup", cgroup,
 			"--chroot-base-dir", "/fc/jail",
-			"--netns", "/var/run/netns/mm-fc-a1b2c3-7",
+			"--netns", "/proc/42/fd/7",
 			"--",
 			"--api-sock", "/api.sock",
 		}
@@ -65,7 +67,7 @@ func TestFCJailerArgs(t *testing.T) {
 		{"v2 pci", 2, true, want("cpu.weight=100", "2", "--enable-pci")},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			got := fcJailerArgs(j, "/usr/bin/firecracker", "/var/run/netns/mm-fc-a1b2c3-7", tc.version, tc.pci)
+			got := fcJailerArgs(j, "/usr/bin/firecracker", "/proc/42/fd/7", tc.version, tc.pci)
 			if !reflect.DeepEqual(got, tc.want) {
 				t.Errorf("fcJailerArgs() =\n%q\nwant\n%q", got, tc.want)
 			}
@@ -102,6 +104,10 @@ func TestNewFCJail(t *testing.T) {
 		UID:      200007,
 		GID:      200007,
 	}
+	if j.mounts == nil || len(*j.mounts) != 0 {
+		t.Fatalf("newFCJail() mount record = %v, want an empty record", j.mounts)
+	}
+	want.mounts = j.mounts
 	if j != want {
 		t.Fatalf("newFCJail() = %+v, want %+v", j, want)
 	}
@@ -359,6 +365,90 @@ func TestFCJailLinkEXDEV(t *testing.T) {
 	}
 	if len(mounts) != 0 {
 		t.Errorf("Link with EPERM made bind mounts %v", mounts)
+	}
+}
+
+func TestFCJailTrackedMounts(t *testing.T) {
+	dir := t.TempDir()
+	setFCJailGlobals(t, dir)
+
+	// A read of the mount table fails.
+	fcMountinfoPath = filepath.Join(dir, "no-mountinfo")
+	fcChown = func(string, int, int) error { return nil }
+	hostCgroupVersion = 2
+	fcCgroupRoot = filepath.Join(dir, "cgroup")
+
+	var mounted, unmounted []string
+	fcMount = func(src, dst, fstype string, flags uintptr, data string) error {
+		mounted = append(mounted, dst)
+		return nil
+	}
+	fcUnmount = func(target string, flags int) error {
+		unmounted = append(unmounted, target)
+		return nil
+	}
+
+	bin := filepath.Join(dir, "firecracker")
+	if err := os.WriteFile(bin, nil, 0755); err != nil {
+		t.Fatal(err)
+	}
+	j := newFCJail(3, bin)
+
+	if err := j.Prepare(); err != nil {
+		t.Fatalf("Prepare of a new jail: %v", err)
+	}
+
+	// /dev/null is on another filesystem, so Link bind mounts it.
+	for _, name := range []string{"/a", "sub/b", "/c"} {
+		method, err := j.Link(os.DevNull, name)
+		if err != nil {
+			t.Fatalf("Link %v: %v", name, err)
+		}
+		if method != "bind mount" {
+			t.Skipf("Link %v used %v: %v and the jail are on one filesystem", name, method, os.DevNull)
+		}
+	}
+	want := []string{j.HostPath("a"), j.HostPath("sub/b"), j.HostPath("c")}
+	if !reflect.DeepEqual(mounted, want) {
+		t.Errorf("mounts = %q, want %q", mounted, want)
+	}
+
+	// A copy of the jail shares the record.
+	k := j
+	if err := k.Destroy(); err != nil {
+		t.Fatalf("Destroy: %v", err)
+	}
+	if want := []string{j.HostPath("sub/b"), j.HostPath("c"), j.HostPath("a")}; !reflect.DeepEqual(unmounted, want) {
+		t.Errorf("unmounts = %q, want %q", unmounted, want)
+	}
+	if _, err := os.Stat(j.Dir()); !os.IsNotExist(err) {
+		t.Errorf("Destroy left %v: %v", j.Dir(), err)
+	}
+
+	unmounted = nil
+	if err := j.Destroy(); err != nil || len(unmounted) != 0 {
+		t.Errorf("second Destroy = %v, unmounts %q", err, unmounted)
+	}
+
+	// A jail without a record, or a jail directory that is left, needs the
+	// mount table.
+	untracked := j
+	untracked.mounts = nil
+	if err := untracked.Destroy(); err == nil || !strings.Contains(err.Error(), "read mounts") {
+		t.Errorf("Destroy without a record = %v, want a mount table read error", err)
+	}
+	if err := os.MkdirAll(j.Root, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := j.Prepare(); err == nil || !strings.Contains(err.Error(), "read mounts") {
+		t.Errorf("Prepare over a left jail = %v, want a mount table read error", err)
+	}
+}
+
+func TestFCDeepestFirst(t *testing.T) {
+	got := fcDeepestFirst([]string{"/j/a", "/j/x/b", "/j/a", "/j/c"})
+	if want := []string{"/j/x/b", "/j/c", "/j/a", "/j/a"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("fcDeepestFirst() = %q, want %q", got, want)
 	}
 }
 

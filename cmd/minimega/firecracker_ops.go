@@ -204,13 +204,17 @@ func (vm *FirecrackerVM) ResetDisk() error {
 
 	log.Info("resetting disks of VM: %v", vm.ID)
 
+	// Keep a disk that fails to release, so that a later reset-disk or
+	// flush tries again.
 	var errs []error
-	for i, d := range vm.disks {
+	var stale []fcDisk
+	for i, d := range append(vm.disks, vm.stale...) {
 		if err := fcReleaseDiskFn(d); err != nil {
 			errs = append(errs, fmt.Errorf("disk %v: %v", i, err))
+			stale = append(stale, d)
 		}
 	}
-	vm.disks = nil
+	vm.disks, vm.stale = nil, stale
 	vm.injected = false
 
 	if err := errors.Join(errs...); err != nil {
@@ -262,7 +266,8 @@ func (f fcFrozenDisk) release() error {
 
 // ExportDisk starts an export of disk 0 to dst in format raw or qcow2. It
 // takes a frozen copy of the disk, and pauses a running VM only for that
-// copy. It returns before the conversion to dst, which vm export-disk with
+// copy. For a running VM the copy must be fast: a device-mapper snapshot or a
+// reflink copy. It returns before the conversion to dst, which vm export-disk with
 // no arguments reports.
 func (vm *FirecrackerVM) ExportDisk(dst, format string) error {
 	vm.lock.Lock()
@@ -314,6 +319,9 @@ func (vm *FirecrackerVM) freezeDisk() (fcFrozenDisk, error) {
 	if running && vm.client == nil {
 		return fcFrozenDisk{}, vmNotRunning(vm.Name)
 	}
+	if running && vm.disks[0].dmName == "" && !fcReflinkOK() {
+		return fcFrozenDisk{}, fmt.Errorf("vm %v is running, and export-disk cannot make a fast copy of its disk: the disk is not a device-mapper snapshot and %v does not support reflink. Pause or stop the VM first", vm.Name, *f_firecrackerDir)
+	}
 
 	var start time.Time
 	if running {
@@ -323,7 +331,7 @@ func (vm *FirecrackerVM) freezeDisk() (fcFrozenDisk, error) {
 		start = time.Now()
 	}
 
-	f, err := fcFreezeDisk(vm.disks[0], fcInstanceDir(vm.ID), vm.ID, n)
+	f, err := fcFreezeDiskCopy(vm.disks[0], fcInstanceDir(vm.ID), vm.ID, n, !running)
 
 	if running {
 		if err2 := vm.client.PatchVMState("Resumed"); err2 != nil {
@@ -344,6 +352,12 @@ func (vm *FirecrackerVM) freezeDisk() (fcFrozenDisk, error) {
 // disk gets a copy of its copy-on-write file in a new snapshot of the same
 // base. A file gets a reflink copy, or a sparse copy without reflink.
 func fcFreezeDisk(d fcDisk, instanceDir string, vmID, n int) (fcFrozenDisk, error) {
+	return fcFreezeDiskCopy(d, instanceDir, vmID, n, true)
+}
+
+// fcFreezeDiskCopy is fcFreezeDisk. With slow false, it returns an error
+// instead of a sparse copy when the reflink copy fails.
+func fcFreezeDiskCopy(d fcDisk, instanceDir string, vmID, n int, slow bool) (fcFrozenDisk, error) {
 	if d.dmName != "" {
 		return fcFreezeDM(d, instanceDir, vmID, n)
 	}
@@ -355,6 +369,10 @@ func fcFreezeDisk(d fcDisk, instanceDir string, vmID, n int) (fcFrozenDisk, erro
 		err := fcCloneFile(d.HostPath, dst)
 		if err == nil {
 			return f, nil
+		}
+		if !slow {
+			os.Remove(dst)
+			return fcFrozenDisk{}, fmt.Errorf("reflink copy of %v failed, and a running VM needs a fast copy: %v. Pause or stop the VM first", d.HostPath, err)
 		}
 		log.Warn("vm %v: reflink copy failed, using a sparse copy: %v", vmID, err)
 	}

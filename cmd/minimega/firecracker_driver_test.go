@@ -16,6 +16,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/sandia-minimega/minimega/v2/internal/bridge"
 )
 
 // fcDriverFakes replaces the host operations of the Firecracker driver. Each
@@ -52,12 +54,12 @@ func setupFCDriver(t *testing.T) *fcDriverFakes {
 
 	oldBase, oldCache := *f_base, fcCache
 	oldCheck, oldPrepare, oldRelease := fcCheckHost, fcPrepareDiskFn, fcReleaseDiskFn
-	oldNetns, oldDelNetns, oldTap, oldDelTap := fcCreateNetns, fcDestroyNetns, fcCreateTap, fcDestroyTap
+	oldNetns, oldDelNetns, oldTap, oldDelTap := fcCreateNetns, fcCloseNetns, fcCreateTap, fcDestroyTap
 	oldCommand := fcJailerCommand
 	t.Cleanup(func() {
 		*f_base, fcCache = oldBase, oldCache
 		fcCheckHost, fcPrepareDiskFn, fcReleaseDiskFn = oldCheck, oldPrepare, oldRelease
-		fcCreateNetns, fcDestroyNetns, fcCreateTap, fcDestroyTap = oldNetns, oldDelNetns, oldTap, oldDelTap
+		fcCreateNetns, fcCloseNetns, fcCreateTap, fcDestroyTap = oldNetns, oldDelNetns, oldTap, oldDelTap
 		fcJailerCommand = oldCommand
 	})
 
@@ -95,15 +97,20 @@ func setupFCDriver(t *testing.T) *fcDriverFakes {
 		f.count("release-disk")
 		return nil
 	}
-	fcCreateNetns = func(string) error {
+	fcCreateNetns = func() (*bridge.Netns, error) {
 		f.count("create-netns")
+		return new(bridge.Netns), nil
+	}
+	fcCloseNetns = func(ns *bridge.Netns) error {
+		if ns != nil {
+			f.count("destroy-netns")
+		}
 		return nil
 	}
-	fcDestroyNetns = func(string) error {
-		f.count("destroy-netns")
-		return nil
-	}
-	fcCreateTap = func(nic NetConfig, ns string, index, uid int) (string, int, error) {
+	fcCreateTap = func(nic NetConfig, ns *bridge.Netns, index, uid int) (string, int, error) {
+		if ns == nil {
+			return "", 0, errors.New("tap without a netns")
+		}
 		f.count("create-tap")
 		return fmt.Sprintf("mega_tap%d", index), 1500, nil
 	}

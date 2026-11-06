@@ -151,9 +151,6 @@ func TestFirecrackerHostNames(t *testing.T) {
 
 	fcInstance = "a1b2c3"
 
-	if got, want := fcNetnsName(7), "mm-fc-a1b2c3-7"; got != want {
-		t.Errorf("fcNetnsName(7) = %q, want %q", got, want)
-	}
 	if got, want := fcParentCgroup(), "minimega-fc-a1b2c3"; got != want {
 		t.Errorf("fcParentCgroup() = %q, want %q", got, want)
 	}

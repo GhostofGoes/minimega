@@ -28,8 +28,10 @@ var (
 	fcMountinfoPath = "/proc/self/mountinfo"
 	fcChown         = os.Chown
 	fcHardLink      = os.Link
+	fcMount         = unix.Mount
+	fcUnmount       = unix.Unmount
 	fcBindMount     = func(src, dst string) error {
-		return unix.Mount(src, dst, "", unix.MS_BIND, "")
+		return fcMount(src, dst, "", unix.MS_BIND, "")
 	}
 )
 
@@ -46,6 +48,11 @@ type fcJail struct {
 	ID       string
 	Root     string
 	UID, GID int
+
+	// mounts records the bind mounts that Link made, and copies of the jail
+	// share it. It is nil for a jail that newFCJail did not return, and
+	// Destroy then reads the mount table.
+	mounts *[]string
 }
 
 // newFCJail returns the jail for VM vmID that runs the Firecracker binary
@@ -56,6 +63,7 @@ func newFCJail(vmID int, fcBin string) fcJail {
 		ExecName: filepath.Base(fcResolve(fcBin)),
 		ID:       fmt.Sprintf("vm%d", vmID),
 		UID:      fcVMUID(vmID),
+		mounts:   new([]string),
 	}
 	j.GID = j.UID
 	j.Root = filepath.Join(j.Dir(), "root")
@@ -177,9 +185,11 @@ func fcEnableController(path, ctrl string) error {
 }
 
 // Prepare removes any jail left from an earlier launch and creates an empty
-// jail root and /out, owned by the VM uid.
+// jail root and /out, owned by the VM uid. It reads the mount table only when
+// a jail directory is left.
 func (j fcJail) Prepare() error {
-	if err := j.Destroy(); err != nil {
+	_, statErr := os.Lstat(j.Dir())
+	if err := j.destroy(j.mounts == nil || statErr == nil); err != nil {
 		return err
 	}
 
@@ -249,6 +259,9 @@ func (j fcJail) Link(src, name string) (string, error) {
 	if err := fcBindMount(src, dst); err != nil {
 		return "", fmt.Errorf("bind mount %v to %v: %v", src, dst, err)
 	}
+	if j.mounts != nil {
+		*j.mounts = append(*j.mounts, dst)
+	}
 
 	return "bind mount", nil
 }
@@ -276,24 +289,38 @@ func (j fcJail) mkdirs(dir string) error {
 	return nil
 }
 
-// Destroy unmounts everything under the jail directory, removes it, and
-// removes the VM cgroup. Missing paths are not errors.
+// Destroy unmounts the bind mounts that Link made, removes the jail
+// directory, and removes the VM cgroup. Missing paths are not errors. It reads
+// the mount table when the jail has no mount record or when the directory
+// stays busy.
 func (j fcJail) Destroy() error {
+	return j.destroy(j.mounts == nil)
+}
+
+func (j fcJail) destroy(scan bool) error {
 	dir := j.Dir()
 
-	data, err := os.ReadFile(fcMountinfoPath)
-	if err != nil {
-		return fmt.Errorf("read mounts: %v", err)
-	}
-
-	for _, m := range fcMountsUnder(string(data), dir) {
-		if err := unix.Unmount(m, unix.MNT_DETACH); err != nil && err != unix.EINVAL && err != unix.ENOENT {
-			return fmt.Errorf("unmount %v: %v", m, err)
+	if scan {
+		if err := fcUnmountUnder(dir); err != nil {
+			return err
 		}
+	} else if err := fcUnmountAll(fcDeepestFirst(*j.mounts)); err != nil {
+		return err
+	}
+	if j.mounts != nil {
+		*j.mounts = nil
 	}
 
 	if err := os.RemoveAll(dir); err != nil {
-		return fmt.Errorf("remove jail: %v", err)
+		if scan {
+			return fmt.Errorf("remove jail: %v", err)
+		}
+		if err := fcUnmountUnder(dir); err != nil {
+			return err
+		}
+		if err := os.RemoveAll(dir); err != nil {
+			return fmt.Errorf("remove jail: %v", err)
+		}
 	}
 
 	for _, cg := range fcVMCgroups(fcCgroupRoot, fcParentCgroup(), j.ID, hostCgroupVersion) {
@@ -338,6 +365,29 @@ func fcRmdirRetry(dir string) error {
 	}
 }
 
+// fcUnmountUnder unmounts every mount point in the mount table that is dir or
+// below it.
+func fcUnmountUnder(dir string) error {
+	data, err := os.ReadFile(fcMountinfoPath)
+	if err != nil {
+		return fmt.Errorf("read mounts: %v", err)
+	}
+
+	return fcUnmountAll(fcMountsUnder(string(data), dir))
+}
+
+// fcUnmountAll detaches each mount point in order. A path that is gone or not
+// a mount point is not an error.
+func fcUnmountAll(mounts []string) error {
+	for _, m := range mounts {
+		if err := fcUnmount(m, unix.MNT_DETACH); err != nil && err != unix.EINVAL && err != unix.ENOENT {
+			return fmt.Errorf("unmount %v: %v", m, err)
+		}
+	}
+
+	return nil
+}
+
 // fcMountsUnder returns the mount points in mountinfo that are dir or below
 // it, deepest first.
 func fcMountsUnder(mountinfo, dir string) []string {
@@ -354,6 +404,17 @@ func fcMountsUnder(mountinfo, dir string) []string {
 		if mp == dir || strings.HasPrefix(mp, dir+"/") {
 			res = append(res, mp)
 		}
+	}
+
+	return fcDeepestFirst(res)
+}
+
+// fcDeepestFirst sorts paths by depth, deepest first, and keeps the later
+// mount first among paths of the same depth.
+func fcDeepestFirst(paths []string) []string {
+	res := make([]string, len(paths))
+	for i, p := range paths {
+		res[len(paths)-1-i] = p
 	}
 
 	sort.SliceStable(res, func(a, b int) bool {

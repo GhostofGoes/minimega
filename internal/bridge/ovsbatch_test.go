@@ -300,7 +300,7 @@ func TestCreateNetnsTapBatched(t *testing.T) {
 			t.Cleanup(func() { ovsCmdWrapper = old })
 
 			b := testBridge()
-			tap, mtu, err := b.CreateNetnsTap("mm-fc-a1b2c3-7", "00:11:22:33:44:55", 101, 0, 200007)
+			tap, mtu, err := b.CreateNetnsTap(&Netns{}, "00:11:22:33:44:55", 101, 0, 200007)
 			if err != nil {
 				t.Fatalf("CreateNetnsTap: %v", err)
 			}

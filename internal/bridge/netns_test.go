@@ -2,49 +2,67 @@
 // Under the terms of Contract DE-NA0003525 with NTESS, the U.S. Government retains certain
 // rights in this software.
 
+//go:build linux
+
 package bridge
 
 import (
 	"errors"
+	"fmt"
 	"os"
-	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
+
+	"golang.org/x/sys/unix"
 )
 
-// fakeNetns records commands. locked counts the commands that ran while
-// bridgeLock was held, and addOK is set when netnsAddTap ran under it.
+// fakeNetns records the netns tap steps. locked counts the steps that ran
+// while bridgeLock was held, and addOK is set when netnsAddTap ran under it.
 type fakeNetns struct {
-	cmds     [][]string
+	steps    []string
 	locked   int
 	fail     string
-	failOut  string
 	addCalls int
 	addErr   error
 	addOK    bool
 }
 
+func (f *fakeNetns) step(s string) error {
+	f.steps = append(f.steps, s)
+	if bridgeLock.TryLock() {
+		bridgeLock.Unlock()
+	} else {
+		f.locked++
+	}
+	if f.fail != "" && strings.HasPrefix(s, f.fail) {
+		return errors.New(f.fail + " failed")
+	}
+	return nil
+}
+
 func (f *fakeNetns) install(t *testing.T) {
 	t.Helper()
 
-	oldRun, oldDir, oldSys, oldAdd, oldBatch := netnsRun, netnsDir, netnsSysNet, netnsAddTap, OVSBatching
+	oldVeth, oldHost, oldTap, oldDel := netnsAddVeth, netnsSetupHost, netnsSetupTap, netnsDelLink
+	oldAdd, oldBatch := netnsAddTap, OVSBatching
 	t.Cleanup(func() {
-		netnsRun, netnsDir, netnsSysNet, netnsAddTap, OVSBatching = oldRun, oldDir, oldSys, oldAdd, oldBatch
+		netnsAddVeth, netnsSetupHost, netnsSetupTap, netnsDelLink = oldVeth, oldHost, oldTap, oldDel
+		netnsAddTap, OVSBatching = oldAdd, oldBatch
 	})
 	OVSBatching = false
 
-	netnsRun = func(args ...string) (string, error) {
-		f.cmds = append(f.cmds, args)
-		if bridgeLock.TryLock() {
-			bridgeLock.Unlock()
-		} else {
-			f.locked++
-		}
-		if f.fail != "" && strings.Contains(strings.Join(args, " "), f.fail) {
-			return f.failOut, errors.New("exit status 1")
-		}
-		return "", nil
+	netnsAddVeth = func(tap, peer string, ns *Netns) error {
+		return f.step(fmt.Sprintf("veth %v %v", tap, peer))
+	}
+	netnsSetupHost = func(tap string) (int, error) {
+		return 9000, f.step("host " + tap)
+	}
+	netnsSetupTap = func(ns *Netns, index, uid, mtu int) error {
+		return f.step(fmt.Sprintf("tap %d %d %d", index, uid, mtu))
+	}
+	netnsDelLink = func(name string) error {
+		return f.step("del " + name)
 	}
 
 	netnsAddTap = func(b *Bridge, tap, mac string, vlan int) error {
@@ -60,16 +78,6 @@ func (f *fakeNetns) install(t *testing.T) {
 		b.taps[tap] = &Tap{Name: tap, Bridge: b.Name, VLAN: vlan, MAC: mac}
 		return nil
 	}
-
-	dir := t.TempDir()
-	netnsDir = filepath.Join(dir, "netns")
-	netnsSysNet = filepath.Join(dir, "net")
-	if err := os.MkdirAll(filepath.Join(netnsSysNet, "mega_tap7"), 0755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(netnsSysNet, "mega_tap7", "mtu"), []byte("9000\n"), 0644); err != nil {
-		t.Fatal(err)
-	}
 }
 
 func testBridge() *Bridge {
@@ -83,30 +91,12 @@ func testBridge() *Bridge {
 	}
 }
 
-func TestNetnsTapCommands(t *testing.T) {
-	want := [][]string{
-		{"ip", "-n", "mm-fc-a1b2c3-7", "tuntap", "add", "dev", "fc1", "mode", "tap", "user", "200007", "group", "200007"},
-		{"ip", "-n", "mm-fc-a1b2c3-7", "link", "set", "dev", "vm1", "mtu", "1450"},
-		{"ip", "-n", "mm-fc-a1b2c3-7", "link", "set", "dev", "fc1", "mtu", "1450"},
-		{"ip", "-n", "mm-fc-a1b2c3-7", "link", "set", "dev", "vm1", "up"},
-		{"ip", "-n", "mm-fc-a1b2c3-7", "link", "set", "dev", "fc1", "up"},
-		{"tc", "-n", "mm-fc-a1b2c3-7", "qdisc", "add", "dev", "vm1", "ingress"},
-		{"tc", "-n", "mm-fc-a1b2c3-7", "filter", "add", "dev", "vm1", "parent", "ffff:", "matchall", "action", "mirred", "egress", "redirect", "dev", "fc1"},
-		{"tc", "-n", "mm-fc-a1b2c3-7", "qdisc", "add", "dev", "fc1", "ingress"},
-		{"tc", "-n", "mm-fc-a1b2c3-7", "filter", "add", "dev", "fc1", "parent", "ffff:", "matchall", "action", "mirred", "egress", "redirect", "dev", "vm1"},
-	}
-
-	if got := netnsTapCommands("mm-fc-a1b2c3-7", 1, 200007, 1450); !reflect.DeepEqual(got, want) {
-		t.Errorf("netnsTapCommands() =\n%q\nwant\n%q", got, want)
-	}
-}
-
 func TestCreateNetnsTap(t *testing.T) {
 	f := &fakeNetns{}
 	f.install(t)
 	b := testBridge()
 
-	tap, mtu, err := b.CreateNetnsTap("mm-fc-a1b2c3-7", "00:11:22:33:44:55", 101, 0, 200007)
+	tap, mtu, err := b.CreateNetnsTap(&Netns{}, "00:11:22:33:44:55", 101, 0, 200007)
 	if err != nil {
 		t.Fatalf("CreateNetnsTap: %v", err)
 	}
@@ -114,16 +104,12 @@ func TestCreateNetnsTap(t *testing.T) {
 		t.Errorf("CreateNetnsTap() = %q, %d, want mega_tap7, 9000", tap, mtu)
 	}
 
-	want := append([][]string{
-		{"ip", "link", "add", "mega_tap7", "type", "veth", "peer", "name", "vm0", "netns", "mm-fc-a1b2c3-7"},
-		{"ip", "link", "set", "mega_tap7", "up"},
-	}, netnsTapCommands("mm-fc-a1b2c3-7", 0, 200007, 9000)...)
-	if !reflect.DeepEqual(f.cmds, want) {
-		t.Errorf("commands =\n%q\nwant\n%q", f.cmds, want)
+	want := []string{"veth mega_tap7 vm0", "host mega_tap7", "tap 0 200007 9000"}
+	if !reflect.DeepEqual(f.steps, want) {
+		t.Errorf("steps = %q, want %q", f.steps, want)
 	}
-
 	if f.locked != 0 {
-		t.Errorf("%d commands ran while bridgeLock was held", f.locked)
+		t.Errorf("%d steps ran while bridgeLock was held", f.locked)
 	}
 	if f.addCalls != 1 || !f.addOK {
 		t.Errorf("netnsAddTap calls = %d, under bridgeLock = %v, want 1 call under the lock", f.addCalls, f.addOK)
@@ -134,18 +120,15 @@ func TestCreateNetnsTap(t *testing.T) {
 }
 
 func TestCreateNetnsTapCleanup(t *testing.T) {
-	del := []string{"ip", "link", "del", "mega_tap7"}
-
 	for _, tc := range []struct {
 		name    string
 		fail    string
 		addErr  error
 		wantAdd int
 	}{
-		{"veth", "type veth", nil, 0},
-		{"up", "set mega_tap7 up", nil, 0},
-		{"tuntap", "tuntap add", nil, 0},
-		{"tc", "mirred", nil, 0},
+		{"veth", "veth", nil, 0},
+		{"host", "host", nil, 0},
+		{"tap", "tap", nil, 0},
 		{"ovs", "", errors.New("add port failed"), 1},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -153,7 +136,7 @@ func TestCreateNetnsTapCleanup(t *testing.T) {
 			f.install(t)
 			b := testBridge()
 
-			tap, _, err := b.CreateNetnsTap("mm-fc-a1b2c3-7", "00:11:22:33:44:55", 101, 0, 200007)
+			tap, _, err := b.CreateNetnsTap(&Netns{}, "00:11:22:33:44:55", 101, 0, 200007)
 			if err == nil {
 				t.Fatalf("CreateNetnsTap() = %q, want an error", tap)
 			}
@@ -161,15 +144,15 @@ func TestCreateNetnsTapCleanup(t *testing.T) {
 				t.Errorf("netnsAddTap calls = %d, want %d", f.addCalls, tc.wantAdd)
 			}
 
-			last := f.cmds[len(f.cmds)-1]
+			last := f.steps[len(f.steps)-1]
 			if tc.name == "veth" {
-				if len(f.cmds) != 1 {
-					t.Errorf("commands after a failed veth add: %q", f.cmds)
+				if len(f.steps) != 1 {
+					t.Errorf("steps after a failed veth add: %q", f.steps)
 				}
 				return
 			}
-			if !reflect.DeepEqual(last, del) {
-				t.Errorf("last command = %q, want %q", last, del)
+			if last != "del mega_tap7" {
+				t.Errorf("last step = %q, want del mega_tap7", last)
 			}
 			if len(b.taps) != 0 {
 				t.Errorf("tap table = %v, want empty", b.taps)
@@ -178,59 +161,148 @@ func TestCreateNetnsTapCleanup(t *testing.T) {
 	}
 }
 
-func TestCreateNetnsTapMTU(t *testing.T) {
+func TestDestroyNetnsTap(t *testing.T) {
 	f := &fakeNetns{}
 	f.install(t)
-	if err := os.WriteFile(filepath.Join(netnsSysNet, "mega_tap7", "mtu"), []byte("bad\n"), 0644); err != nil {
-		t.Fatal(err)
+	b := testBridge()
+
+	if err := b.DestroyNetnsTap("mega_tap7"); err == nil {
+		t.Error("unknown tap: no error")
 	}
 
-	if _, _, err := testBridge().CreateNetnsTap("ns", "", 1, 0, 1); err == nil {
-		t.Fatal("bad MTU: no error")
+	b.taps["mega_tap7"] = &Tap{Name: "mega_tap7", Bridge: b.Name}
+	if err := b.DestroyNetnsTap("mega_tap7"); err != nil {
+		t.Fatal(err)
 	}
-	if last := f.cmds[len(f.cmds)-1]; !reflect.DeepEqual(last, []string{"ip", "link", "del", "mega_tap7"}) {
-		t.Errorf("last command = %q", last)
+	if !b.taps["mega_tap7"].Defunct {
+		t.Error("tap is not defunct")
+	}
+	if want := []string{"del mega_tap7"}; !reflect.DeepEqual(f.steps, want) || f.locked != 0 {
+		t.Errorf("steps = %q (%d under bridgeLock), want %q", f.steps, f.locked, want)
 	}
 }
 
-func TestCreateDestroyNetns(t *testing.T) {
-	f := &fakeNetns{}
-	f.install(t)
+// fakeSetns replaces the namespace syscalls. fail is the setns call (from 1)
+// that fails.
+type fakeSetns struct {
+	fds      []int
+	unshared int
+	fail     int
+}
 
-	if err := CreateNetns("mm-fc-a1b2c3-7"); err != nil {
+func (s *fakeSetns) install(t *testing.T) {
+	t.Helper()
+
+	oldUnshare, oldSetns := netnsUnshare, netnsSetns
+	t.Cleanup(func() { netnsUnshare, netnsSetns = oldUnshare, oldSetns })
+
+	netnsUnshare = func() error {
+		s.unshared++
+		return nil
+	}
+	netnsSetns = func(fd int) error {
+		s.fds = append(s.fds, fd)
+		if len(s.fds) == s.fail {
+			return unix.EPERM
+		}
+		return nil
+	}
+}
+
+func TestNewNetns(t *testing.T) {
+	s := &fakeSetns{}
+	s.install(t)
+
+	ns, err := NewNetns()
+	if err != nil {
 		t.Fatal(err)
 	}
-	if want := [][]string{{"ip", "netns", "add", "mm-fc-a1b2c3-7"}}; !reflect.DeepEqual(f.cmds, want) {
-		t.Errorf("new netns commands = %q, want %q", f.cmds, want)
+	if s.unshared != 1 || len(s.fds) != 1 || s.fds[0] == ns.fd {
+		t.Errorf("unshare calls %d, setns fds %v, netns fd %d", s.unshared, s.fds, ns.fd)
 	}
 
-	if err := os.MkdirAll(netnsDir, 0755); err != nil {
+	if want := fmt.Sprintf("/proc/%d/fd/%d", os.Getpid(), ns.fd); ns.Path() != want {
+		t.Errorf("Path() = %q, want %q", ns.Path(), want)
+	}
+	if _, err := os.Stat(ns.Path()); err != nil {
+		t.Errorf("Path(): %v", err)
+	}
+
+	if err := ns.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(netnsDir, "mm-fc-a1b2c3-7"), nil, 0644); err != nil {
+	if err := ns.Close(); err != nil {
+		t.Errorf("second Close: %v", err)
+	}
+	if ns.Path() != "" {
+		t.Errorf("Path() after Close = %q", ns.Path())
+	}
+	if (*Netns)(nil).Path() != "" || (*Netns)(nil).Close() != nil {
+		t.Error("nil Netns")
+	}
+}
+
+func TestNewNetnsErrors(t *testing.T) {
+	s := &fakeSetns{fail: 1}
+	s.install(t)
+
+	if ns, err := NewNetns(); err == nil || ns != nil || !strings.Contains(err.Error(), "restore") {
+		t.Errorf("failed restore: NewNetns() = %v, %v", ns, err)
+	}
+
+	netnsUnshare = func() error { return unix.EPERM }
+	s.fds = nil
+	if ns, err := NewNetns(); !errors.Is(err, unix.EPERM) || ns != nil || len(s.fds) != 0 {
+		t.Errorf("failed unshare: NewNetns() = %v, %v; setns calls %v", ns, err, s.fds)
+	}
+}
+
+func TestNetnsDo(t *testing.T) {
+	f, err := os.Open(os.DevNull)
+	if err != nil {
 		t.Fatal(err)
 	}
+	defer f.Close()
+	ns := &Netns{f: f, fd: int(f.Fd())}
 
-	f.cmds = nil
-	if err := CreateNetns("mm-fc-a1b2c3-7"); err != nil {
-		t.Fatal(err)
-	}
-	want := [][]string{
-		{"ip", "netns", "del", "mm-fc-a1b2c3-7"},
-		{"ip", "netns", "add", "mm-fc-a1b2c3-7"},
-	}
-	if !reflect.DeepEqual(f.cmds, want) {
-		t.Errorf("leftover netns commands = %q, want %q", f.cmds, want)
+	for _, tc := range []struct {
+		name    string
+		fail    int
+		fnErr   error
+		wantFn  bool
+		wantErr string
+	}{
+		{"ok", 0, nil, true, ""},
+		{"fn error", 0, errors.New("fn failed"), true, "fn failed"},
+		{"enter", 1, nil, false, "enter netns"},
+		{"leave", 2, errors.New("fn failed"), true, "leave netns"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := &fakeSetns{fail: tc.fail}
+			s.install(t)
+
+			var ran bool
+			err := ns.Do(func() error {
+				ran = true
+				if len(s.fds) != 1 || s.fds[0] != ns.fd {
+					t.Errorf("fn ran after setns %v, want [%d]", s.fds, ns.fd)
+				}
+				return tc.fnErr
+			})
+
+			if ran != tc.wantFn {
+				t.Errorf("fn ran = %v, want %v", ran, tc.wantFn)
+			}
+			if tc.wantErr == "" && err != nil || tc.wantErr != "" && (err == nil || !strings.Contains(err.Error(), tc.wantErr)) {
+				t.Errorf("Do() = %v, want %q", err, tc.wantErr)
+			}
+			if tc.wantFn && (len(s.fds) != 2 || s.fds[1] == ns.fd) {
+				t.Errorf("setns fds = %v, want the netns, then the original", s.fds)
+			}
+		})
 	}
 
-	f.fail = "netns del"
-	f.failOut = `Cannot remove namespace file "/var/run/netns/x": No such file or directory`
-	if err := DestroyNetns("x"); err != nil {
-		t.Errorf("missing netns: %v", err)
-	}
-
-	f.failOut = "permission denied"
-	if err := DestroyNetns("x"); err == nil {
-		t.Error("failed delete: no error")
+	if err := (&Netns{}).Do(func() error { return nil }); err == nil {
+		t.Error("closed Netns: no error")
 	}
 }
