@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"strconv"
@@ -18,6 +19,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/sandia-minimega/minimega/v2/internal/bridge"
 	"github.com/sandia-minimega/minimega/v2/pkg/minicli"
 )
 
@@ -38,11 +40,16 @@ func setFCSnapshotSeams(t *testing.T) {
 	setMemDumpSeams(t)
 
 	oldSaves, oldSnapshot, oldHost, oldRename := fcSaves, fcSaveSnapshot, fcSnapshotHostFn, fcSaveRename
+	oldGroups, oldPrefixes, oldPoll := fcSnapGroups, fcPrefixes, fcSavePoll
 	t.Cleanup(func() {
 		fcSaves, fcSaveSnapshot, fcSnapshotHostFn, fcSaveRename = oldSaves, oldSnapshot, oldHost, oldRename
+		fcSnapGroups, fcPrefixes, fcSavePoll = oldGroups, oldPrefixes, oldPoll
 	})
 
 	fcSaves = &fcExportRegistry{m: map[int]*fcExport{}}
+	fcPrefixes = &fcPrefixTable{saving: map[string]bool{}, locks: map[string]*fcPrefixLock{}}
+	fcSavePoll = time.Millisecond
+	fcSnapGroups = newFCSnapGroups()
 	fcSnapshotHostFn = func(string) fcSnapshotHost { return fcTestHost }
 	fcReflinkOK = func() bool { return false }
 }
@@ -313,6 +320,34 @@ func TestFCSave(t *testing.T) {
 		t.Errorf("state = %v, want PAUSED", got)
 	}
 
+	// The renames wait for a restore that reads the prefix, and another save
+	// to the prefix is refused while the save runs.
+	unlock := fcPrefixes.lock(dst, false)
+	if err := vm.Save(dst); err != nil {
+		t.Fatalf("Save() while a restore reads the prefix = %v", err)
+	}
+	if err := fcPrefixes.beginSave(dst); err == nil || !strings.Contains(err.Error(), "another save to "+dst+" is running") {
+		t.Errorf("beginSave() during a save = %v, want a refusal", err)
+	}
+	time.Sleep(50 * time.Millisecond)
+	if _, err := os.Stat(dst + ".json"); err != nil {
+		t.Errorf("sidecar while the restore reads the prefix: %v, want the old sidecar", err)
+	}
+	fcSaves.mu.Lock()
+	job := fcSaves.m[vm.ID]
+	fcSaves.mu.Unlock()
+	if status, _ := job.get(); status != fcExportActive {
+		t.Errorf("save status while the restore reads the prefix = %v, want active", status)
+	}
+	unlock()
+	if err := fcWaitSave(vm.ID); err != nil {
+		t.Errorf("fcWaitSave() = %v", err)
+	}
+	if err := fcPrefixes.beginSave(dst); err != nil {
+		t.Errorf("beginSave() after the save = %v", err)
+	}
+	fcPrefixes.endSave(dst)
+
 	// vm start resumes the VM, as after vm save of a KVM VM.
 	before = len(f.requests(1))
 	if err := vm.Start(); err != nil {
@@ -355,6 +390,63 @@ func TestFCSave(t *testing.T) {
 	waitFCState(t, vm, VM_QUIT)
 	if err := vm.Save(dst); err == nil || !strings.Contains(err.Error(), "needs a vm in running or paused") {
 		t.Errorf("Save() in QUIT = %v, want state error", err)
+	}
+}
+
+func TestFCWaitSave(t *testing.T) {
+	setFCSnapshotSeams(t)
+
+	if err := fcWaitSave(3); err == nil || !strings.Contains(err.Error(), "has no vm save") {
+		t.Errorf("fcWaitSave() with no save = %v", err)
+	}
+
+	job := &fcExport{ID: 3, Name: "a", Dst: "/s/a", status: fcExportActive}
+	fcSaves.m[3] = job
+	go func() {
+		time.Sleep(20 * time.Millisecond)
+		job.finish(fcExportFailed)
+	}()
+	if err := fcWaitSave(3); err == nil || !strings.Contains(err.Error(), "vm save of vm a to /s/a failed") {
+		t.Errorf("fcWaitSave() of a failed save = %v", err)
+	}
+
+	fcSaves.m[3] = &fcExport{ID: 3, status: fcExportCompleted}
+	if err := fcWaitSave(3); err != nil {
+		t.Errorf("fcWaitSave() of a completed save = %v", err)
+	}
+}
+
+func TestFCPrefixLock(t *testing.T) {
+	setFCSnapshotSeams(t)
+
+	dir := t.TempDir()
+	if err := os.Symlink(dir, filepath.Join(dir, "link")); err != nil {
+		t.Fatal(err)
+	}
+
+	// Two paths to one prefix get one lock.
+	unlock := fcPrefixes.lock(filepath.Join(dir, "link", "s"), false)
+	done := make(chan struct{})
+	go func() {
+		fcPrefixes.lock(filepath.Join(dir, "s"), true)()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		t.Fatal("the write lock did not wait for the read lock")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	unlock()
+	unlock()
+	<-done
+
+	fcPrefixes.mu.Lock()
+	n := len(fcPrefixes.locks)
+	fcPrefixes.mu.Unlock()
+	if n != 0 {
+		t.Errorf("locks after the unlocks = %d, want 0", n)
 	}
 }
 
@@ -444,6 +536,9 @@ func TestFCCheckSnapshot(t *testing.T) {
 		{name: "entropy", cfg: func(c *VMConfig) { c.FirecrackerEntropy = false }, want: "0 entropy"},
 		{name: "pci", cfg: func(c *VMConfig) { c.FirecrackerPCI = true }, want: "pci true"},
 		{name: "macs", info: func(i *fcSnapshotInfo) { i.NICMACs = nil }, want: "has 0 NIC MACs for 1 NIC"},
+		{name: "bad mac", info: func(i *fcSnapshotInfo) { i.NICMACs = []string{"$(reboot)"} }, want: `NIC 0 has the MAC "$(reboot)"`},
+		{name: "long mac", info: func(i *fcSnapshotInfo) { i.NICMACs = []string{"00:00:00:00:fe:80:00:00"} }, want: "not a 6-byte MAC"},
+		{name: "upper case mac", info: func(i *fcSnapshotInfo) { i.NICMACs = []string{"06:00:00:00:00:0A"} }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			i := info
@@ -489,6 +584,55 @@ func TestFCRestore(t *testing.T) {
 	fcRunCmd = func(args ...string) (string, error) {
 		cmds.add(args)
 		return "", nil
+	}
+
+	// The test records the owner of each chown and checks the real modes.
+	var mu sync.Mutex
+	owners := map[string][2]int{}
+	var jailerArgs [][]string
+	var tapUIDs []int
+
+	fcChown = func(p string, uid, gid int) error {
+		mu.Lock()
+		defer mu.Unlock()
+		owners[p] = [2]int{uid, gid}
+		return nil
+	}
+	jailer := fcJailerCommand
+	fcJailerCommand = func(bin string, args []string) *exec.Cmd {
+		mu.Lock()
+		jailerArgs = append(jailerArgs, args)
+		mu.Unlock()
+		return jailer(bin, args)
+	}
+	createTap := fcCreateTap
+	fcCreateTap = func(nic NetConfig, ns *bridge.Netns, index, uid int) (string, int, error) {
+		mu.Lock()
+		tapUIDs = append(tapUIDs, uid)
+		mu.Unlock()
+		return createTap(nic, ns, index, uid)
+	}
+	jailerArg := func(n int, name string) string {
+		mu.Lock()
+		defer mu.Unlock()
+		if n >= len(jailerArgs) {
+			return ""
+		}
+		return fcArg(jailerArgs[n], name)
+	}
+	checkFile := func(p string, uid, gid int, mode os.FileMode) {
+		t.Helper()
+		fi, err := os.Stat(p)
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		mu.Lock()
+		got := owners[p]
+		mu.Unlock()
+		if got != [2]int{uid, gid} || fi.Mode().Perm() != mode {
+			t.Errorf("%v is %v:%v with mode %v, want %v:%v with mode %v", p, got[0], got[1], fi.Mode().Perm(), uid, gid, mode)
+		}
 	}
 
 	prefix := filepath.Join(f.dir, "snap", "fc1")
@@ -578,14 +722,42 @@ func TestFCRestore(t *testing.T) {
 		t.Errorf("scratch.raw = %d bytes, %v, want the content of %v", len(got), err, prefix+".scratch")
 	}
 
-	uid := strconv.Itoa(fcVMUID(vm.ID))
-	wantACL := [][]string{
-		{"setfacl", "-m", "u:" + uid + ":r", prefix + ".state"},
-		{"setfacl", "-m", "u:" + uid + ":r", prefix + ".mem"},
+	// The VMM runs as the VM uid and the group of the snapshot, the highest
+	// gid below the uid base. Only the snapshot files get that group.
+	uid := fcVMUID(vm.ID)
+	gid := int(*f_firecrackerUIDBase) - 1
+	if got, want := jailerArg(0, "--uid")+":"+jailerArg(0, "--gid"), strconv.Itoa(uid)+":"+strconv.Itoa(gid); got != want {
+		t.Errorf("restore jailer --uid:--gid = %v, want %v", got, want)
 	}
-	if got := cmds.get(); !reflect.DeepEqual(got, wantACL) {
-		t.Errorf("commands = %q, want %q", got, wantACL)
+	for _, p := range []string{prefix + ".state", prefix + ".mem"} {
+		checkFile(p, os.Geteuid(), gid, 0640)
 	}
+	for _, o := range []struct {
+		path string
+		mode os.FileMode
+	}{
+		{j.Root, 0700},
+		{j.HostPath("out"), 0700},
+		{j.HostPath("/console.fifo"), 0600},
+		{j.HostPath("/firecracker.log"), 0600},
+	} {
+		checkFile(o.path, uid, uid, o.mode)
+	}
+	mu.Lock()
+	if !reflect.DeepEqual(tapUIDs, []int{uid}) {
+		t.Errorf("tap uids = %v, want [%v]", tapUIDs, uid)
+	}
+	mu.Unlock()
+	if got := cmds.get(); len(got) != 0 {
+		t.Errorf("commands = %q, want none", got)
+	}
+
+	// The VM uid owns the cc listener.
+	cc := &fcFakeCC{t: t, vm: vm}
+	if err := vm.connectCC(cc); err != nil {
+		t.Fatalf("connectCC() = %v", err)
+	}
+	expectCCCalls(t, cc, "register "+vm.UUID, "listen "+j.CCSocket()+" "+vm.UUID+" "+strconv.Itoa(uid))
 
 	// vm start resumes the loaded snapshot.
 	if err := vm.Start(); err != nil {
@@ -629,8 +801,8 @@ func TestFCRestore(t *testing.T) {
 	if _, err := os.Stat(j.HostPath("/snapshot.mem")); !os.IsNotExist(err) {
 		t.Errorf("relaunch jail has /snapshot.mem: %v", err)
 	}
-	if got := len(cmds.get()); got != 2 {
-		t.Errorf("commands after relaunch = %d, want 2", got)
+	if got := jailerArg(1, "--gid"); got != strconv.Itoa(uid) {
+		t.Errorf("boot jailer --gid = %v, want the VM uid %v", got, uid)
 	}
 
 	if err := vm.Kill(); err != nil {
@@ -642,12 +814,190 @@ func TestFCRestore(t *testing.T) {
 		t.Fatalf("Flush() = %v", err)
 	}
 
-	wantACL = append(wantACL,
-		[]string{"setfacl", "-x", "u:" + uid, prefix + ".state"},
-		[]string{"setfacl", "-x", "u:" + uid, prefix + ".mem"},
-	)
-	if got := cmds.get(); !reflect.DeepEqual(got, wantACL) {
-		t.Errorf("commands after flush = %q, want %q", got, wantACL)
+	for _, p := range []string{prefix + ".state", prefix + ".mem"} {
+		checkFile(p, os.Geteuid(), os.Getegid(), 0600)
+	}
+	if got := cmds.get(); len(got) != 0 {
+		t.Errorf("commands after flush = %q, want none", got)
+	}
+}
+
+// fcTestSnapFiles writes the state and memory files of snapshot name in dir.
+func fcTestSnapFiles(t *testing.T, dir, name string) *fcRestore {
+	t.Helper()
+
+	prefix := filepath.Join(dir, name)
+	fcWriteFile(t, prefix+".state", []byte("state"))
+	fcWriteFile(t, prefix+".mem", []byte("mem"))
+
+	return &fcRestore{prefix: prefix, state: prefix + ".state", mem: prefix + ".mem"}
+}
+
+// setFCSnapGroupSeams gives the test its own snapshot groups, and records the
+// owner that each chown gives and each command. chown returns the error of
+// chownErr.
+func setFCSnapGroupSeams(t *testing.T, chownErr error) (func(string) [2]int, *fcCmdLog) {
+	t.Helper()
+
+	setFCJailGlobals(t, t.TempDir())
+	setFCOpsSeams(t)
+
+	old := fcSnapGroups
+	t.Cleanup(func() { fcSnapGroups = old })
+	fcSnapGroups = newFCSnapGroups()
+
+	var mu sync.Mutex
+	owners := map[string][2]int{}
+	fcChown = func(p string, uid, gid int) error {
+		if chownErr != nil {
+			return &os.PathError{Op: "chown", Path: p, Err: chownErr}
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		owners[p] = [2]int{uid, gid}
+		return nil
+	}
+
+	cmds := &fcCmdLog{}
+	fcRunCmd = func(args ...string) (string, error) {
+		cmds.add(args)
+		return "", nil
+	}
+
+	return func(p string) [2]int {
+		mu.Lock()
+		defer mu.Unlock()
+		return owners[p]
+	}, cmds
+}
+
+func TestFCSnapGroups(t *testing.T) {
+	owner, cmds := setFCSnapGroupSeams(t, nil)
+	dir := t.TempDir()
+
+	root := [2]int{os.Geteuid(), os.Getegid()}
+	check := func(r *fcRestore, want [2]int, mode os.FileMode) {
+		t.Helper()
+		for _, p := range []string{r.state, r.mem} {
+			fi, err := os.Stat(p)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := owner(p); got != want || fi.Mode().Perm() != mode {
+				t.Errorf("%v is %v with mode %v, want %v with mode %v", p, got, fi.Mode().Perm(), want, mode)
+			}
+		}
+	}
+
+	vms := make([]*FirecrackerVM, 5)
+	for i := range vms {
+		vms[i] = &FirecrackerVM{BaseVM: &BaseVM{ID: i + 1}}
+	}
+	grant := func(i int, r *fcRestore) int {
+		t.Helper()
+		gid, err := vms[i].grantSnapshotRead(r)
+		if err != nil {
+			t.Fatalf("grantSnapshotRead(vm %d) = %v", i+1, err)
+		}
+		return gid
+	}
+
+	a, b := fcTestSnapFiles(t, dir, "a"), fcTestSnapFiles(t, dir, "b")
+
+	// Two restores of a share the highest gid below the uid base 200000.
+	if gid := grant(0, a); gid != 199999 {
+		t.Errorf("first restore of a: gid %v, want 199999", gid)
+	}
+	check(a, [2]int{os.Geteuid(), 199999}, 0640)
+
+	// A vm save replaces the files, and the next restore gives them the group.
+	if err := os.Remove(a.mem); err != nil {
+		t.Fatal(err)
+	}
+	fcWriteFile(t, a.mem, []byte("new mem"))
+	if err := os.Chmod(a.mem, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if gid := grant(1, a); gid != 199999 {
+		t.Errorf("second restore of a: gid %v, want 199999", gid)
+	}
+	check(a, [2]int{os.Geteuid(), 199999}, 0640)
+	if fcVMUID(vms[0].ID) == fcVMUID(vms[1].ID) {
+		t.Errorf("the two restores of a have the same uid %v", fcVMUID(vms[0].ID))
+	}
+
+	// Another snapshot gets the next gid.
+	if gid := grant(2, b); gid != 199998 {
+		t.Errorf("restore of b: gid %v, want 199998", gid)
+	}
+	check(b, [2]int{os.Geteuid(), 199998}, 0640)
+
+	// a keeps its group until the last restore of a is flushed.
+	vms[0].revokeSnapshotRead()
+	check(a, [2]int{os.Geteuid(), 199999}, 0640)
+	vms[1].revokeSnapshotRead()
+	check(a, root, 0600)
+
+	// The free gid goes to the next new snapshot, and the reserved host IDs
+	// do not.
+	fcSnapGroups.reserve([]uint64{199997})
+	c, d := fcTestSnapFiles(t, dir, "c"), fcTestSnapFiles(t, dir, "d")
+	if gid := grant(3, c); gid != 199999 {
+		t.Errorf("restore of c: gid %v, want the free gid 199999", gid)
+	}
+	if gid := grant(4, d); gid != 199996 {
+		t.Errorf("restore of d: gid %v, want 199996 below the reserved 199997", gid)
+	}
+
+	for _, vm := range vms {
+		vm.revokeSnapshotRead()
+	}
+	for _, r := range []*fcRestore{b, c, d} {
+		check(r, root, 0600)
+	}
+	if n := len(fcSnapGroups.m); n != 0 {
+		t.Errorf("%d snapshot groups after the flushes, want 0", n)
+	}
+	if got := cmds.get(); len(got) != 0 {
+		t.Errorf("commands = %q, want none", got)
+	}
+}
+
+func TestFCSnapGroupACLFallback(t *testing.T) {
+	_, cmds := setFCSnapGroupSeams(t, errors.New("operation not permitted"))
+	a := fcTestSnapFiles(t, t.TempDir(), "a")
+
+	vm1 := &FirecrackerVM{BaseVM: &BaseVM{ID: 1}}
+	vm2 := &FirecrackerVM{BaseVM: &BaseVM{ID: 2}}
+
+	for _, vm := range []*FirecrackerVM{vm1, vm2} {
+		gid, err := vm.grantSnapshotRead(a)
+		if err != nil {
+			t.Fatalf("grantSnapshotRead(vm %v) = %v", vm.ID, err)
+		}
+		if gid != fcVMUID(vm.ID) {
+			t.Errorf("vm %v: gid %v, want the VM uid %v", vm.ID, gid, fcVMUID(vm.ID))
+		}
+	}
+
+	vm1.revokeSnapshotRead()
+	vm2.revokeSnapshotRead()
+
+	want := [][]string{
+		{"setfacl", "-m", "u:200001:r", a.state},
+		{"setfacl", "-m", "u:200001:r", a.mem},
+		{"setfacl", "-m", "u:200002:r", a.state},
+		{"setfacl", "-m", "u:200002:r", a.mem},
+		{"setfacl", "-x", "u:200001", a.state},
+		{"setfacl", "-x", "u:200001", a.mem},
+		{"setfacl", "-x", "u:200002", a.state},
+		{"setfacl", "-x", "u:200002", a.mem},
+	}
+	if got := cmds.get(); !reflect.DeepEqual(got, want) {
+		t.Errorf("commands =\n%q\nwant\n%q", got, want)
+	}
+	if n := len(fcSnapGroups.m); n != 0 {
+		t.Errorf("%d snapshot groups after the flushes, want 0", n)
 	}
 }
 
@@ -659,6 +1009,7 @@ func TestFCRestoreErrors(t *testing.T) {
 	cfg := f.config(t)
 	cfg.Disks = DiskConfigs{{Path: prefix + ".hdd"}}
 	cfg.FirecrackerSnapshotPath = prefix
+	cfg.Networks[0].MAC = "06:00:00:00:00:01"
 
 	info := fcTestSnapshotInfo(cfg)
 	info.VCPUs = 4

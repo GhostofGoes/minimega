@@ -76,6 +76,9 @@ CC_SEND_SRC=""
 # The path prefix of the vm save of fc1, in the minimega files directory.
 SNAP=""
 
+# The path prefix of the vm save of csrc (check 16), in the files directory.
+CSNAP=""
+
 fail() {
 	echo "FAIL: $*" >&2
 	exit 1
@@ -100,6 +103,9 @@ cleanup() {
 	fi
 	if [[ -n "$SNAP" ]]; then
 		rm -f "${SNAP}.state" "${SNAP}.mem" "${SNAP}.hdd" "${SNAP}.json" || true
+	fi
+	if [[ -n "$CSNAP" ]]; then
+		rm -f "${CSNAP}.state" "${CSNAP}.mem" "${CSNAP}.json" || true
 	fi
 
 	if [[ $rc -ne 0 ]]; then
@@ -231,10 +237,46 @@ cc_client_has_mac() {
 	grep -qiF "$2" <<<"$row"
 }
 
+# cc_raw prints the raw responses to the cc commands with prefix $1. The host
+# annotation is off, because it puts "<host>: " before the first line.
+cc_raw() {
+	mm ".annotate false cc responses $1 raw" 2>/dev/null
+}
+
 # cc_response_has returns 0 when the responses to the cc commands with prefix
 # $1 contain the text $2.
 cc_response_has() {
-	grep -qF -- "$2" <<<"$(mm "cc responses $1 raw" 2>/dev/null)"
+	grep -qF -- "$2" <<<"$(cc_raw "$1")"
+}
+
+# cc_response_line returns 0 when the responses to the cc commands with
+# prefix $1 have a line that is exactly $2.
+cc_response_line() {
+	grep -qxF -- "$2" <<<"$(cc_raw "$1")"
+}
+
+# cc_dump prints the raw responses and the cc commands rows of prefix $1 to
+# stderr.
+cc_dump() {
+	{
+		echo "---- cc responses $1 raw"
+		mm ".annotate false cc responses $1 raw" || true
+		echo "---- cc commands with prefix $1"
+		mm ".annotate false .filter prefix=$1 cc commands" || true
+		echo "----"
+	} >&2
+}
+
+# wait_cc is wait_for for a cc response check: wait_cc <timeout> <desc>
+# <check> <prefix> <text>. At the timeout, it prints the responses and the
+# commands of the prefix, and fails the test.
+wait_cc() {
+	local timeout=$1 desc=$2 check=$3 prefix=$4 text=$5
+
+	if ! wait_for_quiet "$timeout" "$check" "$prefix" "$text"; then
+		cc_dump "$prefix"
+		fail "$desc: not true after ${timeout}s"
+	fi
 }
 
 # cc_recv_path prints the path of the file that cc recv got from the VM with
@@ -453,10 +495,11 @@ step "4b. cc exec on fc1"
 mm "cc filter name=fc1"
 mm "cc prefix smoke-exec"
 mm "cc exec ip -br link"
-wait_for 60 "cc exec on fc1 returns the MAC of fc1" cc_response_has smoke-exec "$(guest_mac 1)"
+wait_cc 60 "cc exec on fc1 returns the MAC of fc1" cc_response_has smoke-exec "$(guest_mac 1)"
 mm "cc responses smoke-exec"
 for i in 2 3; do
 	if cc_response_has smoke-exec "$(guest_mac "$i")"; then
+		cc_dump smoke-exec
 		fail "cc exec with cc filter name=fc1 ran on fc${i}"
 	fi
 done
@@ -474,7 +517,7 @@ mm "cc prefix smoke-send"
 mm "cc send ${CC_SEND_NAME}"
 mm "cc prefix smoke-cat"
 mm "cc exec cat ${guest_file}"
-wait_for 60 "fc1 has ${guest_file} from cc send" cc_response_has smoke-cat "$send_text"
+wait_cc 60 "fc1 has ${guest_file} from cc send" cc_response_has smoke-cat "$send_text"
 echo "fc1 has ${guest_file} from cc send"
 
 fc1_uuid="$(vm_field fc1 uuid)"
@@ -941,6 +984,188 @@ mm "vm config net ${VLAN}"
 rate_run scalenic "$RATE_NIC_VMS"
 kill_flush_all
 check_clean
+
+# ---------------------------------------------------------------------------
+step "16. snapshot clones"
+
+CLONES=5
+CSRC_MAC="06:00:ac:10:02:00"
+CSNAP="${MM_FILES}/csnap"
+
+clone_mac() {
+	printf '06:00:ac:10:02:%02x' "$1"
+}
+
+# clone_tag prints the clone_identity tag of VM $1.
+clone_tag() {
+	mm ".annotate false .headers false .columns tags .filter name=$1 vm info" 2>/dev/null |
+		sed -n 's/.*"clone_identity":"\([^"]*\)".*/\1/p'
+}
+
+# clones_done returns 0 when each clone has clone_identity=ok. It fails the
+# test when a clone has an identity error.
+clones_done() {
+	local i v
+	for i in $(seq 1 "$CLONES"); do
+		v="$(clone_tag "clone${i}")"
+		case "$v" in
+		ok) ;;
+		"" | pending) return 1 ;;
+		*) fail "the identity of clone${i} failed: ${v}" ;;
+		esac
+	done
+}
+
+# acl_users prints the number of named user entries in the ACL of file $1.
+acl_users() {
+	getfacl -cn "$1" 2>/dev/null | grep -c '^user:[0-9]' || true
+}
+
+lan_vlan="$(mm ".annotate false .headers false .csv true vlans" | awk -F, -v a="$VLAN" '$1 == a || $1 ~ ("//" a "$") {print $2}' | tr -d '[:space:]')"
+[[ "$lan_vlan" =~ ^[0-9]+$ ]] || fail "vlans has no VLAN number for ${VLAN}: '${lan_vlan}'"
+host_tag="$(ovs-vsctl get port "$HOST_TAP" tag)"
+[[ "$host_tag" == "$lan_vlan" ]] || fail "${HOST_TAP} has OVS tag ${host_tag}, but vlans gives ${lan_vlan} for ${VLAN}"
+echo "${VLAN} is VLAN ${lan_vlan}"
+
+mm "clear vm config"
+mm "vm config vcpus 1"
+mm "vm config memory 64"
+mm "vm config kernel ${KERNEL}"
+mm "vm config disk ${MINIMAL},ro"
+mm "vm config backchannel true"
+mm "vm config append root=/dev/vda ro rootfstype=squashfs init=/init mm.ip=192.0.2.10/24 mm.gw=192.0.2.1 mm.hostname=csrc"
+mm "vm config net ${VLAN},${CSRC_MAC}"
+mm "vm launch firecracker csrc"
+wait_state csrc BUILDING 60
+mm "vm start csrc"
+wait_state csrc RUNNING 30
+csrc_uuid="$(vm_field csrc uuid)"
+[[ -n "$csrc_uuid" ]] || fail "no UUID for csrc"
+wait_for 90 "csrc (${csrc_uuid}) is a cc client" cc_has_client "$csrc_uuid"
+
+mm "vm save csrc csnap"
+wait_for 120 "vm save of csrc is completed" job_completed "vm save" csrc
+for ext in state mem json; do
+	[[ -s "${CSNAP}.${ext}" ]] || fail "${CSNAP}.${ext} is missing or empty"
+done
+mm "vm kill csrc"
+wait_state csrc QUIT 30
+mm "vm flush csrc"
+wait_for 30 "csrc is flushed" vm_absent csrc
+echo "vm save wrote ${CSNAP}.state, .mem, and .json"
+
+mm "clear vm config"
+mm "vm config vcpus 1"
+mm "vm config memory 64"
+mm "vm config kernel ${KERNEL}"
+mm "vm config disk ${MINIMAL},ro"
+mm "vm config backchannel true"
+mm "vm config append root=/dev/vda ro rootfstype=squashfs init=/init"
+mm "vm config firecracker-snapshot ${CSNAP}"
+mm "vm config firecracker-clone true"
+for i in $(seq 1 "$CLONES"); do
+	mm "vm config net ${VLAN},$(clone_mac "$i")"
+	mm "vm launch firecracker clone${i}"
+done
+for i in $(seq 1 "$CLONES"); do
+	name="clone${i}"
+	wait_state "$name" BUILDING 60
+	v="$(vm_field "$name" vlan)"
+	[[ "$v" == "[disconnected]" ]] || fail "${name} has VLAN ${v} before its identity, not [disconnected]"
+	tap="$(vm_field "$name" tap | tr -d '[]')"
+	if ovs-vsctl port-to-br "$tap" >/dev/null 2>&1; then
+		fail "the tap ${tap} of ${name} is on a bridge before its identity"
+	fi
+done
+mm ".columns name,state,vlan,mac,tap vm info"
+echo "the taps of the ${CLONES} clones are not on a bridge"
+
+t0="$(now)"
+mm "vm start all"
+if ! wait_for_quiet 120 clones_done; then
+	mm ".columns name,state,vlan,tags vm info" >&2 || true
+	fail "not all ${CLONES} clones have clone_identity=ok after 120s"
+fi
+echo "${CLONES} clones have their identity $(since "$t0")s after vm start all"
+mm ".columns name,state,vlan,mac,tap,tags vm info"
+
+for i in $(seq 1 "$CLONES"); do
+	name="clone${i}"
+	mac="$(clone_mac "$i")"
+
+	tap="$(vm_field "$name" tap | tr -d '[]')"
+	tag="$(ovs-vsctl get port "$tap" tag)"
+	[[ "$tag" == "$lan_vlan" ]] || fail "the tap ${tap} of ${name} has OVS tag ${tag}, not ${lan_vlan}"
+
+	mm "cc filter name=${name}"
+	# BusyBox ip has no -br option.
+	mm "cc prefix ${name}-link"
+	mm "cc exec ip link"
+	mm "cc prefix ${name}-host"
+	mm "cc exec hostname"
+	mm "cc prefix ${name}-route"
+	mm "cc exec ip route"
+	wait_cc 60 "${name} reports MAC ${mac}" cc_response_has "${name}-link" "$mac"
+	wait_cc 60 "${name} reports host name ${name}" cc_response_line "${name}-host" "$name"
+	wait_cc 60 "${name} keeps the default route of csrc" cc_response_has "${name}-route" "default via 192.0.2.1"
+	if cc_response_has "${name}-link" "$CSRC_MAC"; then
+		cc_dump "${name}-link"
+		fail "${name} still has the MAC ${CSRC_MAC} of csrc"
+	fi
+	echo "${name}: MAC ${mac}, host name ${name}, OVS tag ${tag}"
+done
+mm "clear cc prefix"
+mm "clear cc filter"
+
+rss_kb=0
+pss_kb=0
+snap_gid=""
+for i in $(seq 1 "$CLONES"); do
+	name="clone${i}"
+	id="$(vm_id "$name")"
+	jail="$(jail_root "$id")"
+	[[ -n "$jail" ]] || fail "no jail for ${name}"
+	[[ "${jail}/snapshot.mem" -ef "${CSNAP}.mem" ]] || fail "${jail}/snapshot.mem of ${name} is not ${CSNAP}.mem"
+
+	# Each VMM has its own uid (uid base + VM ID) and the gid of the snapshot.
+	pid="$(vm_field "$name" pid)"
+	vmm_uid="$(awk '/^Uid:/ {print $2}' "/proc/${pid}/status" 2>/dev/null || true)"
+	vmm_gid="$(awk '/^Gid:/ {print $2}' "/proc/${pid}/status" 2>/dev/null || true)"
+	[[ "$vmm_uid" =~ ^[0-9]+$ && "$vmm_gid" =~ ^[0-9]+$ ]] || fail "no uid and gid for the VMM of ${name} (pid ${pid})"
+	uid_base=$((vmm_uid - id))
+	((vmm_gid < uid_base && vmm_gid >= uid_base - 65536)) || fail "the VMM of ${name} has gid ${vmm_gid}, not a snapshot gid below the uid base ${uid_base}"
+	[[ -z "$snap_gid" || "$vmm_gid" == "$snap_gid" ]] || fail "the VMM of ${name} has gid ${vmm_gid}, but another clone has gid ${snap_gid}"
+	snap_gid="$vmm_gid"
+
+	# The jail root and the cc socket stay with the uid of the clone.
+	[[ "$(stat -c '%u %a' "$jail")" == "${vmm_uid} 700" ]] ||
+		fail "the jail root of ${name} is $(stat -c '%u:%g mode %a' "$jail"), not owned by ${vmm_uid} with mode 700"
+	sock="${jail}/v.sock_9002"
+	[[ "$(stat -c '%u %a' "$sock")" == "${vmm_uid} 600" ]] ||
+		fail "the cc socket of ${name} is $(stat -c '%u:%g mode %a' "$sock"), not owned by ${vmm_uid} with mode 600"
+
+	r="$(awk '/^VmRSS:/ {print $2}' "/proc/${pid}/status" 2>/dev/null || true)"
+	p="$(awk '/^Pss:/ {print $2}' "/proc/${pid}/smaps_rollup" 2>/dev/null || true)"
+	rss_kb=$((rss_kb + ${r:-0}))
+	pss_kb=$((pss_kb + ${p:-0}))
+done
+for f in "${CSNAP}.state" "${CSNAP}.mem"; do
+	[[ "$(stat -c '%u %g %a' "$f")" == "0 ${snap_gid} 640" ]] ||
+		fail "${f} is $(stat -c '%u:%g mode %a' "$f"), not 0:${snap_gid} with mode 640"
+	acl="$(acl_users "$f")"
+	[[ "$acl" -eq 0 ]] || fail "${f} has ${acl} named user ACL entries, not 0"
+done
+echo "each clone maps ${CSNAP}.mem; the VMMs share gid ${snap_gid}, and ${CSNAP}.mem is 0:${snap_gid} with mode 640 and no ACL entries"
+echo "VMM memory of ${CLONES} clones: RSS ${rss_kb} KiB, PSS ${pss_kb} KiB; guest memory ${CLONES} x 64 MiB = $((CLONES * 65536)) KiB"
+
+kill_flush_all
+check_clean
+for f in "${CSNAP}.state" "${CSNAP}.mem"; do
+	[[ "$(stat -c '%u %g %a' "$f")" == "0 0 600" ]] ||
+		fail "${f} is $(stat -c '%u:%g mode %a' "$f") after the flush, not 0:0 with mode 600"
+done
+rm -f "${CSNAP}.state" "${CSNAP}.mem" "${CSNAP}.json"
+CSNAP=""
 
 mm "tap delete ${HOST_TAP}"
 

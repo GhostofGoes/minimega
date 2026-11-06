@@ -613,8 +613,9 @@ files directory (-filepath).
 The configuration must match <prefix>.json: the same vCPUs, memory,
 disks, ro disks, scratch disk, NICs, backchannel, entropy device, and
 PCI setting. Set vm config disk to <prefix>.hdd, the disk that vm save
-wrote with the snapshot. The VM gets the NIC MACs of the snapshot. A
-scratch disk gets the content of <prefix>.scratch.
+wrote with the snapshot. Without firecracker-clone, the VM gets the NIC
+MACs of the snapshot. A scratch disk gets the content of
+<prefix>.scratch.
 
 minimega restores a snapshot only on the same kind of host (the same
 CPU model and host kernel) and with a Firecracker version that loads
@@ -627,7 +628,8 @@ connections reset, and the guest clock is behind until the guest sets
 it, for example with NTP. minimega does not set the clock_realtime
 option of the load. All restores of one snapshot have the same MACs,
 addresses, and memory, so do not run two of them on one VLAN. A source
-VM that resumes after vm save also shares that state.
+VM that resumes after vm save also shares that state. Use
+firecracker-clone to give each restore its own MACs and host name.
 
 Note: this configuration only applies to Firecracker-based VMs.
 `,
@@ -642,6 +644,41 @@ Note: this configuration only applies to Firecracker-based VMs.
 			}
 
 			ns.vmConfig.FirecrackerSnapshotPath = c.StringArgs["value"]
+
+			return nil
+		}),
+	},
+	{
+		HelpShort: "configures firecracker-clone",
+		HelpLong: `Make a VM that loads firecracker-snapshot a clone with its own
+identity. Use clones to start many VMs from one snapshot.
+
+A clone keeps its configured NIC MACs. vm launch creates each NIC
+disconnected, and vm start resumes the guest. When miniccc in the
+guest connects, minimega runs one cc command in the guest. The command
+finds each NIC by the MAC that the snapshot recorded, sets the
+configured MAC, and sets the VM name as the host name. Then minimega
+connects each NIC to its configured VLAN. When udhcpc runs in the guest,
+minimega then runs udhcpc one time on each NIC.
+
+The clone_identity tag shows the result: pending, ok, or an error. After
+an error, the NICs stay disconnected. A clone needs backchannel true and
+miniccc in the guest. The VM name must be 64 bytes or shorter.
+
+Note: this configuration only applies to Firecracker-based VMs.
+
+Default: false
+`,
+		Patterns: []string{
+			"vm config firecracker-clone [true,false]",
+		},
+		Call: wrapSimpleCLI(func(ns *Namespace, c *minicli.Command, r *minicli.Response) error {
+			if len(c.BoolArgs) == 0 {
+				r.Response = strconv.FormatBool(ns.vmConfig.FirecrackerClone)
+				return nil
+			}
+
+			ns.vmConfig.FirecrackerClone = c.BoolArgs["true"]
 
 			return nil
 		}),
@@ -1510,6 +1547,7 @@ Default: empty map
 			"clear vm config <android-extra-args,>",
 			"clear vm config <fifos,>",
 			"clear vm config <filesystem,>",
+			"clear vm config <firecracker-clone,>",
 			"clear vm config <firecracker-entropy,>",
 			"clear vm config <firecracker-pci,>",
 			"clear vm config <firecracker-path,>",
@@ -2007,6 +2045,9 @@ func (v *FirecrackerConfig) Info(field string) (string, error) {
 	if field == "firecracker-snapshot" {
 		return v.FirecrackerSnapshotPath, nil
 	}
+	if field == "firecracker-clone" {
+		return strconv.FormatBool(v.FirecrackerClone), nil
+	}
 	if field == "firecracker-scratch" {
 		return v.FirecrackerScratch, nil
 	}
@@ -2036,6 +2077,9 @@ func (v *FirecrackerConfig) Clear(mask string) {
 	if mask == Wildcard || mask == "firecracker-snapshot" {
 		v.FirecrackerSnapshotPath = ""
 	}
+	if mask == Wildcard || mask == "firecracker-clone" {
+		v.FirecrackerClone = false
+	}
 	if mask == Wildcard || mask == "firecracker-scratch" {
 		v.FirecrackerScratch = ""
 	}
@@ -2062,6 +2106,9 @@ func (v *FirecrackerConfig) WriteConfig(w io.Writer) error {
 	}
 	if v.FirecrackerSnapshotPath != "" {
 		fmt.Fprintf(w, "vm config firecracker-snapshot %v\n", v.FirecrackerSnapshotPath)
+	}
+	if v.FirecrackerClone != false {
+		fmt.Fprintf(w, "vm config firecracker-clone %t\n", v.FirecrackerClone)
 	}
 	if v.FirecrackerScratch != "" {
 		fmt.Fprintf(w, "vm config firecracker-scratch %v\n", v.FirecrackerScratch)
@@ -2099,6 +2146,8 @@ func (v *FirecrackerConfig) ReadConfig(r io.Reader, ns string, vmConfig *VMConfi
 			v.VsockCID, _ = strconv.ParseUint(config[1], 10, 64)
 		case "firecracker-snapshot":
 			v.FirecrackerSnapshotPath = config[1]
+		case "firecracker-clone":
+			v.FirecrackerClone, _ = strconv.ParseBool(config[1])
 		case "firecracker-scratch":
 			v.FirecrackerScratch = config[1]
 		case "inject":

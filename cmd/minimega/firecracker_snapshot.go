@@ -10,10 +10,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -58,6 +58,94 @@ var (
 
 // fcSaves holds the latest vm save of each Firecracker VM, by VM ID.
 var fcSaves = &fcExportRegistry{m: map[int]*fcExport{}}
+
+// fcPrefixes holds the snapshot path prefixes that a vm save writes or a
+// restore reads.
+var fcPrefixes = &fcPrefixTable{saving: map[string]bool{}, locks: map[string]*fcPrefixLock{}}
+
+// fcPrefixTable makes the saves to one prefix exclusive. A save holds the
+// write lock of its prefix while it renames its files into place, and a
+// restore holds the read lock from the sidecar read until the jail links the
+// files.
+type fcPrefixTable struct {
+	mu     sync.Mutex
+	saving map[string]bool
+	locks  map[string]*fcPrefixLock
+}
+
+type fcPrefixLock struct {
+	sync.RWMutex
+	refs int
+}
+
+// fcPrefixKey returns the key of the snapshot path prefix p: the real path of
+// its directory and the base name.
+func fcPrefixKey(p string) string {
+	p = filepath.Clean(p)
+	return filepath.Join(fcResolve(filepath.Dir(p)), filepath.Base(p))
+}
+
+// beginSave records a save to prefix p. It returns an error when another save
+// to p is running.
+func (t *fcPrefixTable) beginSave(p string) error {
+	key := fcPrefixKey(p)
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	if t.saving[key] {
+		return fmt.Errorf("another save to %v is running", p)
+	}
+	t.saving[key] = true
+
+	return nil
+}
+
+// endSave removes the record of beginSave.
+func (t *fcPrefixTable) endSave(p string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	delete(t.saving, fcPrefixKey(p))
+}
+
+// lock takes the write or read lock of prefix p, and returns the function that
+// releases it. The function can run more than one time.
+func (t *fcPrefixTable) lock(p string, write bool) func() {
+	key := fcPrefixKey(p)
+
+	t.mu.Lock()
+	l := t.locks[key]
+	if l == nil {
+		l = &fcPrefixLock{}
+		t.locks[key] = l
+	}
+	l.refs++
+	t.mu.Unlock()
+
+	if write {
+		l.Lock()
+	} else {
+		l.RLock()
+	}
+
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			if write {
+				l.Unlock()
+			} else {
+				l.RUnlock()
+			}
+
+			t.mu.Lock()
+			if l.refs--; l.refs == 0 {
+				delete(t.locks, key)
+			}
+			t.mu.Unlock()
+		})
+	}
+}
 
 // fcSnapshotDevices are the device counts of a snapshot.
 type fcSnapshotDevices struct {
@@ -125,7 +213,16 @@ type fcRestore struct {
 	prefix  string
 	state   string
 	mem     string
-	scratch string // the saved scratch disk, or empty
+	scratch string   // the saved scratch disk, or empty
+	macs    []string // the NIC MACs of the snapshot
+	unlock  func()   // releases the read lock of the prefix
+}
+
+// release releases the read lock of the prefix of r.
+func (r *fcRestore) release() {
+	if r.unlock != nil {
+		r.unlock()
+	}
 }
 
 // fcSave is one vm save after its snapshot.
@@ -459,6 +556,9 @@ func (vm *FirecrackerVM) checkSaveState() error {
 	if vm.client == nil {
 		return vmNotRunning(vm.Name)
 	}
+	if vm.clone != nil {
+		return fmt.Errorf("vm %v is a clone without its identity (clone_identity %q): vm save needs clone_identity ok, or a relaunch with vm kill and vm start", vm.Name, vm.Tags[fcCloneTag])
+	}
 
 	return nil
 }
@@ -487,9 +587,14 @@ func (vm *FirecrackerVM) startSave(dst string, host fcSnapshotHost) (*fcSave, er
 	if err != nil {
 		return nil, fmt.Errorf("vm %v already has a vm save in progress", vm.Name)
 	}
+	if err := fcPrefixes.beginSave(dst); err != nil {
+		fcSaves.restore(job, prev)
+		return nil, err
+	}
 
 	s, err := vm.snapshotForSave(job, vm.snapshotInfo(dst, host))
 	if err != nil {
+		fcPrefixes.endSave(dst)
 		fcSaves.restore(job, prev)
 		return nil, err
 	}
@@ -607,6 +712,7 @@ func fcFinishSave(s *fcSave) {
 	if err2 := s.release(); err2 != nil {
 		log.Error("vm %v: remove save files: %v", s.job.ID, err2)
 	}
+	fcPrefixes.endSave(s.job.Dst)
 
 	if err != nil {
 		log.Error("vm %v: vm save to %v failed: %v", s.job.ID, s.job.Dst, err)
@@ -622,11 +728,9 @@ func fcFinishSave(s *fcSave) {
 // to its destination, syncs it, and renames it into place. It renames the
 // sidecar last, so a reader that finds <dst>.json finds a complete snapshot.
 // A new save to the same prefix replaces the files, and a restored VM keeps
-// the old memory file that it maps.
+// the old memory file that it maps. The renames wait for the restores that
+// read the prefix.
 func fcWriteSave(s *fcSave) error {
-	fcLaunchSem.Acquire()
-	defer fcLaunchSem.Release()
-
 	dst := s.job.Dst
 	suffix := ".tmp-" + fcRandomSuffix()
 
@@ -637,6 +741,39 @@ func fcWriteSave(s *fcSave) error {
 		}
 		return err
 	}
+
+	if err := fcWriteSaveTemps(s, suffix, &tmps); err != nil {
+		return fail(err)
+	}
+
+	unlock := fcPrefixes.lock(dst, true)
+	defer unlock()
+
+	sidecar := dst + ".json"
+	sidecarTmp := sidecar + suffix
+
+	// Without the old sidecar, the files of two saves never look like one
+	// snapshot.
+	if err := os.Remove(sidecar); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fail(err)
+	}
+	for _, f := range s.files {
+		if err := fcSaveRename(f.dst+suffix, f.dst); err != nil {
+			return fail(err)
+		}
+	}
+	if err := fcSaveRename(sidecarTmp, sidecar); err != nil {
+		return fail(err)
+	}
+
+	return fcSyncPath(filepath.Dir(dst))
+}
+
+// fcWriteSaveTemps writes each file of s and the sidecar to its destination
+// with suffix, syncs it, and appends its name to tmps.
+func fcWriteSaveTemps(s *fcSave, suffix string, tmps *[]string) error {
+	fcLaunchSem.Acquire()
+	defer fcLaunchSem.Release()
 
 	sizes := make([]int64, len(s.files))
 	var total int64
@@ -652,7 +789,7 @@ func fcWriteSave(s *fcSave) error {
 	var done int64
 	for i, f := range s.files {
 		tmp := f.dst + suffix
-		tmps = append(tmps, tmp)
+		*tmps = append(*tmps, tmp)
 
 		progress := func(p float64) {
 			if total > 0 {
@@ -678,7 +815,7 @@ func fcWriteSave(s *fcSave) error {
 			err = fcSyncPath(tmp)
 		}
 		if err != nil {
-			return fail(fmt.Errorf("write %v: %v", f.dst, err))
+			return fmt.Errorf("write %v: %v", f.dst, err)
 		}
 
 		done += sizes[i]
@@ -687,31 +824,44 @@ func fcWriteSave(s *fcSave) error {
 	s.info.Created = time.Now().UTC()
 	data, err := json.MarshalIndent(s.info, "", "    ")
 	if err != nil {
-		return fail(err)
+		return err
 	}
 
-	sidecar := dst + ".json"
+	sidecar := s.job.Dst + ".json"
 	sidecarTmp := sidecar + suffix
-	tmps = append(tmps, sidecarTmp)
+	*tmps = append(*tmps, sidecarTmp)
 	if err := fcWriteSynced(sidecarTmp, append(data, '\n')); err != nil {
-		return fail(fmt.Errorf("write %v: %v", sidecar, err))
+		return fmt.Errorf("write %v: %v", sidecar, err)
 	}
 
-	// Without the old sidecar, the files of two saves never look like one
-	// snapshot.
-	if err := os.Remove(sidecar); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return fail(err)
-	}
-	for _, f := range s.files {
-		if err := fcSaveRename(f.dst+suffix, f.dst); err != nil {
-			return fail(err)
+	return nil
+}
+
+// fcSavePoll is the interval at which fcWaitSave checks a vm save. Tests
+// replace it.
+var fcSavePoll = 100 * time.Millisecond
+
+// fcWaitSave waits until the vm save of the VM with ID id ends. It returns an
+// error when the save failed or when the VM has no save.
+func fcWaitSave(id int) error {
+	for {
+		fcSaves.mu.Lock()
+		e := fcSaves.m[id]
+		fcSaves.mu.Unlock()
+
+		if e == nil {
+			return fmt.Errorf("vm %v has no vm save", id)
 		}
-	}
-	if err := fcSaveRename(sidecarTmp, sidecar); err != nil {
-		return fail(err)
-	}
 
-	return fcSyncPath(filepath.Dir(dst))
+		switch status, _ := e.get(); status {
+		case fcExportCompleted:
+			return nil
+		case fcExportFailed:
+			return fmt.Errorf("vm save of vm %v to %v failed, see the minimega log", e.Name, e.Dst)
+		}
+
+		time.Sleep(fcSavePoll)
+	}
 }
 
 // fcFileSize returns the size of a file or a block device.
@@ -859,6 +1009,8 @@ func fcCheckSnapshot(prefix string, info fcSnapshotInfo, cfg VMConfig, host fcSn
 		fail("snapshot %v has the drives %v, but vm config gives %v", prefix, fcDriveList(info.Drives), fcDriveList(want))
 	} else if len(info.NICMACs) != info.Devices.NICs {
 		fail("snapshot %v has %d NIC MACs for %v", prefix, len(info.NICMACs), fcPlural(info.Devices.NICs, "NIC"))
+	} else if _, err := fcSnapshotMACs(info.NICMACs); err != nil {
+		fail("snapshot %v: %v", prefix, err)
 	}
 
 	if len(errs) > 0 {
@@ -882,14 +1034,50 @@ func fcCheckSnapshot(prefix string, info fcSnapshotInfo, cfg VMConfig, host fcSn
 	return warnings, nil
 }
 
+// fcSnapshotMACs returns the NIC MACs of a sidecar in the lowercase form of
+// net.HardwareAddr. It returns an error when one is not a 6-byte MAC.
+func fcSnapshotMACs(macs []string) ([]string, error) {
+	res := make([]string, 0, len(macs))
+
+	for i, m := range macs {
+		hw, err := net.ParseMAC(m)
+		if err == nil && len(hw) != 6 {
+			err = errors.New("not a 6-byte MAC")
+		}
+		if err != nil {
+			return nil, fmt.Errorf("NIC %d has the MAC %q: %v", i, m, err)
+		}
+		res = append(res, hw.String())
+	}
+
+	return res, nil
+}
+
 // checkRestore reads and checks the snapshot of firecracker-snapshot for a
 // launch with cfg and the Firecracker binary fcBin. It gives the NICs the MACs
-// of the snapshot, because the restored guest keeps them.
+// of the snapshot, because the restored guest keeps them. A clone keeps its
+// configured MACs, and its identity sets them in the guest. The restore holds
+// the read lock of the prefix until r.unlock runs.
 //
 // LOCK: Assumes vm.lock is held.
 func (vm *FirecrackerVM) checkRestore(cfg VMConfig, fcBin string) (*fcRestore, error) {
 	prefix := fcSnapshotPrefix(vm.FirecrackerSnapshotPath)
 
+	unlock := fcPrefixes.lock(prefix, false)
+	r, err := vm.readRestore(prefix, cfg, fcBin)
+	if err != nil {
+		unlock()
+		return nil, err
+	}
+	r.unlock = unlock
+
+	return r, nil
+}
+
+// readRestore reads and checks the snapshot at prefix for checkRestore.
+//
+// LOCK: Assumes vm.lock is held.
+func (vm *FirecrackerVM) readRestore(prefix string, cfg VMConfig, fcBin string) (*fcRestore, error) {
 	info, err := fcReadSnapshotInfo(prefix)
 	if err != nil {
 		return nil, err
@@ -903,7 +1091,12 @@ func (vm *FirecrackerVM) checkRestore(cfg VMConfig, fcBin string) (*fcRestore, e
 		return nil, err
 	}
 
-	r := &fcRestore{prefix: prefix, state: prefix + ".state", mem: prefix + ".mem"}
+	macs, err := fcSnapshotMACs(info.NICMACs)
+	if err != nil {
+		return nil, fmt.Errorf("snapshot %v: %v", prefix, err)
+	}
+
+	r := &fcRestore{prefix: prefix, state: prefix + ".state", mem: prefix + ".mem", macs: macs}
 	if info.Devices.Scratch > 0 {
 		r.scratch = prefix + fcSaveSuffix(0, true)
 	}
@@ -924,7 +1117,11 @@ func (vm *FirecrackerVM) checkRestore(cfg VMConfig, fcBin string) (*fcRestore, e
 		}
 	}
 
-	for i, mac := range info.NICMACs {
+	if vm.FirecrackerClone {
+		return r, nil
+	}
+
+	for i, mac := range macs {
 		if !strings.EqualFold(vm.Networks[i].MAC, mac) {
 			log.Info("vm %v: NIC %d gets MAC %v from snapshot %v in place of %v", vm.Name, i, mac, prefix, vm.Networks[i].MAC)
 		}
@@ -934,28 +1131,193 @@ func (vm *FirecrackerVM) checkRestore(cfg VMConfig, fcBin string) (*fcRestore, e
 	return r, nil
 }
 
-// grantSnapshotRead gives the VM uid read access to the state and memory files
-// of r with an ACL entry. Flush removes the entries.
+// fcSnapGroups holds the shared group of each snapshot that VMs restore.
+var fcSnapGroups = newFCSnapGroups()
+
+// fcSnapGroup is the group of the VMs that restore one snapshot. A gid of -1
+// means that the files did not get the group, so each VM gets ACL entries.
+type fcSnapGroup struct {
+	gid   int
+	files []string
+	refs  int
+}
+
+// fcSnapGroupTable gives each snapshot that VMs restore a gid in
+// fcSnapGIDRange: the highest gid that no other snapshot in use and no host
+// account or group has. The gid is free again when no VM uses the snapshot.
+type fcSnapGroupTable struct {
+	mu       sync.Mutex
+	m        map[string]*fcSnapGroup // real path of <prefix>.mem -> group
+	reserved map[int]bool            // host IDs in fcSnapGIDRange
+}
+
+func newFCSnapGroups() *fcSnapGroupTable {
+	return &fcSnapGroupTable{m: map[string]*fcSnapGroup{}, reserved: map[int]bool{}}
+}
+
+// fcSnapGIDRange returns the range [lo, hi) of the snapshot gids: the fcIDRange
+// gids below the uid base, without gid 0.
+func fcSnapGIDRange() (uint64, uint64) {
+	hi := uint64(*f_firecrackerUIDBase)
+	if hi <= fcIDRange {
+		return 1, hi
+	}
+
+	return hi - fcIDRange, hi
+}
+
+// reserve keeps the host IDs ids out of the snapshot gids.
+func (t *fcSnapGroupTable) reserve(ids []uint64) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	for _, id := range ids {
+		t.reserved[int(id)] = true
+	}
+}
+
+// freeGID returns the highest free gid in fcSnapGIDRange.
 //
-// LOCK: Assumes vm.lock is held.
-func (vm *FirecrackerVM) grantSnapshotRead(r *fcRestore) error {
-	uid := fcVMUID(vm.ID)
+// LOCK: Assumes t.mu is held.
+func (t *fcSnapGroupTable) freeGID() (int, error) {
+	used := map[int]bool{}
+	for _, g := range t.m {
+		used[g.gid] = true
+	}
 
-	for _, p := range []string{r.state, r.mem} {
-		if slices.Contains(vm.snapACLs, p) {
-			continue
+	lo, hi := fcSnapGIDRange()
+	for gid := int(hi) - 1; gid >= int(lo); gid-- {
+		if !used[gid] && !t.reserved[gid] {
+			return gid, nil
+		}
+	}
+
+	return 0, fmt.Errorf("no free gid for the snapshot group in %v-%v", lo, int(hi)-1)
+}
+
+// acquire adds a VM to the group of the snapshot files state and mem, and
+// gives the files to root:<gid> with mode 0640. It returns the key of the group
+// and its gid, or -1 when the files cannot get the group.
+func (t *fcSnapGroupTable) acquire(state, mem string) (string, int, error) {
+	key := fcResolve(mem)
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	g := t.m[key]
+	if g == nil {
+		gid, err := t.freeGID()
+		if err != nil {
+			return "", 0, err
 		}
 
-		if out, err := fcRunCmd("setfacl", "-m", fmt.Sprintf("u:%d:r", uid), p); err != nil {
-			return fmt.Errorf("setfacl %v: %v: %v", p, strings.TrimSpace(out), err)
+		g = &fcSnapGroup{gid: gid, files: []string{state, mem}}
+		if err := fcShareSnapshot(g.files, gid); err != nil {
+			fcUnshareSnapshot(g.files)
+			log.Warn("unable to give %v and %v to group %v, so each restore of them adds an ACL entry for its uid, and ext4 holds only about 500 ACL entries on a file: %v", state, mem, gid, err)
+			g.gid = -1
 		}
-		vm.snapACLs = append(vm.snapACLs, p)
+		t.m[key] = g
+	} else if g.gid >= 0 {
+		// A vm save to the same prefix replaces the files.
+		if err := fcShareSnapshot([]string{state, mem}, g.gid); err != nil {
+			return "", 0, err
+		}
+	}
+
+	g.refs++
+
+	return key, g.gid, nil
+}
+
+// release removes a VM from the group key. After the last VM, it gives the
+// files back to root:root with mode 0600, and the gid is free.
+func (t *fcSnapGroupTable) release(key string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	g := t.m[key]
+	if g == nil {
+		return
+	}
+	if g.refs--; g.refs > 0 {
+		return
+	}
+	delete(t.m, key)
+
+	if g.gid >= 0 {
+		if err := fcUnshareSnapshot(g.files); err != nil {
+			log.Error("snapshot group %v: %v", g.gid, err)
+		}
+	}
+}
+
+// fcShareSnapshot gives the snapshot files to root:<gid> with mode 0640.
+func fcShareSnapshot(files []string, gid int) error {
+	for _, p := range files {
+		if err := fcChown(p, os.Geteuid(), gid); err != nil {
+			return err
+		}
+		if err := os.Chmod(p, 0640); err != nil {
+			return err
+		}
 	}
 
 	return nil
 }
 
-// revokeSnapshotRead removes the ACL entries of grantSnapshotRead.
+// fcUnshareSnapshot gives the snapshot files back to root:root with mode 0600.
+// A missing file is not an error.
+func fcUnshareSnapshot(files []string) error {
+	var errs []error
+
+	for _, p := range files {
+		err := os.Chmod(p, 0600)
+		if err == nil {
+			err = fcChown(p, os.Geteuid(), os.Getegid())
+		}
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			errs = append(errs, err)
+		}
+	}
+
+	return errors.Join(errs...)
+}
+
+// grantSnapshotRead gives the VM read access to the state and memory files of
+// r, and returns the gid of its VMM. The VMs that restore one snapshot share a
+// group that can read its files. When the files cannot get the group, the VM
+// uid gets an ACL entry on each file, and the gid is the VM uid. Flush
+// releases the access.
+//
+// LOCK: Assumes vm.lock is held.
+func (vm *FirecrackerVM) grantSnapshotRead(r *fcRestore) (int, error) {
+	// A relaunch after a failed restore gets the access again.
+	vm.revokeSnapshotRead()
+
+	key, gid, err := fcSnapGroups.acquire(r.state, r.mem)
+	if err != nil {
+		return 0, fmt.Errorf("snapshot %v: %v", r.prefix, err)
+	}
+	vm.snapGroup = key
+
+	if gid >= 0 {
+		return gid, nil
+	}
+
+	uid := fcVMUID(vm.ID)
+	for _, p := range []string{r.state, r.mem} {
+		if out, err := fcRunCmd("setfacl", "-m", fmt.Sprintf("u:%d:r", uid), p); err != nil {
+			return 0, fmt.Errorf("setfacl %v: %v: %v", p, strings.TrimSpace(out), err)
+		}
+		vm.snapACLs = append(vm.snapACLs, p)
+	}
+
+	return uid, nil
+}
+
+// revokeSnapshotRead removes the ACL entries of grantSnapshotRead and removes
+// the VM from its snapshot group.
 //
 // LOCK: Assumes vm.lock is held.
 func (vm *FirecrackerVM) revokeSnapshotRead() {
@@ -967,6 +1329,11 @@ func (vm *FirecrackerVM) revokeSnapshotRead() {
 		}
 	}
 	vm.snapACLs = nil
+
+	if vm.snapGroup != "" {
+		fcSnapGroups.release(vm.snapGroup)
+		vm.snapGroup = ""
+	}
 }
 
 // configureRestore loads the snapshot r into a new VMM, which leaves the VM

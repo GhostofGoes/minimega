@@ -821,6 +821,11 @@ func (n *Namespace) Save(dir string) error {
 				return err
 			}
 
+			// The launch script needs the files of the save.
+			if err := fcWaitSave(vm.GetID()); err != nil {
+				return err
+			}
+
 			if err := writeFirecrackerRestore(f, vm, vmDst, useIOM); err != nil {
 				return err
 			}

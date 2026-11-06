@@ -239,10 +239,11 @@ func (s *Server) ListenUnix(path string) error {
 // ListenUnixBound creates a unix domain socket at path for the VM with the
 // given UUID, and accepts connections on it in a goroutine. Every connection
 // is bound to uuid: a client that sends an empty UUID gets uuid, and a client
-// that claims another UUID is refused. The socket is owned by the current
-// user and the group uid, with mode 0660. A negative uid keeps the group.
-// Close the socket with CloseUnix. The VM must be registered with RegisterVM
-// before its client can complete the handshake.
+// that claims another UUID is refused. The socket is owned by uid and the
+// group uid, with mode 0600, so only uid and root can connect to it. A
+// negative uid keeps the owner and the group. Close the socket with
+// CloseUnix. The VM must be registered with RegisterVM before its client can
+// complete the handshake.
 func (s *Server) ListenUnixBound(path, uuid string, uid int) error {
 	if uuid == "" {
 		return errors.New("bound listener needs a VM UUID")
@@ -263,10 +264,10 @@ func (s *Server) ListenUnixBound(path, uuid string, uid int) error {
 	}
 
 	if uid >= 0 {
-		err = os.Chown(path, os.Getuid(), uid)
+		err = os.Chown(path, uid, uid)
 	}
 	if err == nil {
-		err = os.Chmod(path, 0660)
+		err = os.Chmod(path, 0600)
 	}
 	if err != nil {
 		ln.Close()
@@ -513,6 +514,7 @@ func (s *Server) GetProcesses(uuid string) ([]*Process, error) {
 func (s *Server) GetExitCode(id int, client string) (int, error) {
 	var cid string
 
+	s.clientLock.Lock()
 	if _, ok := s.clients[client]; ok {
 		cid = client
 	} else {
@@ -523,6 +525,7 @@ func (s *Server) GetExitCode(id int, client string) (int, error) {
 			}
 		}
 	}
+	s.clientLock.Unlock()
 
 	if cid == "" {
 		return 0, fmt.Errorf("no client %s", client)

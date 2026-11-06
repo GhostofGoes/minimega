@@ -307,6 +307,71 @@ func TestFCJailPrepareLinkDestroy(t *testing.T) {
 	}
 }
 
+// A VMM with the shared group of a snapshot gets jail objects that only its
+// uid can use.
+func TestFCJailSharedGID(t *testing.T) {
+	dir := t.TempDir()
+	setFCJailGlobals(t, dir)
+
+	fcMountinfoPath = filepath.Join(dir, "mountinfo")
+	if err := os.WriteFile(fcMountinfoPath, nil, 0644); err != nil {
+		t.Fatal(err)
+	}
+	hostCgroupVersion = 2
+	fcCgroupRoot = filepath.Join(dir, "cgroup")
+
+	type chown struct {
+		path     string
+		uid, gid int
+	}
+	var chowns []chown
+	fcChown = func(path string, uid, gid int) error {
+		chowns = append(chowns, chown{path, uid, gid})
+		return nil
+	}
+
+	bin := filepath.Join(dir, "firecracker")
+	if err := os.WriteFile(bin, nil, 0755); err != nil {
+		t.Fatal(err)
+	}
+	j := newFCJail(3, bin)
+	j.GID = 199999
+
+	if err := j.Prepare(); err != nil {
+		t.Fatal(err)
+	}
+	src := filepath.Join(dir, "disk.raw")
+	if err := os.WriteFile(src, []byte("disk"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := j.Link(src, "boot/vmlinux"); err != nil {
+		t.Fatal(err)
+	}
+
+	want := []chown{{j.Root, 200003, 200003}, {j.HostPath("out"), 200003, 200003}, {j.HostPath("boot"), 200003, 200003}}
+	if !reflect.DeepEqual(chowns, want) {
+		t.Errorf("chowns = %v, want %v", chowns, want)
+	}
+	for _, d := range []string{j.Root, j.HostPath("out"), j.HostPath("boot")} {
+		fi, err := os.Stat(d)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if fi.Mode().Perm() != 0700 {
+			t.Errorf("%v mode = %v, want 0700", d, fi.Mode().Perm())
+		}
+	}
+
+	args := fcJailerArgs(j, bin, "/proc/42/fd/7", 2, false)
+	if fcArg(args, "--uid") != "200003" || fcArg(args, "--gid") != "199999" {
+		t.Errorf("jailer args = %q, want --uid 200003 --gid 199999", args)
+	}
+
+	if err := j.Destroy(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestFCJailLinkEXDEV(t *testing.T) {
 	dir := t.TempDir()
 	setFCJailGlobals(t, dir)

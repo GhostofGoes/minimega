@@ -47,6 +47,10 @@ type fcJail struct {
 	ExecName string
 	ID       string
 	Root     string
+
+	// UID is the uid of the VMM, and the owner and group of the jail objects
+	// that minimega creates. GID is the gid of the VMM: UID, or the shared
+	// group of the snapshot that the VMM loads.
 	UID, GID int
 
 	// mounts records the bind mounts that Link made, and copies of the jail
@@ -71,7 +75,8 @@ func newFCJail(vmID int, fcBin string) fcJail {
 	return j
 }
 
-// fcVMUID returns the uid and gid of the VMM of VM vmID.
+// fcVMUID returns the uid of the VMM of VM vmID. It is also the gid of a VMM
+// that does not load a snapshot.
 func fcVMUID(vmID int) int {
 	return int(*f_firecrackerUIDBase) + vmID
 }
@@ -185,8 +190,8 @@ func fcEnableController(path, ctrl string) error {
 }
 
 // Prepare removes any jail left from an earlier launch and creates an empty
-// jail root and /out, owned by the VM uid. It reads the mount table only when
-// a jail directory is left.
+// jail root and /out, owned by the VM uid with mode 0700. It reads the mount
+// table only when a jail directory is left.
 func (j fcJail) Prepare() error {
 	_, statErr := os.Lstat(j.Dir())
 	if err := j.destroy(j.mounts == nil || statErr == nil); err != nil {
@@ -197,7 +202,7 @@ func (j fcJail) Prepare() error {
 		if err := os.MkdirAll(d, 0700); err != nil {
 			return fmt.Errorf("create jail: %v", err)
 		}
-		if err := fcChown(d, j.UID, j.GID); err != nil {
+		if err := fcChown(d, j.UID, j.UID); err != nil {
 			return fmt.Errorf("create jail: %v", err)
 		}
 	}
@@ -233,7 +238,7 @@ func (j fcJail) Link(src, name string) (string, error) {
 		if err := unix.Mknod(dst, unix.S_IFBLK|0600, int(st.Rdev)); err != nil {
 			return "", fmt.Errorf("create device node %v: %v", dst, err)
 		}
-		if err := fcChown(dst, j.UID, j.GID); err != nil {
+		if err := fcChown(dst, j.UID, j.UID); err != nil {
 			return "", fmt.Errorf("create device node %v: %v", dst, err)
 		}
 		return "device node", nil
@@ -281,7 +286,7 @@ func (j fcJail) mkdirs(dir string) error {
 		if err := os.Mkdir(missing[i], 0700); err != nil && !os.IsExist(err) {
 			return fmt.Errorf("create %v: %v", missing[i], err)
 		}
-		if err := fcChown(missing[i], j.UID, j.GID); err != nil {
+		if err := fcChown(missing[i], j.UID, j.UID); err != nil {
 			return fmt.Errorf("create %v: %v", missing[i], err)
 		}
 	}

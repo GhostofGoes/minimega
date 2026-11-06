@@ -469,7 +469,8 @@ to a temporary name that it renames into place:
 
 minimega does not copy a disk with option ro. <filename>.json records its
 path. The snapshot resets the vsock connections of the guest, so cc commands,
-file transfers, and tunnels in progress fail.
+file transfers, and tunnels in progress fail. Only one save to a filename can
+run at a time. A clone that does not have its identity cannot be saved.
 
 To restore a Firecracker VM, use the same vm config as the saved VM, set "vm
 config firecracker-snapshot <filename>" and "vm config disk <filename>.hdd",

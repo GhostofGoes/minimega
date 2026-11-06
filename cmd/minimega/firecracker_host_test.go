@@ -417,16 +417,52 @@ below:x:1999999999:1::/:/bin/false
 bad:x:notanumber:1
 short
 `
-	got := fcIDOverlaps(passwd, 2000000000, 2, 3)
+	got, _ := fcIDOverlaps(passwd, 2000000000, 2000000000+fcIDRange, 2, 3)
 	want := []string{"fc:2000000005", "grp:2000065535"}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("passwd: got %q, want %q", got, want)
 	}
 
 	group := "root:x:0:\nfc:x:2000000001:alice\nusers:x:100:\n"
-	got = fcIDOverlaps(group, 2000000000, 2)
+	got, _ = fcIDOverlaps(group, 2000000000, 2000000000+fcIDRange, 2)
 	want = []string{"fc:2000000001"}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("group: got %q, want %q", got, want)
+	}
+}
+
+func TestFCSnapGIDRangeOverlaps(t *testing.T) {
+	setFCJailGlobals(t, t.TempDir())
+	*f_firecrackerUIDBase = 2000000000
+
+	lo, hi := fcSnapGIDRange()
+	if lo != 2000000000-fcIDRange || hi != 2000000000 {
+		t.Fatalf("fcSnapGIDRange() = %v, %v, want [%v, 2000000000)", lo, hi, 2000000000-fcIDRange)
+	}
+
+	passwd := `root:x:0:0:root:/root:/bin/bash
+low:x:1999934463:1::/:/bin/false
+first:x:1999934464:1::/:/bin/false
+both:x:1999999990:1999999991::/:/bin/false
+last:x:100:1999999999::/:/bin/false
+vmm:x:2000000000:2000000000::/:/bin/false
+`
+	names, ids := fcIDOverlaps(passwd, lo, hi, 2, 3)
+	if want := []string{"first:1999934464", "both:1999999990", "last:1999999999"}; !reflect.DeepEqual(names, want) {
+		t.Errorf("passwd names = %q, want %q", names, want)
+	}
+	if want := []uint64{1999934464, 1999999990, 1999999991, 1999999999}; !reflect.DeepEqual(ids, want) {
+		t.Errorf("passwd ids = %v, want %v", ids, want)
+	}
+
+	names, ids = fcIDOverlaps("snap:x:1999999999:\nusers:x:100:\n", lo, hi, 2)
+	if want := []string{"snap:1999999999"}; !reflect.DeepEqual(names, want) || !reflect.DeepEqual(ids, []uint64{1999999999}) {
+		t.Errorf("group = %q, %v, want %q", names, ids, want)
+	}
+
+	// A low uid base keeps gid 0 out of the range.
+	*f_firecrackerUIDBase = 1000
+	if lo, hi := fcSnapGIDRange(); lo != 1 || hi != 1000 {
+		t.Errorf("fcSnapGIDRange() with uid base 1000 = %v, %v, want [1, 1000)", lo, hi)
 	}
 }

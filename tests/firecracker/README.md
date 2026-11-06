@@ -91,6 +91,37 @@ port adds of many VMs at the same time. Each of these guests gets the static
 address `192.0.2.1/32`, so that it does not start DHCP. The check does not use
 the guest addresses.
 
+## Snapshot clone check
+
+Check 16 of `smoke.sh` boots `csrc` from the minimal guest with
+`vm config backchannel true`, one NIC on VLAN `LAN`, and the static address
+`192.0.2.10/24`. It saves `csrc` with `vm save csrc csnap`, then kills and
+flushes it. Then it launches five clones, `clone1` to `clone5`, with
+`vm config firecracker-snapshot <files>/csnap`,
+`vm config firecracker-clone true`, and a different MAC for each clone. The
+check makes sure of these items:
+
+- Before `vm start all`, each clone shows `disconnected` in the `vlan` column,
+  and its tap is not on a bridge.
+- In 120 seconds after `vm start all`, each clone has the tag
+  `clone_identity=ok`.
+- The tap of each clone has the OVS tag of VLAN `LAN`.
+- In each clone, `ip link` shows the MAC of the clone and not the MAC of
+  `csrc`, `hostname` shows the name of the clone, and `ip route` still has the
+  default route of `csrc`.
+- The jail of each clone has `/snapshot.mem`, which is the same file as
+  `csnap.mem`. All VMMs of the clones have their own uid and the same gid,
+  which is not a uid of a VMM. `csnap.state` and `csnap.mem` are
+  `root:<gid>` with mode `0640` and no ACL entries for the clones.
+- The jail root of each clone is owned by the uid of the clone with mode
+  `0700`. The cc socket in the jail is owned by that uid with mode `0600`.
+- After `vm kill all` and `vm flush`, no host objects are left, and
+  `csnap.state` and `csnap.mem` are `root:root` with mode `0600`.
+
+The check prints the seconds from `vm start all` until all clones have their
+identity. It also prints the sum of the RSS and PSS of the five VMMs, and the
+sum of the guest memory, for information.
+
 ## Files
 
 | File | Use |
@@ -161,7 +192,7 @@ create taps, network namespaces, loop devices, and device-mapper targets.
 
 The checks use VLAN `LAN`, the host tap `mmfc_host`, and the addresses in
 `172.16.0.0/28` and `172.16.1.0/26`. The cc checks put one file in the minimega files
-directory (`<base>/files`), and check 10b puts the `fc1snap` files there. The
-test removes them at the end. Use a minimega instance
+directory (`<base>/files`). Check 10b puts the `fc1snap` files there, and
+check 16 puts the `csnap` files there. The test removes them at the end. Use a minimega instance
 that has no other VMs. To use other paths, set `MM`, `MM_BASE`, `MM_LOG`,
 `MM_FILES`, `FC_DIR`, and `MINIMAL`.

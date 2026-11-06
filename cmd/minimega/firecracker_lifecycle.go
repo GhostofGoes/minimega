@@ -30,6 +30,9 @@ const (
 	// fcCmdlinePerDevice is about the size of one virtio_mmio.device= entry.
 	fcCmdlinePerDevice = 30
 
+	// fcMaxHostname is the size limit of a Linux host name.
+	fcMaxHostname = 64
+
 	// fcConsoleMaxBytes is the default size limit of console.log.
 	fcConsoleMaxBytes = 16 << 20
 
@@ -87,6 +90,14 @@ func fcValidateConfig(name string, cfg VMConfig) (warnings []string, err error) 
 	if _, err := fcParseSize(fc.FirecrackerScratch); err != nil {
 		fail("firecracker-scratch: %v", err)
 	}
+	if fc.FirecrackerClone && fc.FirecrackerSnapshotPath != "" {
+		if !base.Backchannel {
+			fail("firecracker-clone needs vm config backchannel true: minimega sets the identity of a clone through cc")
+		}
+		if len(name) > fcMaxHostname {
+			fail("firecracker-clone sets the VM name as the guest host name, but VM name %v is %d bytes; the limit is %d bytes", name, len(name), fcMaxHostname)
+		}
+	}
 
 	if n, limit, detail := fcDeviceCount(cfg); n > limit {
 		with := "without"
@@ -125,6 +136,9 @@ func fcValidateConfig(name string, cfg VMConfig) (warnings []string, err error) 
 		if d.Interface != "" && d.Interface != "virtio" {
 			warnings = append(warnings, fmt.Sprintf("VM %v: firecracker always uses virtio-blk: ignoring interface %v of disk %d", name, d.Interface, i))
 		}
+	}
+	if fc.FirecrackerClone && fc.FirecrackerSnapshotPath == "" {
+		warnings = append(warnings, fmt.Sprintf("VM %v: firecracker-clone has no effect without firecracker-snapshot", name))
 	}
 	for i, nic := range base.Networks {
 		if nic.Driver != "" && nic.Driver != DefaultKVMDriver && !strings.HasPrefix(nic.Driver, "virtio") {

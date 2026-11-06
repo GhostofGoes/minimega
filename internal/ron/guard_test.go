@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -269,8 +270,36 @@ func TestBoundListenerBindsEmptyUUID(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if fi.Mode().Perm() != 0660 {
-		t.Fatalf("socket mode = %v, want 0660", fi.Mode().Perm())
+	if fi.Mode().Perm() != 0600 {
+		t.Fatalf("socket mode = %v, want 0600", fi.Mode().Perm())
+	}
+
+	mustDial(t, s, path, "", uuidA)
+}
+
+func TestBoundListenerOwner(t *testing.T) {
+	uid := os.Getuid()
+	if os.Geteuid() == 0 {
+		uid = 4242
+	} else if os.Getgid() != uid {
+		t.Skipf("uid %v cannot give a file the group %v", uid, uid)
+	}
+
+	s := newTestServer(t, nil)
+	s.RegisterVM(&fakeVM{uuid: uuidA, policy: CCPolicyStrict, tags: map[string]string{}})
+
+	path := filepath.Join(s.sockDir, "owner.sock")
+	if err := s.ListenUnixBound(path, uuidA, uid); err != nil {
+		t.Fatal(err)
+	}
+
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st := fi.Sys().(*syscall.Stat_t)
+	if int(st.Uid) != uid || int(st.Gid) != uid || fi.Mode().Perm() != 0600 {
+		t.Fatalf("socket is %v:%v with mode %v, want %v:%v with mode 0600", st.Uid, st.Gid, fi.Mode().Perm(), uid, uid)
 	}
 
 	mustDial(t, s, path, "", uuidA)

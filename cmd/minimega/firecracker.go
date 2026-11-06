@@ -130,8 +130,9 @@ type FirecrackerConfig struct {
 	// The configuration must match <prefix>.json: the same vCPUs, memory,
 	// disks, ro disks, scratch disk, NICs, backchannel, entropy device, and
 	// PCI setting. Set vm config disk to <prefix>.hdd, the disk that vm save
-	// wrote with the snapshot. The VM gets the NIC MACs of the snapshot. A
-	// scratch disk gets the content of <prefix>.scratch.
+	// wrote with the snapshot. Without firecracker-clone, the VM gets the NIC
+	// MACs of the snapshot. A scratch disk gets the content of
+	// <prefix>.scratch.
 	//
 	// minimega restores a snapshot only on the same kind of host (the same
 	// CPU model and host kernel) and with a Firecracker version that loads
@@ -144,10 +145,33 @@ type FirecrackerConfig struct {
 	// it, for example with NTP. minimega does not set the clock_realtime
 	// option of the load. All restores of one snapshot have the same MACs,
 	// addresses, and memory, so do not run two of them on one VLAN. A source
-	// VM that resumes after vm save also shares that state.
+	// VM that resumes after vm save also shares that state. Use
+	// firecracker-clone to give each restore its own MACs and host name.
 	//
 	// Note: this configuration only applies to Firecracker-based VMs.
 	FirecrackerSnapshotPath string `config:"firecracker-snapshot" path:"false"`
+
+	// Make a VM that loads firecracker-snapshot a clone with its own
+	// identity. Use clones to start many VMs from one snapshot.
+	//
+	// A clone keeps its configured NIC MACs. vm launch creates each NIC
+	// disconnected, and vm start resumes the guest. When miniccc in the
+	// guest connects, minimega runs one cc command in the guest. The command
+	// finds each NIC by the MAC that the snapshot recorded, sets the
+	// configured MAC, and sets the first 63 bytes of the VM name as the host
+	// name. Then minimega connects each NIC to its configured VLAN. When
+	// udhcpc runs in the guest, minimega then runs udhcpc one time on each NIC.
+	//
+	// The clone_identity tag shows the result: pending, ok, or an error. After
+	// an error, the NICs stay disconnected, and vm save refuses the clone. vm
+	// kill and vm start boot the disk and connect the NICs. A clone needs
+	// backchannel true and miniccc in the guest. The VM name must be 64 bytes
+	// or shorter.
+	//
+	// Note: this configuration only applies to Firecracker-based VMs.
+	//
+	// Default: false
+	FirecrackerClone bool `config:"firecracker-clone"`
 
 	// Add an empty writable scratch disk of this size to a VM, for example
 	// 64M or 1G. The K, M, G, and T suffixes are powers of 1024, and the size
@@ -179,6 +203,7 @@ type FirecrackerVM struct {
 	netns     *bridge.Netns
 	mtus      []int
 	exportSeq int
+	snapGroup string   // key of the snapshot group that the VM is in, or empty
 	snapACLs  []string // snapshot files with an ACL entry for the VM uid
 
 	// restoring is the snapshot that the current launch loads. restored is
@@ -186,6 +211,9 @@ type FirecrackerVM struct {
 	// boot the disk.
 	restoring *fcRestore
 	restored  bool
+
+	// clone is the identity that a restored clone waits for, or nil.
+	clone *fcClone
 
 	// Objects of the current VMM. loaded is true while the VMM holds a
 	// loaded snapshot that vm start did not resume yet.
@@ -247,6 +275,7 @@ func (vm *FirecrackerConfig) String() string {
 	fmt.Fprintf(w, "Entropy:\t%v\n", vm.FirecrackerEntropy)
 	fmt.Fprintf(w, "Vsock CID:\t%v\n", vm.VsockCID)
 	fmt.Fprintf(w, "Snapshot:\t%v\n", vm.FirecrackerSnapshotPath)
+	fmt.Fprintf(w, "Clone:\t%v\n", vm.FirecrackerClone)
 	fmt.Fprintf(w, "Scratch:\t%v\n", vm.FirecrackerScratch)
 	fmt.Fprintf(w, "Injects:\t%v\n", vm.Injects)
 	w.Flush()
@@ -295,6 +324,9 @@ func (vm *FirecrackerVM) Copy() VM {
 	vm2.disks = append([]fcDisk(nil), vm.disks...)
 	vm2.mtus = append([]int(nil), vm.mtus...)
 	vm2.snapACLs = append([]string(nil), vm.snapACLs...)
+	if vm.clone != nil {
+		vm2.clone = vm.clone.copy()
+	}
 
 	return vm2
 }
@@ -326,7 +358,8 @@ func fcCheckHostDefault(fcPath, jailerPath string) (string, string, error) {
 
 // fcCreateTapDefault creates the links of a NIC in ns, and starts the bridge
 // port add of the host end. The add can wait on the OVS batcher, so the launch
-// waits for it with fcWaitTapAdd after the network stage.
+// waits for it with fcWaitTapAdd after the network stage. A NIC on
+// DisconnectedVLAN gets no bridge port.
 func fcCreateTapDefault(nic NetConfig, ns *bridge.Netns, index, uid int) (string, int, error) {
 	br, err := getBridge(nic.Bridge)
 	if err != nil {
@@ -336,6 +369,9 @@ func fcCreateTapDefault(nic NetConfig, ns *bridge.Netns, index, uid int) (string
 	tap, mtu, err := br.CreateNetnsLinks(ns, nic.MAC, nic.VLAN, index, uid)
 	if err != nil {
 		return "", 0, err
+	}
+	if nic.VLAN == DisconnectedVLAN {
+		return tap, mtu, nil
 	}
 
 	done := make(chan error, 1)
@@ -476,7 +512,18 @@ func (vm *FirecrackerVM) launch(first bool) error {
 		}
 
 		vm.restoring = r
-		defer func() { vm.restoring = nil }()
+		defer func() {
+			r.release()
+			vm.restoring = nil
+		}()
+
+		if vm.FirecrackerClone {
+			vm.holdClone(r.macs)
+		}
+	} else if c := vm.clone; c != nil {
+		// The relaunch boots the disk, and the guest gets the configured MACs.
+		vm.clone = nil
+		vm.releaseClone(c)
 	}
 
 	if fcIsBeaconName(vm.Name) {
@@ -729,7 +776,15 @@ func (vm *FirecrackerVM) startVMM(cfg VMConfig, fcBin, jailerBin string) error {
 		return err
 	}
 
+	gid := uid
+	if r := vm.restoring; r != nil {
+		if gid, err = vm.grantSnapshotRead(r); err != nil {
+			return err
+		}
+	}
+
 	j := newFCJail(vm.ID, fcBin)
+	j.GID = gid
 	vm.jail = j
 
 	if err := fcCheckSocketPath(j.HostPath("/api.sock")); err != nil {
@@ -770,14 +825,12 @@ func (vm *FirecrackerVM) startVMM(cfg VMConfig, fcBin, jailerBin string) error {
 	}
 
 	if r := vm.restoring; r != nil {
-		if err := vm.grantSnapshotRead(r); err != nil {
-			return fail(err)
-		}
 		for _, l := range [][2]string{{r.state, fcRestoreState}, {r.mem, fcRestoreMem}} {
 			if _, err := j.Link(l[0], l[1]); err != nil {
 				return fail(err)
 			}
 		}
+		r.release()
 	}
 
 	logFIFO := j.HostPath("/firecracker.log")
@@ -954,7 +1007,8 @@ func (j fcJail) CCSocket() string {
 }
 
 // startCCListener creates the cc listener in jail j, when the VM has a cc
-// server and the jail has no listener yet.
+// server and the jail has no listener yet. The VM uid owns the socket, so only
+// the VMM of the VM can connect to it.
 //
 // LOCK: Assumes vm.lock is held. ListenUnixBound takes only the ron listener
 // lock and never calls back into the VM, so it is safe under vm.lock.
@@ -964,7 +1018,7 @@ func (vm *FirecrackerVM) startCCListener(j fcJail) error {
 	}
 
 	p := j.CCSocket()
-	if err := vm.cc.ListenUnixBound(p, vm.UUID, j.GID); err != nil {
+	if err := vm.cc.ListenUnixBound(p, vm.UUID, j.UID); err != nil {
 		return fmt.Errorf("unable to create cc listener: %v", err)
 	}
 	vm.ccPath = p
@@ -1137,6 +1191,7 @@ func (vm *FirecrackerVM) Start() error {
 
 		vm.loaded = false
 		vm.setState(VM_RUNNING)
+		vm.startCloneIdentity()
 		return nil
 	}
 

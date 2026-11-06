@@ -175,6 +175,7 @@ func firecrackerHostInit() {
 	log.Debug("firecracker instance name: %v", fcInstance)
 
 	base := uint64(*f_firecrackerUIDBase)
+	lo, hi := fcSnapGIDRange()
 	for _, f := range []struct {
 		path   string
 		fields []int
@@ -187,16 +188,24 @@ func firecrackerHostInit() {
 			continue
 		}
 
-		if ids := fcIDOverlaps(string(data), base, f.fields...); len(ids) > 0 {
-			log.Warn("%v has IDs in the Firecracker uid range %v-%v: %v", f.path, base, base+fcIDRange-1, strings.Join(ids, ", "))
+		if names, _ := fcIDOverlaps(string(data), base, base+fcIDRange, f.fields...); len(names) > 0 {
+			log.Warn("%v has IDs in the Firecracker uid range %v-%v: %v", f.path, base, base+fcIDRange-1, strings.Join(names, ", "))
 		}
+
+		names, ids := fcIDOverlaps(string(data), lo, hi, f.fields...)
+		if len(names) > 0 {
+			log.Warn("%v has IDs in the Firecracker snapshot gid range %v-%v, and restores do not use these gids: %v", f.path, lo, hi-1, strings.Join(names, ", "))
+		}
+		fcSnapGroups.reserve(ids)
 	}
 }
 
 // fcIDOverlaps returns "name:id" for each entry of a passwd or group file
-// with an ID, at one of the field indexes, in [base, base+fcIDRange).
-func fcIDOverlaps(data string, base uint64, fields ...int) []string {
-	var res []string
+// with an ID, at one of the field indexes, in [lo, hi). It also returns each
+// ID in the range.
+func fcIDOverlaps(data string, lo, hi uint64, fields ...int) ([]string, []uint64) {
+	var names []string
+	var ids []uint64
 
 	for _, line := range strings.Split(data, "\n") {
 		line = strings.TrimSpace(line)
@@ -205,6 +214,7 @@ func fcIDOverlaps(data string, base uint64, fields ...int) []string {
 		}
 
 		parts := strings.Split(line, ":")
+		var found []uint64
 		for _, i := range fields {
 			if i >= len(parts) {
 				continue
@@ -215,14 +225,18 @@ func fcIDOverlaps(data string, base uint64, fields ...int) []string {
 				continue
 			}
 
-			if id >= base && id < base+fcIDRange {
-				res = append(res, fmt.Sprintf("%v:%v", parts[0], id))
-				break
+			if id >= lo && id < hi {
+				found = append(found, id)
 			}
+		}
+
+		if len(found) > 0 {
+			names = append(names, fmt.Sprintf("%v:%v", parts[0], found[0]))
+			ids = append(ids, found...)
 		}
 	}
 
-	return res
+	return names, ids
 }
 
 var fcVersionRe = regexp.MustCompile(`v(\d+)\.(\d+)\.(\d+)`)

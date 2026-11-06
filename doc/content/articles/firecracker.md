@@ -86,7 +86,7 @@ The directory must obey these rules:
 | Flag | Default | Use |
 |---|---|---|
 | `-firecracker-dir` | `/var/lib/minimega/firecracker` | The directory for the jails, the instance directories, and the image cache. |
-| `-firecracker-uid-base` | `2000000000` | The first uid and gid of the VMMs. Each VMM runs as the base plus its VM ID. |
+| `-firecracker-uid-base` | `2000000000` | The first uid and gid of the VMMs. Each VMM runs as the base plus its VM ID. The VMMs that restore one snapshot share a gid below the base. |
 | `-firecracker-launch-parallel` | `0` | The maximum number of VMs that prepare at the same time. `0` is the number of CPUs. |
 
 The environment variables `MM_FIRECRACKER_DIR`, `MM_FIRECRACKER_UID_BASE`, and
@@ -94,6 +94,11 @@ The environment variables `MM_FIRECRACKER_DIR`, `MM_FIRECRACKER_UID_BASE`, and
 
 At startup, minimega logs a warning when `/etc/passwd` or `/etc/group` has an
 ID from the uid base to the uid base plus 65535.
+
+The 65536 gids below the uid base are the snapshot gids. Each snapshot that a
+VM restores gets one of these gids while a VM that restores it exists.
+minimega logs a warning at startup when `/etc/passwd` or `/etc/group` has an
+ID in this range, and does not use that ID.
 
 Two minimega instances on one host must use different `-firecracker-dir` and
 `-firecracker-uid-base` values. Two instances can give the same VM ID to two
@@ -237,6 +242,7 @@ the [minimega API](../reference/minimega.md) for each parameter.
 | `vsock-cid` | `3` | The guest CID of the vsock device, from 3 to 4294967294. |
 | `firecracker-scratch` | none | Add an empty writable disk of this size, for example `64M`. |
 | `firecracker-snapshot` | none | Load a snapshot that `vm save` wrote. See [Save and restore](#save-and-restore). |
+| `firecracker-clone` | `false` | Give a VM that loads `firecracker-snapshot` its own MACs and host name. See [Clones](#clones). |
 | `inject` | none | Copy files into the first disk, or remove files from it, at launch. |
 
 <a id="TOC_4.2."></a>
@@ -541,13 +547,18 @@ Do these steps to restore a saved VM:
 6. Resume the VM with `vm start`.
 
 The launch compares the configuration and the host with `<filename>.json`, and
-fails when they are different. The VM gets the NIC MACs of the snapshot. After
+fails when they are different. The VM gets the NIC MACs of the snapshot,
+unless it is a [clone](#clones). After
 a guest reboot, the VM boots its disk with `vm config kernel`. It does not load
 the snapshot again.
 
-`ns save` saves each running or paused Firecracker VM with `vm save`. Its
+`ns save` saves each running or paused Firecracker VM with `vm save`. It waits
+until minimega writes the files of each save, and fails when a save fails. Its
 launch script restores the VM with `vm config firecracker-snapshot`. For other
 Firecracker VMs, `ns save` records only the configuration.
+
+Only one save to a `<filename>` can run at a time. A launch that restores
+`<filename>` waits while a save renames its files into place.
 
 <a id="TOC_8.1."></a>
 
@@ -573,12 +584,96 @@ Firecracker VMs, `ns save` records only the configuration.
   load.
 - All restores of one snapshot have the same MACs, IP addresses, host name, and
   memory secrets. Do not run two of them on one VLAN, unless the guest changes
-  its address.
+  its address. A [clone](#clones) gets its own MACs and host name.
 - When the source VM continues after `vm save`, it also shares these secrets.
   Linux 5.18 and later guests use VMGenID to reseed their random number
   generator after a restore.
 - A KVM VM cannot load a Firecracker snapshot. A Firecracker VM cannot load a
   KVM snapshot.
+
+<a id="TOC_8.2."></a>
+
+### Clones
+
+A clone is a VM that loads a snapshot and then gets its own identity. Use
+clones to start many VMs from one saved VM. Set
+`vm config firecracker-clone true` together with
+`vm config firecracker-snapshot`.
+
+minimega does these steps for each clone:
+
+1. `vm launch` keeps the configured MAC of each NIC. It creates each NIC
+   disconnected, so the `vlan` column of `vm info` shows `disconnected`.
+2. `vm start` resumes the guest. The guest still has the MACs and the host
+   name of the saved VM, but no NIC is on a VLAN.
+3. When miniccc in the guest connects, minimega runs one cc command in the
+   guest. For each NIC, the command finds the guest interface that has the MAC
+   of the snapshot, and sets the configured MAC on it. Then the command sets
+   the first 63 bytes of the VM name as the host name. When the guest refuses
+   the host name, the command continues.
+4. minimega connects each NIC to its configured VLAN.
+5. When `udhcpc` runs in the guest, minimega then runs `udhcpc` one time on
+   each NIC, to get a lease for the new MAC.
+
+The `clone_identity` tag shows the result. The value is `pending` until step
+4, `ok` after step 4, or an error message. minimega waits at most 120 seconds
+for the cc client, and then at most 120 seconds for the result of the command.
+The time while the VM is paused does not count. After an error, the NICs stay
+disconnected. Correct the guest, then connect the NICs with `vm net connect`.
+Or use `vm kill` and `vm start`: the VM then boots its disk with the
+configured MACs, and minimega connects the NICs. When the VM quits before the
+identity is set, for example after `vm kill`, minimega also connects the NICs.
+
+`vm save` and `ns save` refuse a clone until its `clone_identity` tag is
+`ok`, or until a `vm kill` and `vm start` of the clone.
+
+For example, these commands save `src`, and then start 100 clones of it on
+VLAN `lan`:
+
+```text
+vm save src base
+vm kill src
+
+clear vm config
+vm config vcpus 1
+vm config memory 64
+vm config kernel vmlinux
+vm config disk rootfs.squashfs,ro
+vm config net lan
+vm config firecracker-snapshot base
+vm config firecracker-clone true
+vm launch firecracker clone[1-100]
+vm start all
+```
+
+Each clone gets a random MAC, because `vm config net` gives no MAC. The clones
+share memory on the host:
+
+- The jail of each clone gets a hard link to `<filename>.mem`, or a bind mount
+  when the file is on a different filesystem. Firecracker maps the file as
+  private memory. Thus all clones share the pages that they do not change, in
+  the host page cache.
+- All VMs that restore one snapshot run with the same snapshot gid. minimega
+  gives `<filename>.state` and `<filename>.mem` to `root:<gid>` with mode
+  `0640`. After `vm flush` of the last of these VMs, the files are `root:root`
+  with mode `0600` again. When the filesystem cannot change the group, each VM
+  gets an ACL entry. ext4 holds only about 500 ACL entries on a file.
+- The jail, the console and log pipes, the tap, and the cc socket of each VM
+  stay with the uid of the VM, so that one VMM cannot use the objects of
+  another VMM.
+- A disk with `ro` is one shared cached image for all clones. A writable disk
+  gets its own copy of `<filename>.hdd` for each clone.
+
+These limits apply to clones:
+
+- A clone needs `vm config backchannel true`, and the guest must run miniccc.
+- The VM name must be 64 bytes or shorter, the limit of a Linux host name.
+- The guest must have `sh`, `ip`, `hostname`, and `/sys/class/net`. The
+  minimal guest has them.
+- A clone keeps the static IP addresses of the saved VM. Give the saved VM no
+  static address and use `udhcpc`, or set the addresses through cc.
+- Clones share the memory secrets of the saved VM. Linux 5.18 and later
+  guests use VMGenID to reseed their random number generator after a restore.
 
 <a id="TOC_9."></a>
 
