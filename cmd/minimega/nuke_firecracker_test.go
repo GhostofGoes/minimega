@@ -189,7 +189,10 @@ func TestFCNuke(t *testing.T) {
 	busy := map[string]bool{filepath.Join(dir, "vm", "9", "stuck"): true}
 	setNukeSeams(t, root, ops, dmls, busy)
 
-	fcNuke()
+	// The busy mount and the vm/9 entry under it stay.
+	if n := fcNuke(); n != 19 {
+		t.Errorf("fcNuke() = %v, want 19", n)
+	}
 
 	want := []string{
 		"kill " + fakePID(100), "kill " + fakePID(101), "kill " + fakePID(102), "kill " + fakePID(103), "kill " + fakePID(104),
@@ -233,6 +236,158 @@ func TestFCNuke(t *testing.T) {
 	}
 }
 
+func TestFCStartupClean(t *testing.T) {
+	setup := func(t *testing.T) (root, dir, base string, ops *nukeOps) {
+		root = fcResolve(t.TempDir())
+		dir = filepath.Join(root, "fc")
+		base = filepath.Join(root, "base")
+		setFCJailGlobals(t, dir)
+
+		oldBase := *f_base
+		t.Cleanup(func() { *f_base = oldBase })
+		*f_base = base
+
+		// The <ID> links of the earlier process, a KVM instance directory, a
+		// link into another Firecracker directory, and other base entries.
+		nukeMkdir(t, base)
+		for name, target := range map[string]string{
+			"0":     filepath.Join(dir, "vm", "0"),
+			"1":     filepath.Join(dir, "vm", "1"),
+			"3":     filepath.Join(root, "other", "vm", "3"),
+			"alias": filepath.Join(dir, "vm", "0"),
+		} {
+			if err := os.Symlink(target, filepath.Join(base, name)); err != nil {
+				t.Fatal(err)
+			}
+		}
+		nukeWrite(t, filepath.Join(base, "2", "name"), "kvm")
+		nukeWrite(t, filepath.Join(base, "minimega.pid"), "1")
+		nukeMkdir(t, filepath.Join(base, "files"))
+		nukeMkdir(t, filepath.Join(base, "namespaces", "minimega"))
+
+		nukeWrite(t, filepath.Join(root, "mountinfo"), mountLine("/other/mount"))
+		nukeMkdir(t, filepath.Join(root, "proc"))
+		nukeMkdir(t, filepath.Join(root, "netns"))
+
+		ops = &nukeOps{}
+		setNukeSeams(t, root, ops, "mm-fc-a1b2c3-1-0\t(253:1)\nmm-fc-ffffff-1-0\t(253:2)\n", nil)
+
+		return root, dir, base, ops
+	}
+
+	t.Run("leftovers", func(t *testing.T) {
+		root, dir, base, ops := setup(t)
+
+		vmRoot := filepath.Join(dir, "jail", "firecracker", "vm1", "root")
+		nukeWrite(t, filepath.Join(vmRoot, "disk0"), "")
+		nukeWrite(t, filepath.Join(dir, "vm", "0", "console.log"), "boot")
+		nukeWrite(t, filepath.Join(dir, "cache", "abc"), "image")
+		nukeWrite(t, filepath.Join(root, "mountinfo"), mountLine(filepath.Join(vmRoot, "disk0"))+mountLine("/other/mount"))
+
+		nukeProc(t, filepath.Join(root, "proc"), 1, "0::/minimega-fc-a1b2c3/vm1", "/firecracker", "--id", "vm1")
+		nukeProc(t, filepath.Join(root, "proc"), 2, "0::/minimega-fc-ffffff/vm1", "/firecracker", "--id", "vm1")
+
+		nukeWrite(t, filepath.Join(root, "sys", "block", "loop0", "loop", "backing_file"), filepath.Join(dir, "vm", "1", "disk-0.cow")+"\n")
+		nukeWrite(t, filepath.Join(root, "sys", "block", "loop1", "loop", "backing_file"), "/srv/other.img\n")
+		nukeWrite(t, filepath.Join(root, "netns", "mm-fc-a1b2c3-1"), "")
+		nukeWrite(t, filepath.Join(root, "netns", "mm-fc-ffffff-1"), "")
+		nukeMkdir(t, filepath.Join(root, "cgroup", "minimega-fc-a1b2c3", "vm1"))
+		nukeMkdir(t, filepath.Join(root, "cgroup", "minimega-fc-ffffff", "vm1"))
+
+		fcStartupClean()
+
+		want := []string{
+			"kill " + fakePID(1),
+			"umount " + filepath.Join(vmRoot, "disk0"),
+			"run dmsetup ls",
+			"run dmsetup remove mm-fc-a1b2c3-1-0",
+			"run losetup -d /dev/loop0",
+			"netns mm-fc-a1b2c3-1",
+		}
+		if got := ops.get(); !reflect.DeepEqual(got, want) {
+			t.Errorf("operations =\n%q\nwant\n%q", got, want)
+		}
+
+		for _, p := range []string{
+			filepath.Join(base, "0"),
+			filepath.Join(base, "1"),
+			filepath.Join(dir, "vm", "0"),
+			filepath.Join(dir, "jail", "firecracker"),
+			filepath.Join(root, "cgroup", "minimega-fc-a1b2c3"),
+		} {
+			if _, err := os.Lstat(p); !os.IsNotExist(err) {
+				t.Errorf("%v exists after the startup cleanup: %v", p, err)
+			}
+		}
+
+		for _, p := range []string{
+			filepath.Join(base, "2", "name"),
+			filepath.Join(base, "3"),
+			filepath.Join(base, "alias"),
+			filepath.Join(base, "minimega.pid"),
+			filepath.Join(base, "files"),
+			filepath.Join(base, "namespaces", "minimega"),
+			filepath.Join(dir, "cache", "abc"),
+			filepath.Join(root, "cgroup", "minimega-fc-ffffff", "vm1"),
+			filepath.Join(root, "proc", fakePID(2)),
+		} {
+			if _, err := os.Lstat(p); err != nil {
+				t.Errorf("%v is missing after the startup cleanup: %v", p, err)
+			}
+		}
+	})
+
+	t.Run("no firecracker directory", func(t *testing.T) {
+		_, _, base, ops := setup(t)
+
+		fcStartupClean()
+
+		if got := ops.get(); len(got) != 0 {
+			t.Errorf("operations = %q, want none", got)
+		}
+		for _, name := range []string{"0", "1", "2", "3", "alias", "minimega.pid", "files", "namespaces"} {
+			if _, err := os.Lstat(filepath.Join(base, name)); err != nil {
+				t.Errorf("%v is missing after the startup cleanup: %v", name, err)
+			}
+		}
+	})
+}
+
+func TestFCNukeBaseLinks(t *testing.T) {
+	base := t.TempDir()
+	vmDir := "/fc/vm"
+
+	for name, target := range map[string]string{
+		"4":  "/fc/vm/4",
+		"5":  "/fc/vm/../vm/5",
+		"6":  "/fc/vmx/6",
+		"7":  "/fc/vm",
+		"x8": "/fc/vm/8",
+	} {
+		if err := os.Symlink(target, filepath.Join(base, name)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	nukeMkdir(t, filepath.Join(base, "9"))
+
+	if n := fcNukeBaseLinks(base, vmDir); n != 2 {
+		t.Errorf("fcNukeBaseLinks() = %v, want 2", n)
+	}
+
+	for name, keep := range map[string]bool{"4": false, "5": false, "6": true, "7": true, "x8": true, "9": true} {
+		_, err := os.Lstat(filepath.Join(base, name))
+		if keep && err != nil {
+			t.Errorf("%v is missing: %v", name, err)
+		} else if !keep && !os.IsNotExist(err) {
+			t.Errorf("%v exists: %v", name, err)
+		}
+	}
+
+	if n := fcNukeBaseLinks(filepath.Join(base, "missing"), vmDir); n != 0 {
+		t.Errorf("fcNukeBaseLinks(missing) = %v, want 0", n)
+	}
+}
+
 func TestFCNukeCgroupsV1(t *testing.T) {
 	root := t.TempDir()
 	parent := "minimega-fc-a1b2c3"
@@ -245,7 +400,9 @@ func TestFCNukeCgroupsV1(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	fcNukeCgroups(root, parent, 1)
+	if n := fcNukeCgroups(root, parent, 1); n != 4 {
+		t.Errorf("fcNukeCgroups() = %v, want 4", n)
+	}
 
 	for _, d := range []string{"cpu,cpuacct", "memory"} {
 		if _, err := os.Lstat(filepath.Join(root, d, parent)); !os.IsNotExist(err) {

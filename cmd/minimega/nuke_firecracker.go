@@ -36,32 +36,98 @@ var (
 // fcNuke removes what the Firecracker VMs of this minimega instance left on
 // the host: the VMM and jailer processes, the mounts in the jails, the
 // device-mapper targets, the loop devices, the netns entries, the cgroups,
-// the jails, and the instance directories. It keeps the image cache.
-func fcNuke() {
+// the jails, and the instance directories. It keeps the image cache. It
+// returns the number of objects that it removed.
+func fcNuke() int {
 	dir := fcResolve(*f_firecrackerDir)
 	jailDir := filepath.Join(dir, "jail")
 	vmDir := filepath.Join(dir, "vm")
 	prefix := "mm-fc-" + fcInstance + "-"
 	parent := fcParentCgroup()
 
+	n := 0
+
 	pids := fcNukeProcs(nukeProcRoot, jailDir, parent)
 	for _, pid := range pids {
 		log.Info("killing firecracker process: %v", pid)
-		if err := nukeKill(pid); err != nil && err != unix.ESRCH {
+		if err := nukeKill(pid); err == nil {
+			n++
+		} else if err != unix.ESRCH {
 			log.Error("kill %v: %v", pid, err)
 		}
 	}
 	fcNukeWait(nukeProcRoot, pids, fcNukeWaitTime)
 
-	fcNukeUnmount(jailDir, vmDir)
-	fcNukeDM(prefix)
-	fcNukeLoops(nukeSysBlock, dir)
-	fcNukeNetns(nukeNetnsDir, prefix)
-	fcNukeCgroups(fcCgroupRoot, parent, hostCgroupVersion)
+	n += fcNukeUnmount(jailDir, vmDir)
+	n += fcNukeDM(prefix)
+	n += fcNukeLoops(nukeSysBlock, dir)
+	n += fcNukeNetns(nukeNetnsDir, prefix)
+	n += fcNukeCgroups(fcCgroupRoot, parent, hostCgroupVersion)
 
 	for _, d := range []string{jailDir, vmDir} {
-		fcNukeDir(d)
+		n += fcNukeDir(d)
 	}
+
+	return n
+}
+
+// fcStartupClean removes the Firecracker state that an earlier minimega
+// process with the same -base and -firecracker-dir left: the objects that
+// fcNuke removes, and the <base>/<ID> links to the instance directories. It
+// keeps the image cache and the other entries of the base directory. It does
+// nothing when the Firecracker directory does not exist.
+func fcStartupClean() {
+	dir := fcResolve(*f_firecrackerDir)
+	if _, err := os.Stat(dir); err != nil {
+		if !os.IsNotExist(err) {
+			log.Warn("unable to remove leftover firecracker state: %v", err)
+		}
+		return
+	}
+
+	n := fcNuke()
+	n += fcNukeBaseLinks(*f_base, filepath.Join(dir, "vm"))
+
+	if n > 0 {
+		log.Info("removed %v firecracker objects that an earlier minimega process left in %v and %v", n, *f_base, dir)
+	} else {
+		log.Debug("no leftover firecracker state in %v and %v", *f_base, dir)
+	}
+}
+
+// fcNukeBaseLinks removes the <ID> entries of base that are links into vmDir.
+// It returns the number of links that it removed.
+func fcNukeBaseLinks(base, vmDir string) int {
+	entries, err := os.ReadDir(base)
+	if err != nil {
+		log.Debug("unable to list %v: %v", base, err)
+		return 0
+	}
+
+	n := 0
+	for _, e := range entries {
+		if e.Type()&os.ModeSymlink == 0 {
+			continue
+		}
+		if _, err := strconv.Atoi(e.Name()); err != nil {
+			continue
+		}
+
+		p := filepath.Join(base, e.Name())
+		target, err := os.Readlink(p)
+		if err != nil || !strings.HasPrefix(filepath.Clean(target), vmDir+"/") {
+			continue
+		}
+
+		log.Info("removing %v: link to %v", p, target)
+		if err := os.Remove(p); err != nil {
+			log.Error("remove %v: %v", p, err)
+			continue
+		}
+		n++
+	}
+
+	return n
 }
 
 // fcNukeProcs returns the PIDs of the Firecracker and jailer processes of
@@ -154,42 +220,53 @@ func fcProcGone(root string, pid int) bool {
 }
 
 // fcNukeUnmount unmounts the mounts below each directory, deepest first. It
-// does not unmount a directory itself.
-func fcNukeUnmount(dirs ...string) {
+// does not unmount a directory itself. It returns the number of unmounts.
+func fcNukeUnmount(dirs ...string) int {
 	data, err := os.ReadFile(fcMountinfoPath)
 	if err != nil {
 		log.Error("read mounts: %v", err)
-		return
+		return 0
 	}
 
+	n := 0
 	for _, d := range dirs {
 		for _, m := range fcMountsUnder(string(data), d) {
 			if m == filepath.Clean(d) {
 				continue
 			}
 
-			if err := nukeUnmount(m); err != nil && err != unix.EINVAL && err != unix.ENOENT {
+			log.Info("unmounting %v", m)
+			if err := nukeUnmount(m); err == nil {
+				n++
+			} else if err != unix.EINVAL && err != unix.ENOENT {
 				log.Error("unmount %v: %v", m, err)
 			}
 		}
 	}
+
+	return n
 }
 
 // fcNukeDM removes the device-mapper targets with names that start with
-// prefix.
-func fcNukeDM(prefix string) {
+// prefix. It returns the number of targets that it removed.
+func fcNukeDM(prefix string) int {
 	out, err := nukeRunCmd("dmsetup", "ls")
 	if err != nil {
 		log.Debug("dmsetup ls: %v: %v", err, strings.TrimSpace(out))
-		return
+		return 0
 	}
 
+	n := 0
 	for _, name := range fcNukeDMNames(out, prefix) {
 		log.Info("removing device-mapper target: %v", name)
 		if out, err := nukeRunCmd("dmsetup", "remove", name); err != nil {
 			log.Error("dmsetup remove %v: %v: %v", name, err, strings.TrimSpace(out))
+			continue
 		}
+		n++
 	}
+
+	return n
 }
 
 // fcNukeDMNames returns the target names in the output of dmsetup ls that start
@@ -206,14 +283,16 @@ func fcNukeDMNames(out, prefix string) []string {
 }
 
 // fcNukeLoops detaches the loop devices with a backing file in dir.
-// sysBlock is the /sys/block directory.
-func fcNukeLoops(sysBlock, dir string) {
+// sysBlock is the /sys/block directory. It returns the number of loop devices
+// that it detached.
+func fcNukeLoops(sysBlock, dir string) int {
 	entries, err := os.ReadDir(sysBlock)
 	if err != nil {
 		log.Debug("unable to list loop devices: %v", err)
-		return
+		return 0
 	}
 
+	n := 0
 	for _, e := range entries {
 		if !strings.HasPrefix(e.Name(), "loop") {
 			continue
@@ -233,8 +312,12 @@ func fcNukeLoops(sysBlock, dir string) {
 		log.Info("detaching loop device %v: %v", dev, f)
 		if out, err := nukeRunCmd("losetup", "-d", dev); err != nil {
 			log.Error("losetup -d %v: %v: %v", dev, err, strings.TrimSpace(out))
+			continue
 		}
+		n++
 	}
+
+	return n
 }
 
 // nukeRemoveNetns detaches the nsfs bind mount of a named network namespace
@@ -251,13 +334,14 @@ var nukeRemoveNetns = func(dir, name string) error {
 }
 
 // fcNukeNetns removes the network namespaces in dir with names that start
-// with prefix.
-func fcNukeNetns(dir, prefix string) {
+// with prefix. It returns the number of namespaces that it removed.
+func fcNukeNetns(dir, prefix string) int {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
-		return
+		return 0
 	}
 
+	n := 0
 	for _, e := range entries {
 		if !strings.HasPrefix(e.Name(), prefix) {
 			continue
@@ -266,24 +350,39 @@ func fcNukeNetns(dir, prefix string) {
 		log.Info("removing netns: %v", e.Name())
 		if err := nukeRemoveNetns(dir, e.Name()); err != nil {
 			log.Error("%v", err)
+			continue
 		}
+		n++
 	}
+
+	return n
 }
 
 // fcNukeCgroups removes the VM cgroups below the parent cgroup and the parent
-// itself. On cgroup v1, each controller hierarchy has a parent.
-func fcNukeCgroups(root, parent string, version int) {
+// itself. On cgroup v1, each controller hierarchy has a parent. It returns the
+// number of cgroups that it removed.
+func fcNukeCgroups(root, parent string, version int) int {
 	var dirs []string
 	if version == 2 {
 		dirs = []string{filepath.Join(root, parent)}
 	} else {
 		entries, err := os.ReadDir(root)
 		if err != nil {
-			return
+			return 0
 		}
 		for _, e := range entries {
 			dirs = append(dirs, filepath.Join(root, e.Name(), parent))
 		}
+	}
+
+	n := 0
+	rmdir := func(d string) {
+		log.Info("removing cgroup %v", d)
+		if err := fcRmdirRetry(d); err != nil {
+			log.Error("remove cgroup %v: %v", d, err)
+			return
+		}
+		n++
 	}
 
 	for _, d := range dirs {
@@ -293,34 +392,31 @@ func fcNukeCgroups(root, parent string, version int) {
 		}
 
 		for _, e := range entries {
-			if !e.IsDir() {
-				continue
-			}
-			if err := fcRmdirRetry(filepath.Join(d, e.Name())); err != nil {
-				log.Error("remove cgroup %v: %v", filepath.Join(d, e.Name()), err)
+			if e.IsDir() {
+				rmdir(filepath.Join(d, e.Name()))
 			}
 		}
-
-		if err := fcRmdirRetry(d); err != nil {
-			log.Error("remove cgroup %v: %v", d, err)
-		}
+		rmdir(d)
 	}
+
+	return n
 }
 
 // fcNukeDir removes the entries of dir. It keeps an entry that has a mount
-// below it.
-func fcNukeDir(dir string) {
+// below it. It returns the number of entries that it removed.
+func fcNukeDir(dir string) int {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
-		return
+		return 0
 	}
 
 	data, err := os.ReadFile(fcMountinfoPath)
 	if err != nil {
 		log.Error("not removing the entries of %v: read mounts: %v", dir, err)
-		return
+		return 0
 	}
 
+	n := 0
 	for _, e := range entries {
 		p := filepath.Join(dir, e.Name())
 		if m := fcMountsUnder(string(data), p); len(m) > 0 {
@@ -331,6 +427,10 @@ func fcNukeDir(dir string) {
 		log.Info("removing %v", p)
 		if err := os.RemoveAll(p); err != nil {
 			log.Error("remove %v: %v", p, err)
+			continue
 		}
+		n++
 	}
+
+	return n
 }

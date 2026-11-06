@@ -293,6 +293,9 @@ func main() {
 	pid := strconv.Itoa(os.Getpid())
 	mustWrite(filepath.Join(*f_base, "minimega.pid"), pid)
 
+	// before the mesh and the command socket accept commands, and before recover
+	fcStartupClean()
+
 	// fan out to the number of cpus on the system if GOMAXPROCS env variable
 	// is not set.
 	if os.Getenv("GOMAXPROCS") == "" {
