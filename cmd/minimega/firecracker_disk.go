@@ -555,6 +555,26 @@ func fcDMSnapshotTable(size int64, base, cow string) string {
 	return fmt.Sprintf("0 %d snapshot %s %s P 8", size/512, base, cow)
 }
 
+// fcDMNodeTimeout is how long fcDMNode waits for a /dev/mapper node.
+const fcDMNodeTimeout = 5 * time.Second
+
+// fcDMNode makes the /dev/mapper node of the device-mapper target name, waits
+// for it, and returns its path. Without udev, for example in a container,
+// dmsetup create can return before the node exists.
+func fcDMNode(name string) (string, error) {
+	p := filepath.Join("/dev/mapper", name)
+
+	if out, err := fcRunCmd("dmsetup", "mknodes", name); err != nil {
+		log.Warn("dmsetup mknodes %v: %v: %v", name, strings.TrimSpace(out), err)
+	}
+
+	if err := fcWaitDev(p, fcDMNodeTimeout); err != nil {
+		return "", fmt.Errorf("dmsetup create %v: %v", name, err)
+	}
+
+	return p, nil
+}
+
 func fcCacheType(cache string) string {
 	if cache == "unsafe" {
 		return "Unsafe"
@@ -844,7 +864,11 @@ func fcSnapshotDisk(d *fcDisk, instanceDir string, index int) error {
 	}
 	d.dmName = name
 
-	d.HostPath = filepath.Join("/dev/mapper", name)
+	p, err := fcDMNode(name)
+	if err != nil {
+		return err
+	}
+	d.HostPath = p
 	d.IsBlock = true
 
 	return nil

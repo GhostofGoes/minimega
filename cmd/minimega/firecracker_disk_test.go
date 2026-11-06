@@ -327,6 +327,72 @@ func TestFCDMSnapshotTable(t *testing.T) {
 	}
 }
 
+func TestFCDMNode(t *testing.T) {
+	for _, tc := range []struct {
+		name               string
+		mknodesErr, waitOK bool
+	}{
+		{"node exists", false, true},
+		{"mknodes fails", true, true},
+		{"node missing", false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cmds := setFCDiskSeams(t, func(args []string) (string, error) {
+				if tc.mknodesErr {
+					return "no control", fmt.Errorf("exit status 1")
+				}
+				return "", nil
+			})
+
+			var waited []string
+			fcWaitDev = func(dev string, timeout time.Duration) error {
+				if timeout != fcDMNodeTimeout {
+					t.Errorf("timeout = %v, want %v", timeout, fcDMNodeTimeout)
+				}
+				waited = append(waited, dev)
+				if !tc.waitOK {
+					return fmt.Errorf("%v did not appear after %v", dev, timeout)
+				}
+				return nil
+			}
+
+			p, err := fcDMNode("mm-fc-a1b2c3-7-0")
+
+			if want := [][]string{fcCmd("dmsetup", "mknodes", "mm-fc-a1b2c3-7-0")}; !reflect.DeepEqual(cmds.get(), want) {
+				t.Errorf("commands = %q, want %q", cmds.get(), want)
+			}
+			if want := []string{"/dev/mapper/mm-fc-a1b2c3-7-0"}; !reflect.DeepEqual(waited, want) {
+				t.Errorf("waited for %q, want %q", waited, want)
+			}
+
+			if tc.waitOK {
+				if err != nil || p != "/dev/mapper/mm-fc-a1b2c3-7-0" {
+					t.Errorf("fcDMNode() = %q, %v", p, err)
+				}
+			} else if err == nil || p != "" || !strings.Contains(err.Error(), "/dev/mapper/mm-fc-a1b2c3-7-0") {
+				t.Errorf("fcDMNode() = %q, %v, want an error that names the node", p, err)
+			}
+		})
+	}
+}
+
+func TestFCWaitDev(t *testing.T) {
+	dev := filepath.Join(t.TempDir(), "mm-fc-a1b2c3-7-0")
+
+	go func() {
+		time.Sleep(100 * time.Millisecond)
+		os.WriteFile(dev, nil, 0600)
+	}()
+	if err := fcWaitDev(dev, 5*time.Second); err != nil {
+		t.Errorf("fcWaitDev() for a node that appears later = %v", err)
+	}
+
+	missing := filepath.Join(t.TempDir(), "missing")
+	if err := fcWaitDev(missing, 100*time.Millisecond); err == nil || !strings.Contains(err.Error(), missing) {
+		t.Errorf("fcWaitDev() for a missing node = %v, want an error that names it", err)
+	}
+}
+
 func TestFCCacheType(t *testing.T) {
 	for in, want := range map[string]string{
 		"":             "Writeback",
@@ -478,6 +544,15 @@ func TestFCPrepareDisk(t *testing.T) {
 		fcCacheFill = fakeFill(&fills)
 		fcDMUsable = func() bool { return true }
 
+		var waited []string
+		fcWaitDev = func(dev string, timeout time.Duration) error {
+			if timeout != fcDMNodeTimeout {
+				t.Errorf("timeout = %v, want %v", timeout, fcDMNodeTimeout)
+			}
+			waited = append(waited, dev)
+			return nil
+		}
+
 		inst1, inst2 := t.TempDir(), t.TempDir()
 		d1, err := fcPrepareDisk(inst1, 0, DiskConfig{Path: src}, true, 7, 200007)
 		if err != nil {
@@ -499,12 +574,17 @@ func TestFCPrepareDisk(t *testing.T) {
 			fcCmd("losetup", "--find", "--show", "--read-only", cached),
 			fcCmd("losetup", "--find", "--show", cow1),
 			fcCmd("dmsetup", "create", "mm-fc-a1b2c3-7-0", "--table", "0 2048 snapshot /dev/loop3 /dev/loop4 P 8"),
+			fcCmd("dmsetup", "mknodes", "mm-fc-a1b2c3-7-0"),
 			infoCmd,
 			fcCmd("losetup", "--find", "--show", cow2),
 			fcCmd("dmsetup", "create", "mm-fc-a1b2c3-8-1", "--table", "0 2048 snapshot /dev/loop3 /dev/loop4 P 8"),
+			fcCmd("dmsetup", "mknodes", "mm-fc-a1b2c3-8-1"),
 		}
 		if !reflect.DeepEqual(cmds.get(), want) {
 			t.Errorf("commands =\n%q\nwant\n%q", cmds.get(), want)
+		}
+		if want := []string{"/dev/mapper/mm-fc-a1b2c3-7-0", "/dev/mapper/mm-fc-a1b2c3-8-1"}; !reflect.DeepEqual(waited, want) {
+			t.Errorf("waited for %q, want %q", waited, want)
 		}
 
 		if d1.HostPath != "/dev/mapper/mm-fc-a1b2c3-7-0" || !d1.IsBlock || d1.CacheType != "Writeback" {
@@ -540,6 +620,38 @@ func TestFCPrepareDisk(t *testing.T) {
 		}
 		if got := fcCache.inUse(key); got != 0 {
 			t.Errorf("inUse() after release = %v, want 0", got)
+		}
+	})
+
+	t.Run("device-mapper node missing", func(t *testing.T) {
+		src := fcWriteFile(t, filepath.Join(t.TempDir(), "a.raw"), []byte("raw"))
+		cmds := setFCDiskSeams(t, nil)
+		fcRunCmd = func(args ...string) (string, error) {
+			cmds.add(args)
+			return fcDiskReply(info(t, src, "raw"))(args)
+		}
+
+		var fills int32
+		fcCacheFill = fakeFill(&fills)
+		fcDMUsable = func() bool { return true }
+		fcWaitDev = func(dev string, timeout time.Duration) error {
+			return fmt.Errorf("%v did not appear after %v", dev, timeout)
+		}
+
+		_, err := fcPrepareDisk(t.TempDir(), 0, DiskConfig{Path: src}, true, 7, 200007)
+		if err == nil || !strings.Contains(err.Error(), "/dev/mapper/mm-fc-a1b2c3-7-0") {
+			t.Fatalf("error = %v, want one that names /dev/mapper/mm-fc-a1b2c3-7-0", err)
+		}
+
+		calls := cmds.get()
+		want := [][]string{
+			fcCmd("dmsetup", "mknodes", "mm-fc-a1b2c3-7-0"),
+			fcCmd("dmsetup", "remove", "mm-fc-a1b2c3-7-0"),
+			fcCmd("losetup", "-d", "/dev/loop4"),
+			fcCmd("losetup", "-d", "/dev/loop3"),
+		}
+		if len(calls) < len(want) || !reflect.DeepEqual(calls[len(calls)-len(want):], want) {
+			t.Errorf("commands = %q, want cleanup %q", calls, want)
 		}
 	})
 
