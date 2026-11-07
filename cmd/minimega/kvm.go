@@ -901,6 +901,8 @@ func (vm *KvmVM) addTap(name, bridge, mac string, vlan int, qinq bool) (string, 
 		return tap, err
 	}
 
+	br.SetTapOwner(tap, vm.Namespace, vm.Name)
+
 	if qinq {
 		if err := br.SetTapQinQ(tap, vlan); err != nil {
 			return tap, err
