@@ -7,6 +7,7 @@ package ron
 import (
 	"encoding/gob"
 	"net"
+	"strings"
 	"testing"
 )
 
@@ -21,14 +22,35 @@ func TestBindClientUUIDUsesSerialIdentity(t *testing.T) {
 	}
 }
 
-func TestBindClientUUIDPreservesGuestIdentity(t *testing.T) {
+func TestBindClientUUIDPreservesUnboundGuestIdentity(t *testing.T) {
 	want := "a5ba6920-5bcf-4022-b8cf-015425f7b05c"
 	m := &Message{Client: &Client{UUID: want}}
-	if err := bindClientUUID(m, "different-host-identity"); err != nil {
+	if err := bindClientUUID(m, ""); err != nil {
 		t.Fatal(err)
 	}
 	if m.Client.UUID != want {
 		t.Fatalf("guest identity changed: %q", m.Client.UUID)
+	}
+}
+
+func TestBindClientUUIDRejectsOtherIdentity(t *testing.T) {
+	m := &Message{Client: &Client{UUID: "a5ba6920-5bcf-4022-b8cf-015425f7b05c"}}
+	if err := bindClientUUID(m, "3b440429-067f-5b75-a0c3-f436519f8ccb"); err == nil {
+		t.Fatal("expected a UUID mismatch error")
+	}
+}
+
+func TestBindClientUUIDAcceptsBoundIdentity(t *testing.T) {
+	want := "3b440429-067f-5b75-a0c3-f436519f8ccb"
+	for _, claimed := range []string{
+		want,
+		strings.ToUpper(want),
+		"2904443b-7f06-755b-a0c3-f436519f8ccb", // mangled form
+	} {
+		m := &Message{Client: &Client{UUID: claimed}}
+		if err := bindClientUUID(m, want); err != nil {
+			t.Fatalf("%v: %v", claimed, err)
+		}
 	}
 }
 
