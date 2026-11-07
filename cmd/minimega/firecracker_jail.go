@@ -63,7 +63,7 @@ type fcJail struct {
 // fcBin.
 func newFCJail(vmID int, fcBin string) fcJail {
 	j := fcJail{
-		Base:     filepath.Join(fcResolve(*f_firecrackerDir), "jail"),
+		Base:     fcJailBase(),
 		ExecName: filepath.Base(fcResolve(fcBin)),
 		ID:       fmt.Sprintf("vm%d", vmID),
 		UID:      fcVMUID(vmID),
@@ -73,6 +73,11 @@ func newFCJail(vmID int, fcBin string) fcJail {
 	j.Root = filepath.Join(j.Dir(), "root")
 
 	return j
+}
+
+// fcJailBase returns the jailer --chroot-base-dir.
+func fcJailBase() string {
+	return filepath.Join(fcResolve(*f_firecrackerDir), "jail")
 }
 
 // fcVMUID returns the uid of the VMM of VM vmID. It is also the gid of a VMM

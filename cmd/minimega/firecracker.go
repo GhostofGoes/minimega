@@ -52,11 +52,9 @@ var (
 	fcCloseNetns     = (*bridge.Netns).Close
 	fcCreateTap      = fcCreateTapDefault
 	fcDestroyTap     = fcDestroyTapDefault
-	fcJailerCommand  = func(bin string, args []string) *exec.Cmd {
-		return exec.Command(bin, args...)
-	}
-	fcStartVMMFn = (*FirecrackerVM).startVMM
-	fcProcDir    = "/proc"
+	fcJailerCommand  = fcJailerShimCommand
+	fcStartVMMFn     = (*FirecrackerVM).startVMM
+	fcProcDir        = "/proc"
 )
 
 // fcCCServer is the part of the ron server that Firecracker VMs use. Tests

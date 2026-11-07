@@ -126,6 +126,11 @@ func main() {
 	flag.Usage = usage
 	flag.Parse()
 
+	// see fcJailerShim()
+	if fcJailerShimRequested(flag.Args()) {
+		fcJailerShim(flag.Arg(1), flag.Arg(2), flag.Args()[3:])
+	}
+
 	// generates a tab-completion script from the flags registered above,
 	// so this needs to happen after flag.Parse() but doesn't depend on
 	// anything else minimega sets up
