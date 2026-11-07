@@ -52,8 +52,9 @@ docker run -d \
 ```
 
 The container runs the `start-minimega.sh` script as PID 1, which takes care of
-starting openvswitch, miniweb, and finally minimega. On container stop, it
-forwards the shutdown signal to minimega and removes stale PID/socket state.
+starting openvswitch, miniweb (unless `MINIWEB_ENABLED=false`), and finally
+minimega. On container stop, it forwards the shutdown signal to minimega and
+removes stale PID/socket state.
 This means the minimega logs will be available in the container logs via Docker
 (`docker logs minimega`).
 
@@ -316,7 +317,11 @@ The defaults set for miniweb are:
 MINIWEB_ROOT=/opt/minimega/web
 MINIWEB_HOST=0.0.0.0
 MINIWEB_PORT=9001
+MINIWEB_ENABLED=true
 ```
+
+Set `MINIWEB_ENABLED=false` to not start miniweb. With a value other than
+`true` or `false`, the script stops before it starts any service.
 
 The default miniweb root contains the bundled documentation under `docs/`.
 When `MINIWEB_ROOT` points elsewhere, the documentation remains available
