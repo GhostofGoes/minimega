@@ -307,7 +307,7 @@ func (vms *VMs) Launch(requestor, namespace string, q *QueuedVMs) <-chan error {
 
 		// prefetch any files associated with VMs
 		if err := q.GetFiles(requestor); err != nil {
-			errs <- err
+			errs <- launchBatchError{err}
 			return
 		}
 
@@ -777,12 +777,39 @@ func meshageVMLaunchResponse(cmd meshageVMLaunch) meshageVMResponse {
 		return meshageVMResponse{Errors: []string{err.Error()}, TID: cmd.TID}
 	}
 
+	launchErrs := ns.Launch(cmd.From, cmd.QueuedVMs)
+
 	errs := []string{}
-	for _, err := range ns.Launch(cmd.From, cmd.QueuedVMs) {
+	for _, err := range launchErrs {
 		errs = append(errs, err.Error())
 	}
 
-	return meshageVMResponse{Errors: errs, TID: cmd.TID}
+	return meshageVMResponse{
+		Errors:   errs,
+		Launched: launchedCount(len(cmd.QueuedVMs.Names), launchErrs),
+		TID:      cmd.TID,
+	}
+}
+
+// launchBatchError is an error that stops the launch of all the VMs of a
+// queued entry.
+type launchBatchError struct {
+	err error
+}
+
+func (e launchBatchError) Error() string { return e.err.Error() }
+func (e launchBatchError) Unwrap() error { return e.err }
+
+// launchedCount returns the number of VMs of a queued entry with total VMs that
+// launched, from the errors of the launch.
+func launchedCount(total int, errs []error) int {
+	for _, err := range errs {
+		if errors.As(err, new(launchBatchError)) {
+			return 0
+		}
+	}
+
+	return max(total-len(errs), 0)
 }
 
 // globalVMs gets the VMs from all hosts in the mesh, filtered to the current
