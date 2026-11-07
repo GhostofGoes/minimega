@@ -292,6 +292,8 @@ func (vm *AndroidVM) conflictsNoLock(vm2 VM) error {
 		return vm.BaseVM.conflicts(vm2.BaseVM)
 	case *ContainerVM:
 		return vm.BaseVM.conflicts(vm2.BaseVM)
+	case *FirecrackerVM:
+		return vm.BaseVM.conflicts(vm2.BaseVM)
 	}
 
 	return errors.New("unknown VM type")
