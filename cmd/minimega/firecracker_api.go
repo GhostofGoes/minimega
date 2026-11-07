@@ -345,9 +345,24 @@ func (c *fcClient) GetVersion() (string, error) {
 	return v.FirecrackerVersion, err
 }
 
+// The probes of the API socket start fcSocketPollMin apart, and the interval
+// doubles up to fcSocketPollMax.
+const (
+	fcSocketPollMin = time.Millisecond
+	fcSocketPollMax = 10 * time.Millisecond
+)
+
+// fcSocketBackoff returns the interval after the interval d.
+func fcSocketBackoff(d time.Duration) time.Duration {
+	if d *= 2; d > fcSocketPollMax {
+		d = fcSocketPollMax
+	}
+	return d
+}
+
 // WaitForSocket polls until the API socket answers GET / or ctx ends.
 func (c *fcClient) WaitForSocket(ctx context.Context) error {
-	backoff := 20 * time.Millisecond
+	backoff := fcSocketPollMin
 
 	for {
 		attempt, cancel := context.WithTimeout(ctx, c.timeout)
@@ -367,8 +382,6 @@ func (c *fcClient) WaitForSocket(ctx context.Context) error {
 		case <-t.C:
 		}
 
-		if backoff *= 2; backoff > 200*time.Millisecond {
-			backoff = 200 * time.Millisecond
-		}
+		backoff = fcSocketBackoff(backoff)
 	}
 }

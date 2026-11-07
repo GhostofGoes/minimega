@@ -89,14 +89,38 @@ const (
 	fcDiskConvert
 )
 
-// fcDiskChain returns the backing chain of src, src first.
+// fcDiskChain returns the backing chain of src, src first. It runs qemu-img
+// again only when src or an image in its chain changes.
 func fcDiskChain(src string) ([]fcImage, error) {
+	if chain, ok := fcCache.chains.get(src); ok {
+		return append([]fcImage(nil), chain...), nil
+	}
+
+	before, statErr := fcStatSource(src)
+
 	out, err := fcRunCmd("qemu-img", "info", "--output=json", "--backing-chain", src)
 	if err != nil {
 		return nil, fmt.Errorf("qemu-img info %v: %v: %v", src, strings.TrimSpace(out), err)
 	}
 
-	return fcParseChain(src, out)
+	chain, err := fcParseChain(src, out)
+	if err != nil {
+		return nil, err
+	}
+
+	if statErr == nil {
+		var deps []string
+		for _, img := range chain[1:] {
+			p := img.Filename
+			if !filepath.IsAbs(p) {
+				p = filepath.Join(filepath.Dir(src), p)
+			}
+			deps = append(deps, p)
+		}
+		fcCache.chains.put(src, before, append([]fcImage(nil), chain...), deps...)
+	}
+
+	return chain, nil
 }
 
 func fcParseChain(src, out string) ([]fcImage, error) {
@@ -157,6 +181,75 @@ func fcStatSource(src string) (fcSourceID, error) {
 	return id, nil
 }
 
+// fcStatCacheMax is the maximum number of entries in a statCache.
+const fcStatCacheMax = 1024
+
+// statCache keeps one value for each path. A value is valid while the path
+// and each file that the value depends on keep the same fcSourceID.
+type statCache[V any] struct {
+	mu sync.Mutex
+	m  map[string]statCacheEntry[V]
+}
+
+type statCacheEntry[V any] struct {
+	files []string
+	ids   []fcSourceID
+	v     V
+}
+
+func newStatCache[V any]() *statCache[V] {
+	return &statCache[V]{m: map[string]statCacheEntry[V]{}}
+}
+
+// get returns the value of path when no file that it depends on changed.
+func (c *statCache[V]) get(path string) (V, bool) {
+	c.mu.Lock()
+	e, ok := c.m[path]
+	c.mu.Unlock()
+
+	var zero V
+	if !ok {
+		return zero, false
+	}
+
+	for i, f := range e.files {
+		if id, err := fcStatSource(f); err != nil || id != e.ids[i] {
+			return zero, false
+		}
+	}
+
+	return e.v, true
+}
+
+// put keeps v for path. v also depends on deps. before is the fcSourceID of
+// path from before v was made. put keeps nothing when path changed since then,
+// or when it cannot read a file.
+func (c *statCache[V]) put(path string, before fcSourceID, v V, deps ...string) {
+	files := append([]string{path}, deps...)
+	ids := make([]fcSourceID, len(files))
+	for i, f := range files {
+		id, err := fcStatSource(f)
+		if err != nil {
+			return
+		}
+		ids[i] = id
+	}
+	if ids[0] != before {
+		return
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if _, ok := c.m[path]; !ok && len(c.m) >= fcStatCacheMax {
+		for k := range c.m {
+			delete(c.m, k)
+			break
+		}
+	}
+	c.m[path] = statCacheEntry[V]{files: files, ids: ids, v: v}
+}
+
 func fcCacheKey(id fcSourceID) string {
 	sum := sha256.Sum256([]byte(fmt.Sprintf("%s\x00%d\x00%d\x00%d", id.Path, id.Size, id.Mtime, id.Inode)))
 	return hex.EncodeToString(sum[:])[:16]
@@ -193,6 +286,9 @@ type fcCacheState struct {
 	inflight map[string]*fcInflight
 	users    map[string]map[int]int
 	bases    map[string]*fcBaseLoop
+
+	// chains keeps the backing chain of each source image.
+	chains *statCache[[]fcImage]
 }
 
 func newFCCacheState() *fcCacheState {
@@ -200,6 +296,7 @@ func newFCCacheState() *fcCacheState {
 		inflight: map[string]*fcInflight{},
 		users:    map[string]map[int]int{},
 		bases:    map[string]*fcBaseLoop{},
+		chains:   newStatCache[[]fcImage](),
 	}
 }
 

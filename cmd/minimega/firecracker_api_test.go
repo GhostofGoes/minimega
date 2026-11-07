@@ -374,6 +374,19 @@ func TestFirecrackerAPIWaitForSocket(t *testing.T) {
 	}
 }
 
+func TestFCSocketBackoff(t *testing.T) {
+	var got []time.Duration
+	for d := fcSocketPollMin; len(got) < 7; d = fcSocketBackoff(d) {
+		got = append(got, d)
+	}
+
+	ms := time.Millisecond
+	want := []time.Duration{ms, 2 * ms, 4 * ms, 8 * ms, 10 * ms, 10 * ms, 10 * ms}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("intervals = %v, want %v", got, want)
+	}
+}
+
 func TestFirecrackerAPIWaitForSocketTimeout(t *testing.T) {
 	c := newFCClient(filepath.Join(t.TempDir(), "api.sock"))
 

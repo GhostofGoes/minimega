@@ -263,6 +263,98 @@ func TestFCCacheFillError(t *testing.T) {
 	}
 }
 
+func TestFCDiskChainCache(t *testing.T) {
+	dir := t.TempDir()
+	overlay := fcWriteFile(t, filepath.Join(dir, "ov.qcow2"), []byte("overlay"))
+	base := fcWriteFile(t, filepath.Join(dir, "base.raw"), []byte("base"))
+	missing := filepath.Join(dir, "missing.qcow2")
+
+	info := fcImageJSON(t,
+		fcImage{Filename: overlay, Format: "qcow2", BackingFilename: "base.raw"},
+		fcImage{Filename: "base.raw", Format: "raw"},
+	)
+	cmds := setFCDiskSeams(t, func(args []string) (string, error) {
+		return info, nil
+	})
+
+	chain := func(src string, wantCmds int) {
+		t.Helper()
+		c, err := fcDiskChain(src)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(c) != 2 || c[0].Format != "qcow2" || c[1].Format != "raw" {
+			t.Errorf("fcDiskChain(%v) = %+v", src, c)
+		}
+		c[0].Format = "changed"
+		if n := len(cmds.get()); n != wantCmds {
+			t.Errorf("qemu-img commands = %d, want %d", n, wantCmds)
+		}
+	}
+
+	chain(overlay, 1)
+	chain(overlay, 1)
+
+	// A change to a backing file or to the source runs qemu-img again.
+	fcWriteFile(t, base, []byte("new base"))
+	chain(overlay, 2)
+	chain(overlay, 2)
+	fcWriteFile(t, overlay, []byte("new overlay"))
+	chain(overlay, 3)
+
+	// A file that cannot be read is not kept.
+	chain(missing, 4)
+	chain(missing, 5)
+}
+
+func TestStatCache(t *testing.T) {
+	dir := t.TempDir()
+	a := fcWriteFile(t, filepath.Join(dir, "a"), []byte("a"))
+
+	c := newStatCache[int]()
+	before, err := fcStatSource(a)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	fcWriteFile(t, a, []byte("changed"))
+	c.put(a, before, 1)
+	if _, ok := c.get(a); ok {
+		t.Error("get() found a value that put made from an old version of the file")
+	}
+
+	before, _ = fcStatSource(a)
+	c.put(a, before, 2)
+	if v, ok := c.get(a); !ok || v != 2 {
+		t.Errorf("get() = %v, %v, want 2, true", v, ok)
+	}
+
+	// A path that becomes a link to another file is a new version.
+	b := fcWriteFile(t, filepath.Join(dir, "b"), []byte("changed"))
+	if err := os.Remove(a); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(b, a); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := c.get(a); ok {
+		t.Error("get() found a value after the path changed to a link")
+	}
+
+	c = newStatCache[int]()
+	for i := 0; i < fcStatCacheMax+10; i++ {
+		p := fcWriteFile(t, filepath.Join(dir, "many", fmt.Sprint(i)), nil)
+		id, err := fcStatSource(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		c.put(p, id, i)
+	}
+	if n := len(c.m); n != fcStatCacheMax {
+		t.Errorf("cache has %d entries, want %d", n, fcStatCacheMax)
+	}
+}
+
 func TestFCPlanDisk(t *testing.T) {
 	raw := fcImage{Filename: "/img/base.raw", Format: "raw", VirtualSize: 1 << 20}
 	plain := fcImage{Filename: "/img/base.qcow2", Format: "qcow2", VirtualSize: 1 << 20}
@@ -575,7 +667,6 @@ func TestFCPrepareDisk(t *testing.T) {
 			fcCmd("losetup", "--find", "--show", cow1),
 			fcCmd("dmsetup", "create", "mm-fc-a1b2c3-7-0", "--table", "0 2048 snapshot /dev/loop3 /dev/loop4 P 8"),
 			fcCmd("dmsetup", "mknodes", "mm-fc-a1b2c3-7-0"),
-			infoCmd,
 			fcCmd("losetup", "--find", "--show", cow2),
 			fcCmd("dmsetup", "create", "mm-fc-a1b2c3-8-1", "--table", "0 2048 snapshot /dev/loop3 /dev/loop4 P 8"),
 			fcCmd("dmsetup", "mknodes", "mm-fc-a1b2c3-8-1"),
@@ -903,7 +994,7 @@ func TestFCPrepareDiskReadOnly(t *testing.T) {
 			cached := filepath.Join(fcCacheDir(), key+".raw")
 			infoCmd := fcCmd("qemu-img", "info", "--output=json", "--backing-chain", fcResolve(src))
 
-			if want := [][]string{infoCmd, infoCmd}; !reflect.DeepEqual(cmds.get(), want) {
+			if want := [][]string{infoCmd}; !reflect.DeepEqual(cmds.get(), want) {
 				t.Errorf("commands =\n%q\nwant\n%q", cmds.get(), want)
 			}
 			for i, d := range []fcDisk{d1, d2} {
