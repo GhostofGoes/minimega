@@ -51,8 +51,14 @@ func heartbeat() {
 
 	log.Debug("sending heartbeat")
 
+	uuid := client.UUID
+	if !client.acked {
+		// do not claim a UUID adopted on an earlier connection
+		uuid = client.claim
+	}
+
 	c := &ron.Client{
-		UUID:          client.UUID,
+		UUID:          uuid,
 		Arch:          client.Arch,
 		OS:            client.OS,
 		Hostname:      client.Hostname,
