@@ -87,10 +87,12 @@ The directory must obey these rules:
 |---|---|---|
 | `-firecracker-dir` | `/var/lib/minimega/firecracker` | The directory for the jails, the instance directories, and the image cache. |
 | `-firecracker-uid-base` | `2000000000` | The first uid and gid of the VMMs. Each VMM runs as the base plus its VM ID. The VMMs that restore one snapshot share a gid below the base. |
-| `-firecracker-launch-parallel` | `0` | The maximum number of VMs that prepare at the same time, and the maximum number of VMs that `vm start` boots at the same time. `0` is the number of CPUs. |
+| `-firecracker-launch-parallel` | `0` | The maximum number of VMs that prepare at the same time. `0` is the number of CPUs. |
+| `-firecracker-start-parallel` | `0` | The maximum number of VMs that `vm start` boots at the same time. `0` is the number of CPUs. |
 
-The environment variables `MM_FIRECRACKER_DIR`, `MM_FIRECRACKER_UID_BASE`, and
-`MM_FIRECRACKER_LAUNCH_PARALLEL` set the same values.
+The environment variables `MM_FIRECRACKER_DIR`, `MM_FIRECRACKER_UID_BASE`,
+`MM_FIRECRACKER_LAUNCH_PARALLEL`, and `MM_FIRECRACKER_START_PARALLEL` set the
+same values.
 
 At startup, minimega logs a warning when `/etc/passwd` or `/etc/group` has an
 ID from the uid base to the uid base plus 65535.
@@ -742,8 +744,11 @@ launch counts until it completes the vmm stage. A launch skips a stage that has
 no work. For example, a relaunch from the quit state skips the disk and network
 stages.
 
-`vm start` sends the boot request (`InstanceStart`) of at most `P` VMs at the
-same time. The other VMs wait for a place. The timeout of each request is 60
+`vm start` sends the boot request (`InstanceStart`) of at most `S` VMs at the
+same time. `S` is the value of `-firecracker-start-parallel`, or the number of
+CPUs when the value is 0. The guests that boot use the host CPUs, so a value
+of `S` that is much larger than the number of CPUs makes each request slower,
+but does not boot the VMs faster. The other VMs wait for a place. The timeout of each request is 60
 seconds, and it starts when the request gets a place. The guests that boot at
 the same time use the host CPUs, so a request can take longer than other API
 requests.

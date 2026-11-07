@@ -106,6 +106,16 @@ func fcLaunchParallel() int {
 	return runtime.NumCPU()
 }
 
+// fcStartParallel returns -firecracker-start-parallel, or the number of CPUs
+// when it is 0.
+func fcStartParallel() int {
+	if n := *f_firecrackerStartParallel; n > 0 {
+		return n
+	}
+
+	return runtime.NumCPU()
+}
+
 // fcStageTime is the time that a launch waited for a stage and the time that
 // it ran in the stage.
 type fcStageTime struct {

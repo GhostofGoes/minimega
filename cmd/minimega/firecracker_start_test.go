@@ -20,14 +20,17 @@ import (
 // longer in total than the API timeout, but each request is shorter, so all
 // of them must succeed.
 func TestFCInstanceStartLimit(t *testing.T) {
-	oldParallel, oldTimeout := *f_firecrackerLaunchParallel, fcStartTimeout
+	oldParallel, oldLaunch, oldTimeout := *f_firecrackerStartParallel, *f_firecrackerLaunchParallel, fcStartTimeout
 	t.Cleanup(func() {
-		*f_firecrackerLaunchParallel = oldParallel
+		*f_firecrackerStartParallel = oldParallel
+		*f_firecrackerLaunchParallel = oldLaunch
 		fcStartTimeout = oldTimeout
-		fcStartSem = fcSemaphore{}
+		fcStartSem = fcSemaphore{size: fcStartParallel}
 	})
-	*f_firecrackerLaunchParallel = 2
-	fcStartSem = fcSemaphore{}
+	*f_firecrackerStartParallel = 2
+	// the launch limit does not apply to starts
+	*f_firecrackerLaunchParallel = 5
+	fcStartSem = fcSemaphore{size: fcStartParallel}
 
 	const (
 		starts  = 10
@@ -99,9 +102,9 @@ func TestFCInstanceStartTimeout(t *testing.T) {
 	oldTimeout := fcStartTimeout
 	t.Cleanup(func() {
 		fcStartTimeout = oldTimeout
-		fcStartSem = fcSemaphore{}
+		fcStartSem = fcSemaphore{size: fcStartParallel}
 	})
-	fcStartSem = fcSemaphore{}
+	fcStartSem = fcSemaphore{size: fcStartParallel}
 
 	const work = 300 * time.Millisecond
 

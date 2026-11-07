@@ -316,4 +316,5 @@ func registerEnvironmentFlags(fs *flag.FlagSet) {
 	fs.String("firecracker-dir", "", "")
 	fs.Uint("firecracker-uid-base", 2000000000, "")
 	fs.Int("firecracker-launch-parallel", 0, "")
+	fs.Int("firecracker-start-parallel", 0, "")
 }

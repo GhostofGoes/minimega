@@ -61,7 +61,8 @@ var (
 
 	f_firecrackerDir            = flag.String("firecracker-dir", "/var/lib/minimega/firecracker", "directory for Firecracker jails, instance directories, and the image cache; must be one filesystem")
 	f_firecrackerUIDBase        = flag.Uint("firecracker-uid-base", 2000000000, "first uid and gid for jailed Firecracker VMMs; each VM uses the base plus its VM ID, and the restores of one snapshot share a gid below the base")
-	f_firecrackerLaunchParallel = flag.Int("firecracker-launch-parallel", 0, "maximum Firecracker VMs that prepare, or that boot, at the same time; 0 means the number of CPUs")
+	f_firecrackerLaunchParallel = flag.Int("firecracker-launch-parallel", 0, "maximum Firecracker VMs that prepare at the same time; 0 means the number of CPUs")
+	f_firecrackerStartParallel  = flag.Int("firecracker-start-parallel", 0, "maximum Firecracker VMs that boot at the same time; 0 means the number of CPUs")
 
 	f_e         = flag.Bool("e", false, "execute command on running minimega")
 	f_attach    = flag.Bool("attach", false, "attach the minimega command line to a running instance of minimega")

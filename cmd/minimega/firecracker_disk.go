@@ -56,11 +56,16 @@ var (
 type fcSemaphore struct {
 	once sync.Once
 	ch   chan struct{}
+	size func() int // the limit; nil means fcLaunchParallel
 }
 
 func (s *fcSemaphore) Acquire() {
 	s.once.Do(func() {
-		s.ch = make(chan struct{}, fcLaunchParallel())
+		size := fcLaunchParallel
+		if s.size != nil {
+			size = s.size
+		}
+		s.ch = make(chan struct{}, size())
 	})
 	s.ch <- struct{}{}
 }

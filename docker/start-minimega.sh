@@ -46,6 +46,7 @@ fi
 : "${MM_FIRECRACKER_DIR:=/var/lib/minimega/firecracker}"
 : "${MM_FIRECRACKER_UID_BASE:=2000000000}"
 : "${MM_FIRECRACKER_LAUNCH_PARALLEL:=0}"
+: "${MM_FIRECRACKER_START_PARALLEL:=0}"
 : "${MM_APPEND:=}"
 : "${MM_OOM_SCORE_ADJ:=}"
 
@@ -250,6 +251,7 @@ fi
   -firecracker-dir=${MM_FIRECRACKER_DIR} \
   -firecracker-uid-base=${MM_FIRECRACKER_UID_BASE} \
   -firecracker-launch-parallel=${MM_FIRECRACKER_LAUNCH_PARALLEL} \
+  -firecracker-start-parallel=${MM_FIRECRACKER_START_PARALLEL} \
   ${MM_APPEND} &
 MINIMEGA_PID=$!
 echo "[$(date --rfc-3339=seconds)] minimega started with PID ${MINIMEGA_PID}" | tee -a ${MM_LOGFILE}

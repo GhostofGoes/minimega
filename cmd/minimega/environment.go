@@ -41,6 +41,7 @@ var environmentFlags = []environmentFlag{
 	{"MM_FIRECRACKER_DIR", "firecracker-dir"},
 	{"MM_FIRECRACKER_UID_BASE", "firecracker-uid-base"},
 	{"MM_FIRECRACKER_LAUNCH_PARALLEL", "firecracker-launch-parallel"},
+	{"MM_FIRECRACKER_START_PARALLEL", "firecracker-start-parallel"},
 }
 
 func setEnvironmentFlagDefault(fs *flag.FlagSet, mapping environmentFlag, value string) error {
