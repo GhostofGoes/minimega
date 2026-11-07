@@ -387,7 +387,9 @@ func cliCaptureVM(ns *Namespace, c *minicli.Command, resp *minicli.Response) err
 func wrapClearCapture(fn minicli.CLIFunc) minicli.CLIFunc {
 	return func(c *minicli.Command, respChan chan<- minicli.Responses) {
 		if c.Source == "" && !c.BoolArgs["netflow"] {
-			nsCaptureStopHead(resolveNamespace(c).Name, Wildcard, nsCaptureStopWait)
+			if ns, err := resolveNamespace(c); err == nil {
+				nsCaptureStopHead(ns.Name, Wildcard, nsCaptureStopWait)
+			}
 		}
 
 		fn(c, respChan)

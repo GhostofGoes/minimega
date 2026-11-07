@@ -81,6 +81,7 @@ func (s *fakeSource) isClosed() bool {
 func testBridge() *Bridge {
 	return &Bridge{
 		Name:         "test_bridge",
+		reaper:       systemReaper{},
 		taps:         map[string]*Tap{"tap0": {Name: "tap0", Bridge: "test_bridge"}},
 		trunks:       map[string]bool{},
 		tunnels:      map[string]bool{},
@@ -463,8 +464,13 @@ func useFakeCommands(t *testing.T) *fakeCommands {
 	t.Helper()
 
 	f := &fakeCommands{}
-	oldOVS, oldProc := ovsExec, processExec
-	t.Cleanup(func() { ovsExec, processExec = oldOVS, oldProc })
+	oldOVS, oldProc, oldUp := ovsExec, processExec, upCaptureTap
+	t.Cleanup(func() { ovsExec, processExec, upCaptureTap = oldOVS, oldProc, oldUp })
+
+	upCaptureTap = func(tap string) error {
+		f.add("ip link set " + tap + " up promisc on")
+		return nil
+	}
 
 	ovsExec = func(args []string) (string, error) {
 		f.add("ovs-vsctl " + strings.Join(args, " "))
