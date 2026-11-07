@@ -5,6 +5,8 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -18,9 +20,10 @@ import (
 // longer in total than the API timeout, but each request is shorter, so all
 // of them must succeed.
 func TestFCInstanceStartLimit(t *testing.T) {
-	oldParallel := *f_firecrackerLaunchParallel
+	oldParallel, oldTimeout := *f_firecrackerLaunchParallel, fcStartTimeout
 	t.Cleanup(func() {
 		*f_firecrackerLaunchParallel = oldParallel
+		fcStartTimeout = oldTimeout
 		fcStartSem = fcSemaphore{}
 	})
 	*f_firecrackerLaunchParallel = 2
@@ -67,13 +70,13 @@ func TestFCInstanceStartLimit(t *testing.T) {
 	srv.Start()
 	t.Cleanup(srv.Close)
 
+	fcStartTimeout = timeout
+
 	errs := make(chan error, starts)
 	begin := time.Now()
 	for range starts {
 		go func() {
-			c := newFCClient(sock)
-			c.timeout = timeout
-			errs <- fcInstanceStart(c)
+			errs <- fcInstanceStart(newFCClient(sock))
 		}()
 	}
 	for range starts {
@@ -87,5 +90,51 @@ func TestFCInstanceStartLimit(t *testing.T) {
 	}
 	if d := time.Since(begin); d <= timeout {
 		t.Errorf("the starts took %v; the test needs more than the timeout %v", d, timeout)
+	}
+}
+
+// TestFCInstanceStartTimeout checks that InstanceStart has its own timeout,
+// and not the timeout of the other API requests.
+func TestFCInstanceStartTimeout(t *testing.T) {
+	oldTimeout := fcStartTimeout
+	t.Cleanup(func() {
+		fcStartTimeout = oldTimeout
+		fcStartSem = fcSemaphore{}
+	})
+	fcStartSem = fcSemaphore{}
+
+	const work = 300 * time.Millisecond
+
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-time.After(work):
+		case <-r.Context().Done():
+		}
+		w.WriteHeader(http.StatusNoContent)
+	})
+
+	dir, err := os.MkdirTemp("", "fcs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dir) })
+
+	sock := filepath.Join(dir, "api.sock")
+	srv := httptest.NewUnstartedServer(handler)
+	srv.Listener = fcListen(t, sock)
+	srv.Start()
+	t.Cleanup(srv.Close)
+
+	c := newFCClient(sock)
+	c.timeout = work / 3
+
+	fcStartTimeout = 3 * work
+	if err := fcInstanceStart(c); err != nil {
+		t.Errorf("start longer than the API timeout = %v, want no error", err)
+	}
+
+	fcStartTimeout = work / 3
+	if err := fcInstanceStart(c); !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("start longer than the start timeout = %v, want deadline exceeded", err)
 	}
 }

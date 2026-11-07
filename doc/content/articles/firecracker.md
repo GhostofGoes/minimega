@@ -743,8 +743,10 @@ no work. For example, a relaunch from the quit state skips the disk and network
 stages.
 
 `vm start` sends the boot request (`InstanceStart`) of at most `P` VMs at the
-same time. The other VMs wait for a place. The API timeout of each request
-starts when the request gets a place.
+same time. The other VMs wait for a place. The timeout of each request is 60
+seconds, and it starts when the request gets a place. The guests that boot at
+the same time use the host CPUs, so a request can take longer than other API
+requests.
 
 - minimega creates the links, the taps, and the tc filters through netlink. It
   does not run `ip` or `tc` for them.

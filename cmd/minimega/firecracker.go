@@ -1152,13 +1152,21 @@ func (vm *FirecrackerVM) Recover(string, int) error {
 // requests at the end of a large start miss the API timeout.
 var fcStartSem fcSemaphore
 
-// fcInstanceStart boots the guest of the VMM at c. The API timeout starts
-// when the request gets a place in fcStartSem.
+// fcStartTimeout is the timeout of one InstanceStart request. It is longer
+// than the API timeout, because the guests that boot at the same time use the
+// CPUs of the host, and the request then waits for CPU time.
+var fcStartTimeout = 60 * time.Second
+
+// fcInstanceStart boots the guest of the VMM at c. The timeout starts when the
+// request gets a place in fcStartSem.
 func fcInstanceStart(c *fcClient) error {
 	fcStartSem.Acquire()
 	defer fcStartSem.Release()
 
-	return c.Action("InstanceStart")
+	ctx, cancel := context.WithTimeout(context.Background(), fcStartTimeout)
+	defer cancel()
+
+	return c.ActionContext(ctx, "InstanceStart")
 }
 
 func (vm *FirecrackerVM) Start() error {

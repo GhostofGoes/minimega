@@ -293,6 +293,12 @@ func (c *fcClient) Action(actionType string) error {
 	return c.put("/actions", fcInstanceAction{ActionType: actionType})
 }
 
+// ActionContext is Action, but the deadline of ctx applies, else the client
+// timeout.
+func (c *fcClient) ActionContext(ctx context.Context, actionType string) error {
+	return c.do(ctx, http.MethodPut, "/actions", fcInstanceAction{ActionType: actionType}, nil)
+}
+
 // PatchVMState sets the VM state to "Paused" or "Resumed".
 func (c *fcClient) PatchVMState(state string) error {
 	return c.do(context.Background(), http.MethodPatch, "/vm", fcVMState{State: state}, nil)
