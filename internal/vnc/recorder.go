@@ -343,7 +343,6 @@ func (fb *fbRecorder) read() {
 			prev = time.Now()
 
 			werr = fb.writeChunk(writer, offset, buf[:n])
-			log.Debug("fb wrote %d bytes", n)
 		}
 		if err != nil {
 			log.Debug("fb response read failed: %v", err)
