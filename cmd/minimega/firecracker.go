@@ -1147,6 +1147,20 @@ func (vm *FirecrackerVM) Recover(string, int) error {
 	return errors.New("recovery is not supported for firecracker VMs")
 }
 
+// fcStartSem limits the InstanceStart requests that run at the same time.
+// "vm start all" starts each VM in its own goroutine. Without a limit, the
+// requests at the end of a large start miss the API timeout.
+var fcStartSem fcSemaphore
+
+// fcInstanceStart boots the guest of the VMM at c. The API timeout starts
+// when the request gets a place in fcStartSem.
+func fcInstanceStart(c *fcClient) error {
+	fcStartSem.Acquire()
+	defer fcStartSem.Release()
+
+	return c.Action("InstanceStart")
+}
+
 func (vm *FirecrackerVM) Start() error {
 	vm.lock.Lock()
 	defer vm.lock.Unlock()
@@ -1194,7 +1208,7 @@ func (vm *FirecrackerVM) Start() error {
 	}
 
 	log.Info("starting VM: %v", vm.ID)
-	if err := vm.client.Action("InstanceStart"); err != nil {
+	if err := fcInstanceStart(vm.client); err != nil {
 		vm.stopVMM()
 		return vm.setErrorf("unable to start: %v", err)
 	}
