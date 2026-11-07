@@ -472,6 +472,11 @@ func (n *Node) checkDegree() {
 	}
 }
 
+var (
+	errAlreadyConnected = errors.New("already connected")
+	errDialSelf         = errors.New("cannot mesh dial yourself")
+)
+
 // dial another node, perform a handshake, and add the client to the client list if successful
 func (n *Node) dial(host string, solicited bool) error {
 	addr := n.resolve(host)
@@ -480,12 +485,12 @@ func (n *Node) dial(host string, solicited bool) error {
 	conn, h, err := n.handshake(addr, func(h hello) (hello, error) {
 		// are we the remote host?
 		if h.Name == n.name {
-			return hello{}, errors.New("cannot mesh dial yourself")
+			return hello{}, errDialSelf
 		}
 
 		// are we already connected to this node?
 		if n.hasClient(h.Name) {
-			return hello{}, fmt.Errorf("already connected to %v", h.Name)
+			return hello{}, fmt.Errorf("%w to %v", errAlreadyConnected, h.Name)
 		}
 
 		// we should hangup if the connection no longer wants solicited connections and we're solicited
@@ -497,10 +502,11 @@ func (n *Node) dial(host string, solicited bool) error {
 		return hello{Class: Control, Session: rand.Uint64() | 1}, nil
 	})
 	if err != nil {
-		if solicited {
+		// a peer that is connected or is this node is not a dial failure
+		if solicited && !errors.Is(err, errAlreadyConnected) && !errors.Is(err, errDialSelf) {
 			log.Error("dial %v: %v", host, err)
 		}
-		return fmt.Errorf("dial %v: %v", host, err)
+		return fmt.Errorf("dial %v: %w", host, err)
 	}
 	if conn == nil {
 		return nil
@@ -512,7 +518,7 @@ func (n *Node) dial(host string, solicited bool) error {
 	c := newClient(h.Name, addr, conn.session, l)
 	if !n.register(c, n.name) {
 		l.close(errors.New("duplicate"))
-		return fmt.Errorf("already connected to %v", h.Name)
+		return fmt.Errorf("%w to %v", errAlreadyConnected, h.Name)
 	}
 
 	go n.clientHandler(c)

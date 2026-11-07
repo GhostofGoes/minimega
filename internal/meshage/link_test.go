@@ -14,6 +14,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	log "github.com/sandia-minimega/minimega/v2/pkg/minilog"
 )
 
 // pipeLink returns a link on one side of a pipe, and the encoder and decoder
@@ -520,6 +522,47 @@ func TestNodeLinks(t *testing.T) {
 	if err := a.Dial("b"); err == nil || !strings.Contains(err.Error(), "already connected") {
 		t.Errorf("second dial = %v, want already connected", err)
 	}
+}
+
+// TestDialSolicitedConnected checks that a solicited dial to a peer that is
+// already connected does not log an error. A node with fewer peers than its
+// degree solicits all the time, and each peer then dials it again.
+func TestDialSolicitedConnected(t *testing.T) {
+	nodes := testNodes(t, "a", "b")
+	a, b := nodes["a"], nodes["b"]
+
+	dialTest(t, a, b)
+
+	var buf safeBuffer
+	log.AddLogger("solicited", &buf, log.ERROR, false)
+	defer log.DelLogger("solicited")
+
+	if err := a.dial("b", true); !errors.Is(err, errAlreadyConnected) {
+		t.Errorf("solicited dial = %v, want already connected", err)
+	}
+	if out := buf.String(); out != "" {
+		t.Errorf("solicited dial logged: %q", out)
+	}
+}
+
+// safeBuffer is a bytes.Buffer that goroutines can write at the same time.
+type safeBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *safeBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	return b.buf.Write(p)
+}
+
+func (b *safeBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	return b.buf.String()
 }
 
 // TestNodeLinkFallback closes the bulk link. Bulk messages then use the
