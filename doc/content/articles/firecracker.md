@@ -752,7 +752,9 @@ starts when the request gets a place.
   namespaces have no name in `/run/netns`, so `ip netns list` does not show
   them.
 - minimega adds the OVS ports in groups. One `ovs-vsctl` transaction adds at
-  most 256 ports that the launches request in 50 ms.
+  most 256 ports. A port add does not wait for other requests. The port adds
+  that the launches request while a transaction runs go into the next
+  transaction.
 
 After each `vm launch` with Firecracker VMs, minimega writes one line to the
 log:

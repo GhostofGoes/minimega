@@ -7,7 +7,6 @@ package bridge
 import (
 	"fmt"
 	"sync"
-	"time"
 
 	log "github.com/sandia-minimega/minimega/v2/pkg/minilog"
 )
@@ -18,7 +17,6 @@ var OVSBatching = true
 
 const (
 	ovsBatchMax      = 256
-	ovsBatchWindow   = 50 * time.Millisecond
 	ovsBatchArgBytes = 100 << 10
 )
 
@@ -42,23 +40,23 @@ func (r *ovsPortReq) args() []string {
 }
 
 // ovsBatcher commits queued port adds in groups: one ovs-vsctl transaction
-// per group, flushed when max requests are queued or window after the first.
+// per group of at most max requests. A request does not wait for others. The
+// requests that arrive while a transaction runs make the next group.
 type ovsBatcher struct {
-	run    func([]string) (string, error)
-	window time.Duration
-	max    int
+	run func([]string) (string, error)
+	max int
 
 	once  sync.Once
 	queue chan *ovsPortReq
 }
 
-func newOVSBatcher(run func([]string) (string, error), window time.Duration, max int) *ovsBatcher {
-	return &ovsBatcher{run: run, window: window, max: max}
+func newOVSBatcher(run func([]string) (string, error), max int) *ovsBatcher {
+	return &ovsBatcher{run: run, max: max}
 }
 
 var ovsPorts = newOVSBatcher(func(args []string) (string, error) {
 	return ovsCmdWrapper(args)
-}, ovsBatchWindow, ovsBatchMax)
+}, ovsBatchMax)
 
 // ovsAddPortBatched is ovsAddPort through the process-wide batcher.
 func ovsAddPortBatched(bridge, tap string, vlan int, host bool) error {
@@ -83,22 +81,25 @@ func (o *ovsBatcher) add(bridge, tap string, vlan int, host bool) error {
 
 func (o *ovsBatcher) loop() {
 	for r := range o.queue {
-		batch := []*ovsPortReq{r}
-		timer := time.NewTimer(o.window)
-
-	collect:
-		for len(batch) < o.max {
-			select {
-			case r := <-o.queue:
-				batch = append(batch, r)
-			case <-timer.C:
-				break collect
-			}
-		}
-		timer.Stop()
-
-		o.flush(batch)
+		o.flush(o.collect(r))
 	}
+}
+
+// collect returns r and the requests that are in the queue now, at most max
+// in total. It does not wait for more requests.
+func (o *ovsBatcher) collect(r *ovsPortReq) []*ovsPortReq {
+	batch := []*ovsPortReq{r}
+
+	for len(batch) < o.max {
+		select {
+		case r := <-o.queue:
+			batch = append(batch, r)
+		default:
+			return batch
+		}
+	}
+
+	return batch
 }
 
 // flush rejects repeated tap names, then commits the batch in chunks that

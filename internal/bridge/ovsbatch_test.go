@@ -89,12 +89,40 @@ func newReq(tap string) *ovsPortReq {
 	return &ovsPortReq{bridge: "br", tap: tap, res: make(chan error, 1)}
 }
 
+// gatedOVS returns a fakeOVS whose first invocation closes entered and then
+// waits until release is closed.
+func gatedOVS() (f *fakeOVS, entered, release chan struct{}) {
+	entered, release = make(chan struct{}), make(chan struct{})
+	first := true
+	f = &fakeOVS{fail: func([]string) error {
+		if first {
+			first = false
+			close(entered)
+			<-release
+		}
+		return nil
+	}}
+	return f, entered, release
+}
+
+// waitQueued waits until the queue of o holds n requests.
+func waitQueued(t *testing.T, o *ovsBatcher, n int) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for len(o.queue) < n {
+		if time.Now().After(deadline) {
+			t.Fatalf("queue length = %d, want %d", len(o.queue), n)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
 func TestOVSBatcherGroups(t *testing.T) {
 	f := &fakeOVS{}
-	o := newOVSBatcher(f.run, 500*time.Millisecond, 256)
+	o := newOVSBatcher(f.run, 256)
 
 	var taps []string
-	for i := 0; i < 300; i++ {
+	for i := 0; i < 600; i++ {
 		taps = append(taps, fmt.Sprintf("t%d", i))
 	}
 
@@ -104,15 +132,11 @@ func TestOVSBatcherGroups(t *testing.T) {
 		}
 	}
 
-	if len(f.calls) != 2 {
-		t.Fatalf("invocations = %d, want 2", len(f.calls))
-	}
-	if a, b := len(portTaps(f.calls[0])), len(portTaps(f.calls[1])); a != 256 || b != 44 {
-		t.Errorf("batch sizes = %d, %d, want 256, 44", a, b)
-	}
-
 	count := map[string]int{}
-	for _, c := range f.calls {
+	for i, c := range f.calls {
+		if n := len(portTaps(c)); n > 256 {
+			t.Errorf("batch %d has %d ports, want at most 256", i, n)
+		}
 		for _, tap := range portTaps(c) {
 			count[tap]++
 		}
@@ -124,11 +148,53 @@ func TestOVSBatcherGroups(t *testing.T) {
 	}
 }
 
-func TestOVSBatcherWindow(t *testing.T) {
-	f := &fakeOVS{}
-	o := newOVSBatcher(f.run, 50*time.Millisecond, 256)
+func TestOVSBatcherMax(t *testing.T) {
+	o := newOVSBatcher(nil, 256)
+	o.queue = make(chan *ovsPortReq, 300)
+	for i := 0; i < 299; i++ {
+		o.queue <- newReq(fmt.Sprintf("t%d", i))
+	}
+
+	if n := len(o.collect(newReq("first"))); n != 256 {
+		t.Errorf("first batch = %d requests, want 256", n)
+	}
+	if n := len(o.collect(<-o.queue)); n != 44 {
+		t.Errorf("second batch = %d requests, want 44", n)
+	}
+	if n := len(o.queue); n != 0 {
+		t.Errorf("queue length = %d, want 0", n)
+	}
+}
+
+func TestOVSBatcherNoWait(t *testing.T) {
+	var mu sync.Mutex
+	var ran time.Time
+	o := newOVSBatcher(func([]string) (string, error) {
+		mu.Lock()
+		ran = time.Now()
+		mu.Unlock()
+		return "", nil
+	}, 256)
 
 	start := time.Now()
+	if err := o.add("br", "t0", 0, false); err != nil {
+		t.Fatal(err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if d := ran.Sub(start); ran.IsZero() || d > 40*time.Millisecond {
+		t.Errorf("commit started %v after the add, want no wait", d)
+	}
+}
+
+func TestOVSBatcherNextBatch(t *testing.T) {
+	f, entered, release := gatedOVS()
+	o := newOVSBatcher(f.run, 256)
+
+	first := make(chan error, 1)
+	go func() { first <- o.add("br", "g", 0, false) }()
+	<-entered
 
 	var wg sync.WaitGroup
 	errs := make([]error, 3)
@@ -139,21 +205,26 @@ func TestOVSBatcherWindow(t *testing.T) {
 			errs[i] = o.add("br", fmt.Sprintf("t%d", i), i*5, i == 2)
 		}(i)
 	}
+	waitQueued(t, o, 3)
+	close(release)
 	wg.Wait()
 
-	if d := time.Since(start); d < 50*time.Millisecond {
-		t.Errorf("flushed after %v, want at least 50ms", d)
+	if err := <-first; err != nil {
+		t.Errorf("add g: %v", err)
 	}
 	for i, err := range errs {
 		if err != nil {
 			t.Errorf("add t%d: %v", i, err)
 		}
 	}
-	if len(f.calls) != 1 {
-		t.Fatalf("invocations = %d, want 1", len(f.calls))
+	if len(f.calls) != 2 {
+		t.Fatalf("invocations = %d, want 2", len(f.calls))
+	}
+	if got := portTaps(f.calls[0]); !reflect.DeepEqual(got, []string{"g"}) {
+		t.Errorf("first batch = %q, want [g]", got)
 	}
 
-	args := strings.Join(f.calls[0], " ")
+	args := strings.Join(f.calls[1], " ")
 	for _, want := range []string{
 		"-- add-port br t0",
 		"-- add-port br t1 tag=5",
@@ -175,20 +246,27 @@ func TestOVSBatcherSplit(t *testing.T) {
 		}
 		return nil
 	}}
-	o := newOVSBatcher(f.run, 500*time.Millisecond, 256)
+	o := newOVSBatcher(f.run, 256)
 
 	taps := []string{"bad"}
 	for i := 0; i < 7; i++ {
 		taps = append(taps, fmt.Sprintf("t%d", i))
 	}
 
-	for tap, err := range addAll(o, taps) {
-		if tap == "bad" {
+	var reqs []*ovsPortReq
+	for _, tap := range taps {
+		reqs = append(reqs, newReq(tap))
+	}
+	o.flush(reqs)
+
+	for i, r := range reqs {
+		err := <-r.res
+		if i == 0 {
 			if err == nil || !strings.Contains(err.Error(), "add port failed") {
 				t.Errorf("add bad = %v, want an add port error", err)
 			}
 		} else if err != nil {
-			t.Errorf("add %v: %v", tap, err)
+			t.Errorf("add %v: %v", taps[i], err)
 		}
 	}
 
@@ -218,7 +296,7 @@ func TestOVSBatcherSplit(t *testing.T) {
 
 func TestOVSBatcherDuplicate(t *testing.T) {
 	f := &fakeOVS{}
-	o := newOVSBatcher(f.run, time.Second, 256)
+	o := newOVSBatcher(f.run, 256)
 
 	reqs := []*ovsPortReq{newReq("a"), newReq("b"), newReq("a")}
 	o.flush(reqs)
@@ -249,7 +327,7 @@ func TestOVSBatcherAlreadyExists(t *testing.T) {
 		}
 		return nil
 	}}
-	o := newOVSBatcher(f.run, 10*time.Millisecond, 256)
+	o := newOVSBatcher(f.run, 256)
 
 	if err := o.add("br", "x", 0, false); err != errAlreadyExists {
 		t.Errorf("single add = %v, want errAlreadyExists", err)
