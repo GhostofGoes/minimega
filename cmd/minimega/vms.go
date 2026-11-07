@@ -24,6 +24,12 @@ import (
 type VMs struct {
 	m  map[int]VM
 	mu sync.Mutex
+
+	// stopVNC, if set, stops the VNC recordings, playback, and pastes of the
+	// named VM. Kill calls it for each VM that it kills, and Flush and
+	// FlushAll for each VM that they delete. A KVM VM also calls it when QEMU
+	// exits.
+	stopVNC func(name string)
 }
 
 // vmApplyFunc is passed into VMs.apply
@@ -303,6 +309,10 @@ func (vms *VMs) Launch(requestor, namespace string, q *QueuedVMs) <-chan error {
 			// future conflict tests.
 			vms.m[vm.GetID()] = vm
 
+			if kvm, ok := vm.(*KvmVM); ok {
+				kvm.onExit = vms.stopVNC
+			}
+
 			// The actual launching can happen in parallel while we keep checking
 			// for conflicts.
 			wg.Add(1)
@@ -354,15 +364,27 @@ func (vms *VMs) Kill(target string) error {
 			return true, err
 		}
 
+		vms.vmEnded(vm)
+
 		return true, nil
 	})
 }
 
-// Flush VMs matching target.
+// vmEnded stops the VNC recordings, playback, and pastes of vm.
+func (vms *VMs) vmEnded(vm VM) {
+	if vms.stopVNC != nil {
+		vms.stopVNC(vm.GetName())
+	}
+}
+
+// Flush VMs matching target. Flush destroys the taps of the VMs before it
+// returns.
 func (vms *VMs) Flush(target string, cc *ron.Server) error {
 	var mapLock sync.Mutex
+	var flushed []int
 
-	return vms.Apply(target, func(vm VM, _ bool) (bool, error) {
+	vms.mu.Lock()
+	errs := vms.apply(target, func(vm VM, _ bool) (bool, error) {
 		if vm.GetState()&(VM_QUIT|VM_ERROR) == 0 {
 			return false, nil
 		}
@@ -379,23 +401,48 @@ func (vms *VMs) Flush(target string, cc *ron.Server) error {
 			return true, err
 		}
 
+		vms.vmEnded(vm)
+
 		mapLock.Lock()
 		defer mapLock.Unlock()
 
-		delete(vms.m, vm.GetID())
+		flushed = append(flushed, vm.GetID())
 
 		return true, nil
 	})
+
+	// apply iterates over vms.m, so delete after it returns
+	for _, id := range flushed {
+		delete(vms.m, id)
+	}
+	vms.mu.Unlock()
+
+	// destroy the taps of all the flushed VMs in one pass of the reaper
+	reapTaps()
+
+	return makeErrSlice(errs)
 }
 
 // FlushAll deletes VMs that are in the QUIT or ERROR state, disconnecting them
-// from the provided ron.Server first.
+// from the provided ron.Server first. FlushAll destroys the taps of the VMs
+// before it returns.
 func (vms *VMs) FlushAll(cc *ron.Server) error {
+	vms.flushAll(cc)
+
+	// destroy the taps of all the flushed VMs in one pass of the reaper
+	reapTaps()
+
+	return nil
+}
+
+// flushAll deletes VMs like FlushAll but leaves their taps for the reaper.
+func (vms *VMs) flushAll(cc *ron.Server) {
 	vms.mu.Lock()
 	defer vms.mu.Unlock()
 
 	var wg sync.WaitGroup
 	var mapLock sync.Mutex
+	var flushed []int
 
 	for i, vm := range vms.m {
 		if vm.GetState()&(VM_QUIT|VM_ERROR) != 0 {
@@ -412,16 +459,20 @@ func (vms *VMs) FlushAll(cc *ron.Server) error {
 					log.Error("clogged vm %v: %v", vm.GetID(), err)
 				}
 
+				vms.vmEnded(vm)
+
 				mapLock.Lock()
 				defer mapLock.Unlock()
-				delete(vms.m, i)
+				flushed = append(flushed, i)
 				wg.Done()
 			}(i, vm)
 		}
 	}
 	wg.Wait()
 
-	return nil
+	for _, i := range flushed {
+		delete(vms.m, i)
+	}
 }
 
 func (vms *VMs) ProcStats(d time.Duration) []*VMProcStats {
@@ -599,21 +650,33 @@ func meshageVMLauncher() {
 		go func(m *meshage.Message) {
 			cmd := m.Body.(meshageVMLaunch)
 
-			ns := GetOrCreateNamespace(cmd.Namespace)
-
-			errs := []string{}
-			for _, err := range ns.Launch(cmd.From, cmd.QueuedVMs) {
-				errs = append(errs, err.Error())
-			}
-
 			to := []string{m.Source}
-			msg := meshageVMResponse{Errors: errs, TID: cmd.TID}
+			msg := meshageVMLaunchResponse(cmd)
 
 			if _, err := meshageNode.Set(to, msg); err != nil {
 				log.Errorln(err)
 			}
 		}(m)
 	}
+}
+
+// meshageVMLaunchResponse launches the VMs in cmd and returns the response to
+// send back to the scheduler. If the namespace in cmd does not exist and its
+// name is not valid, no VMs are launched and the response contains the error.
+func meshageVMLaunchResponse(cmd meshageVMLaunch) meshageVMResponse {
+	ns, err := GetOrCreateNamespace(cmd.Namespace)
+	if err != nil {
+		log.Error("invalid namespace from mesh: %v", err)
+
+		return meshageVMResponse{Errors: []string{err.Error()}, TID: cmd.TID}
+	}
+
+	errs := []string{}
+	for _, err := range ns.Launch(cmd.From, cmd.QueuedVMs) {
+		errs = append(errs, err.Error())
+	}
+
+	return meshageVMResponse{Errors: errs, TID: cmd.TID}
 }
 
 // globalVMs gets the VMs from all hosts in the mesh, filtered to the current

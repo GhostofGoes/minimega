@@ -74,7 +74,7 @@ func (c *chans) dropAll() []chan *tunnelMessage {
 func (t *Tunnel) mux() {
 	var err error
 
-	log.Info("starting minitunnel mux")
+	log.Debug("starting minitunnel mux")
 
 	for {
 		var m tunnelMessage
@@ -99,12 +99,13 @@ func (t *Tunnel) mux() {
 
 	close(t.quit) // signal to all listeners that this tunnel is outa here
 	t.transport.Close()
+	t.clearReverses()
 
 	for _, ch := range t.chans.dropAll() {
 		close(ch)
 	}
 
-	log.Info("mux exit: %v", err)
+	log.Debug("mux exit: %v", err)
 }
 
 func (t *Tunnel) handleRemote(m *tunnelMessage) {

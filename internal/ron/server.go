@@ -331,7 +331,7 @@ func (s *Server) DialSerial(path, uuid string) error {
 			// This blocks, but will return on a loss of connection to the client.
 			s.clientHandler(cli)
 
-			log.Info("client handler for %s completed", path)
+			log.Debug("client handler for %s completed", path)
 		}
 	}()
 
@@ -484,6 +484,98 @@ func (s *Server) GetResponses(raw bool) (string, error) {
 	}
 
 	return res, err
+}
+
+// GetClientResponses returns the stdout and stderr recorded for each client
+// that responded to command id, or to every command if id is nil. Results are
+// sorted by command ID then client UUID.
+func (s *Server) GetClientResponses(id *int) ([]ClientResponse, error) {
+	res := []ClientResponse{}
+
+	var ids []int
+	if id != nil {
+		ids = append(ids, *id)
+	} else {
+		entries, err := os.ReadDir(s.responsePath(nil))
+		if os.IsNotExist(err) {
+			return res, nil
+		} else if err != nil {
+			return nil, err
+		}
+
+		for _, e := range entries {
+			if v, err := strconv.Atoi(e.Name()); err == nil && e.IsDir() {
+				ids = append(ids, v)
+			}
+		}
+	}
+
+	for _, v := range ids {
+		base := s.responsePath(&v)
+
+		entries, err := os.ReadDir(base)
+		if os.IsNotExist(err) && id != nil {
+			return nil, fmt.Errorf("no responses for %v", v)
+		} else if err != nil {
+			return nil, err
+		}
+
+		for _, e := range entries {
+			if !e.IsDir() {
+				continue
+			}
+
+			r := ClientResponse{ID: v, UUID: e.Name()}
+
+			for name, dst := range map[string]*string{"stdout": &r.Stdout, "stderr": &r.Stderr} {
+				path := filepath.Join(base, e.Name(), name)
+
+				// a received file may have created a directory with this name
+				if fi, err := os.Stat(path); os.IsNotExist(err) || (err == nil && !fi.Mode().IsRegular()) {
+					continue
+				}
+
+				data, err := os.ReadFile(path)
+				if err != nil {
+					return nil, err
+				}
+				*dst = string(data)
+			}
+
+			res = append(res, r)
+		}
+	}
+
+	sort.Slice(res, func(i, j int) bool {
+		if res[i].ID != res[j].ID {
+			return res[i].ID < res[j].ID
+		}
+		return res[i].UUID < res[j].UUID
+	})
+
+	return res, nil
+}
+
+// GetClientInfo returns a serializable summary of every active client, sorted
+// by UUID.
+func (s *Server) GetClientInfo() []ClientInfo {
+	res := []ClientInfo{}
+
+	for _, c := range s.GetClients() {
+		res = append(res, ClientInfo{
+			UUID:     c.UUID,
+			Hostname: c.Hostname,
+			Arch:     c.Arch,
+			OS:       c.OS,
+			Version:  c.Version,
+			IPs:      c.IPs,
+			MACs:     c.MACs,
+		})
+	}
+
+	sort.Slice(res, func(i, j int) bool { return res[i].UUID < res[j].UUID })
+
+	return res
 }
 
 // GetClients returns a list of every active client
@@ -643,14 +735,14 @@ func (s *Server) DeleteResponses(prefix string) error {
 // ClearResponses deletes all responses received so far. It may not affect
 // responses that are still in-flight.
 func (s *Server) ClearResponses() error {
-	log.Info("clearing responses")
+	log.Debug("clearing responses")
 
 	// grab the client lock so that no more responses can be processed until
 	// we're finished.
 	s.clientLock.Lock()
 	defer s.clientLock.Unlock()
 
-	log.Info("cleared responses")
+	log.Debug("cleared responses")
 
 	return os.RemoveAll(s.responsePath(nil))
 }
@@ -728,7 +820,7 @@ func (s *Server) serve(addr string, ln net.Listener) {
 
 		remote := conn.RemoteAddr()
 
-		log.Info("client connected: %v -> %v", remote, addr)
+		log.Debug("client connected: %v -> %v", remote, addr)
 		c, err := s.handshake(conn, "")
 		if err != nil {
 			if err != io.EOF {
@@ -821,7 +913,7 @@ func (s *Server) handshake(conn net.Conn, expectedUUID string) (*client, error) 
 	}
 
 	if majorVersion(m.Version) > 0 {
-		log.Info("starting heartbeat to client %s", m.Client.UUID)
+		log.Debug("starting heartbeat to client %s", m.Client.UUID)
 
 		// Only send heartbeats to client if message version is present to prevent
 		// older clients from failing against this version of the server (sending a
@@ -1141,32 +1233,21 @@ func (s *Server) route(m *Message) {
 		}
 
 		if c.maxCommandID == maxCommandID {
-			log.Info("no commands for %v", uuid)
+			log.Debug("no commands for %v", uuid)
 			return
 		}
 
 		if m.Type == MESSAGE_COMMAND {
 			if s.UseVMs {
-				vm, ok := s.vms[uuid]
-				if !ok {
+				filters := make([]*Filter, 0, len(m.Commands))
+				for _, cmd := range m.Commands {
+					filters = append(filters, cmd.Filter)
+				}
+
+				if !s.loadVMTags(uuid, c, filters) {
 					// odd, someone must have unregistered the client...
 					log.Error("unregistered client %v", uuid)
 					return
-				}
-				// update client's tags in case we're matching based on them
-				c.Tags = vm.GetTags()
-
-				// load the relevant info fields, overriding any tag values
-				for _, cmd := range m.Commands {
-					if cmd.Filter != nil && cmd.Filter.Tags != nil {
-						for k := range cmd.Filter.Tags {
-							// only replace non-zero fields
-							v, _ := vm.Info(k)
-							if v != "" {
-								c.Tags[k] = v
-							}
-						}
-					}
 				}
 			}
 
@@ -1184,7 +1265,7 @@ func (s *Server) route(m *Message) {
 			c.maxCommandID = maxCommandID
 
 			if len(m2.Commands) == 0 {
-				log.Info("no commands for %v", uuid)
+				log.Debug("no commands for %v", uuid)
 				return
 			}
 
@@ -1229,6 +1310,33 @@ func (s *Server) route(m *Message) {
 	}
 
 	wg.Wait()
+}
+
+// loadVMTags sets c.Tags from the tags of the VM registered for uuid, then
+// overrides each key in the Tags of filters with the non-empty VM info field of
+// the same name, so that c.Matches can match on them. It returns false when no
+// VM is registered for uuid. The caller must hold clientLock.
+func (s *Server) loadVMTags(uuid string, c *client, filters []*Filter) bool {
+	vm, ok := s.vms[uuid]
+	if !ok {
+		return false
+	}
+
+	c.Tags = vm.GetTags()
+
+	for _, f := range filters {
+		if f == nil || f.Tags == nil {
+			continue
+		}
+
+		for k := range f.Tags {
+			if v, _ := vm.Info(k); v != "" {
+				c.Tags[k] = v
+			}
+		}
+	}
+
+	return true
 }
 
 // process responses, writing files when necessary
@@ -1294,7 +1402,7 @@ func (s *Server) updateClient(cin *Client) {
 		// the client probably disconnected between sending the heartbeat and
 		// us processing it. We'll still process any command responses but
 		// shouldn't try to update the client itself.
-		log.Info("unknown client %v", cin.UUID)
+		log.Debug("unknown client %v", cin.UUID)
 		return
 	}
 
@@ -1308,7 +1416,7 @@ func (s *Server) updateClient(cin *Client) {
 	vm, ok := s.vms[cin.UUID]
 	if !ok {
 		// see above but for the VM.
-		log.Info("unregistered client %v", cin.UUID)
+		log.Debug("unregistered client %v", cin.UUID)
 		return
 	}
 

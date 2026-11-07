@@ -7,7 +7,7 @@ require (
 	github.com/anthonynsimon/bild v0.14.0
 	github.com/c9s/goprocinfo v0.0.0-20210130143923-c95fcf8c64a8
 	github.com/dutchcoders/goftp v0.0.0-20170301105846-ed59a591ce14
-	github.com/fsnotify/fsnotify v1.9.0
+	github.com/fsnotify/fsnotify v1.10.1
 	github.com/goftp/server v0.0.0-20200708154336-f64f7c2d8a42
 	github.com/google/gopacket v1.1.19
 	github.com/jbuchbinder/gopnm v0.0.0-20251119211316-bb594e0d2e34
@@ -18,6 +18,7 @@ require (
 	github.com/stargrave/goircd v0.0.0-00010101000000-000000000000
 	github.com/thoj/go-ircevent v0.0.0-20210723090443-73e444401d64
 	github.com/twmb/murmur3 v1.1.8
+	github.com/vishvananda/netlink v1.3.1
 	github.com/ziutek/telnet v0.1.0
 	golang.org/x/crypto v0.48.0
 	golang.org/x/net v0.50.0
@@ -32,6 +33,7 @@ require (
 	github.com/clipperhouse/uax29/v2 v2.7.0 // indirect
 	github.com/creack/pty v1.1.24 // indirect
 	github.com/mattn/go-runewidth v0.0.20 // indirect
+	github.com/vishvananda/netns v0.0.5 // indirect
 	golang.org/x/mod v0.33.0 // indirect
 	golang.org/x/sync v0.19.0 // indirect
 	golang.org/x/text v0.34.0 // indirect

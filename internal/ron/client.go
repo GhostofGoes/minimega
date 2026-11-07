@@ -41,6 +41,17 @@ type Client struct {
 	LastCommandID int
 }
 
+// ClientInfo is the serializable summary of a Client reported to users.
+type ClientInfo struct {
+	UUID     string
+	Hostname string
+	Arch     string
+	OS       string
+	Version  string
+	IPs      []string
+	MACs     []string
+}
+
 type client struct {
 	*Client    // embed
 	sync.Mutex // embed
@@ -48,6 +59,10 @@ type client struct {
 	checkin time.Time // when the client last checked in
 
 	tunnel *minitunnel.Tunnel
+
+	// reversePending is true while a Tunnel.Reverse call for this client has
+	// not returned, protected by Server.clientLock
+	reversePending bool
 
 	// writeMu serializes calls to enc.Encode
 	writeMu sync.Mutex
