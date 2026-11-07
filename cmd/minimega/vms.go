@@ -24,6 +24,12 @@ import (
 type VMs struct {
 	m  map[int]VM
 	mu sync.Mutex
+
+	// stopVNC, if set, stops the VNC recordings, playback, and pastes of the
+	// named VM. Kill calls it for each VM that it kills, and Flush and
+	// FlushAll for each VM that they delete. A KVM VM also calls it when QEMU
+	// exits.
+	stopVNC func(name string)
 }
 
 // vmApplyFunc is passed into VMs.apply
@@ -302,6 +308,7 @@ func (vms *VMs) Launch(requestor, namespace string, q *QueuedVMs) <-chan error {
 			// Add the newly created VM to the map so that it gets included in
 			// future conflict tests.
 			vms.m[vm.GetID()] = vm
+			vms.hookExit(vm)
 
 			// The actual launching can happen in parallel while we keep checking
 			// for conflicts.
@@ -354,16 +361,35 @@ func (vms *VMs) Kill(target string) error {
 			return true, err
 		}
 
+		vms.vmEnded(vm)
+
 		return true, nil
 	})
+}
+
+// hookExit makes a KVM VM stop its VNC recordings, playback, and pastes when
+// QEMU exits. Call it for each VM that Launch creates or recovery finds.
+func (vms *VMs) hookExit(vm VM) {
+	if kvm, ok := vm.(*KvmVM); ok {
+		kvm.onExit = vms.stopVNC
+	}
+}
+
+// vmEnded stops the VNC recordings, playback, and pastes of vm.
+func (vms *VMs) vmEnded(vm VM) {
+	if vms.stopVNC != nil {
+		vms.stopVNC(vm.GetName())
+	}
 }
 
 // Flush VMs matching target. Flush destroys the taps of the VMs before it
 // returns.
 func (vms *VMs) Flush(target string, cc *ron.Server) error {
 	var mapLock sync.Mutex
+	var flushed []int
 
-	err := vms.Apply(target, func(vm VM, _ bool) (bool, error) {
+	vms.mu.Lock()
+	errs := vms.apply(target, func(vm VM, _ bool) (bool, error) {
 		if vm.GetState()&(VM_QUIT|VM_ERROR) == 0 {
 			return false, nil
 		}
@@ -380,18 +406,26 @@ func (vms *VMs) Flush(target string, cc *ron.Server) error {
 			return true, err
 		}
 
+		vms.vmEnded(vm)
+
 		mapLock.Lock()
 		defer mapLock.Unlock()
 
-		delete(vms.m, vm.GetID())
+		flushed = append(flushed, vm.GetID())
 
 		return true, nil
 	})
 
+	// apply iterates over vms.m, so delete after it returns
+	for _, id := range flushed {
+		delete(vms.m, id)
+	}
+	vms.mu.Unlock()
+
 	// destroy the taps of all the flushed VMs in one pass of the reaper
 	reapTaps()
 
-	return err
+	return makeErrSlice(errs)
 }
 
 // FlushAll deletes VMs that are in the QUIT or ERROR state, disconnecting them
@@ -413,6 +447,7 @@ func (vms *VMs) flushAll(cc *ron.Server) {
 
 	var wg sync.WaitGroup
 	var mapLock sync.Mutex
+	var flushed []int
 
 	for i, vm := range vms.m {
 		if vm.GetState()&(VM_QUIT|VM_ERROR) != 0 {
@@ -429,14 +464,20 @@ func (vms *VMs) flushAll(cc *ron.Server) {
 					log.Error("clogged vm %v: %v", vm.GetID(), err)
 				}
 
+				vms.vmEnded(vm)
+
 				mapLock.Lock()
 				defer mapLock.Unlock()
-				delete(vms.m, i)
+				flushed = append(flushed, i)
 				wg.Done()
 			}(i, vm)
 		}
 	}
 	wg.Wait()
+
+	for _, i := range flushed {
+		delete(vms.m, i)
+	}
 }
 
 func (vms *VMs) ProcStats(d time.Duration) []*VMProcStats {
