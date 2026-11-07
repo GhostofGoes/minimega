@@ -12,6 +12,7 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	log "github.com/sandia-minimega/minimega/v2/pkg/minilog"
@@ -121,6 +122,40 @@ func (w *deadlineWriter) Write(p []byte) (int, error) {
 	return n, nil
 }
 
+// progressReader sets the read deadline before each read, so that a large
+// message fails only when the connection stops. It records the time of the
+// last read that got data.
+type progressReader struct {
+	conn net.Conn
+
+	// timeout returns the read deadline. Set it before the first read.
+	timeout func() time.Duration
+
+	last atomic.Int64 // UnixNano of the last read that got data
+}
+
+func (r *progressReader) Read(p []byte) (int, error) {
+	if err := r.conn.SetReadDeadline(time.Now().Add(r.timeout())); err != nil {
+		return 0, err
+	}
+
+	n, err := r.conn.Read(p)
+	if n > 0 {
+		r.last.Store(time.Now().UnixNano())
+	}
+
+	return n, err
+}
+
+// lastRead returns the time of the last read that got data, or the zero time.
+func (r *progressReader) lastRead() time.Time {
+	if v := r.last.Load(); v != 0 {
+		return time.Unix(0, v)
+	}
+
+	return time.Time{}
+}
+
 // pending is a message that waits for its ACK.
 type pending struct {
 	m     *Message
@@ -137,6 +172,7 @@ type link struct {
 	conn    net.Conn
 	enc     *gob.Encoder
 	dec     *gob.Decoder
+	in      *progressReader // the reader of dec
 	timeout time.Duration
 
 	// keepalive returns how long the link can be idle before the writer
@@ -155,12 +191,13 @@ type link struct {
 	once    sync.Once
 }
 
-func newLink(class Class, conn net.Conn, enc *gob.Encoder, dec *gob.Decoder, timeout time.Duration, keepalive func() time.Duration) *link {
+func newLink(class Class, conn net.Conn, enc *gob.Encoder, dec *gob.Decoder, in *progressReader, timeout time.Duration, keepalive func() time.Duration) *link {
 	l := &link{
 		class:     class,
 		conn:      conn,
 		enc:       enc,
 		dec:       dec,
+		in:        in,
 		timeout:   timeout,
 		keepalive: keepalive,
 		slots:     make(chan struct{}, WINDOW),
@@ -263,18 +300,30 @@ func (l *link) writer() {
 		seq := m.Seq
 		l.mu.Lock()
 		if _, ok := l.waiting[seq]; ok {
-			p.timer = time.AfterFunc(l.timeout, func() {
-				// the ACK can arrive at the same time as the timeout
-				l.mu.Lock()
-				_, ok := l.waiting[seq]
-				l.mu.Unlock()
-
-				if ok {
-					l.close(fmt.Errorf("%w: no ACK for message %d", errTimeout, seq))
-				}
-			})
+			p.timer = time.AfterFunc(l.timeout, func() { l.ackTimeout(seq) })
 		}
 		l.mu.Unlock()
+	}
+}
+
+// ackTimeout closes the link when the message seq has no ACK and the link
+// received nothing for l.timeout. The peer sends its ACKs between messages, so
+// a link that receives a large message waits longer for an ACK.
+func (l *link) ackTimeout(seq uint64) {
+	l.mu.Lock()
+	// the ACK can arrive at the same time as the timeout
+	p, ok := l.waiting[seq]
+	if ok {
+		if wait := l.timeout - time.Since(l.in.lastRead()); wait > 0 {
+			p.timer.Reset(wait)
+			l.mu.Unlock()
+			return
+		}
+	}
+	l.mu.Unlock()
+
+	if ok {
+		l.close(fmt.Errorf("%w: no ACK for message %d", errTimeout, seq))
 	}
 }
 

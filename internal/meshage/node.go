@@ -77,6 +77,7 @@ type Node struct {
 	messagePump      [numClasses]chan *Message
 	sequences        map[uint64]uint64
 	clientLock       sync.Mutex
+	solicitedPending uint // accepted connections that were told Solicited, guarded by clientLock
 	sequenceLock     sync.Mutex
 	degreeLock       sync.Mutex
 	meshLock         sync.Mutex
@@ -196,6 +197,28 @@ func (n *Node) numClients() uint {
 	return uint(len(n.clients))
 }
 
+// reserveSolicited returns true and reserves a client slot when the node
+// solicits connections. A reservation stops parallel handshakes from going
+// over the degree. Release it with releaseSolicited.
+func (n *Node) reserveSolicited() bool {
+	n.clientLock.Lock()
+	defer n.clientLock.Unlock()
+
+	if uint(len(n.clients))+n.solicitedPending < n.degree {
+		n.solicitedPending++
+		return true
+	}
+
+	return false
+}
+
+func (n *Node) releaseSolicited() {
+	n.clientLock.Lock()
+	defer n.clientLock.Unlock()
+
+	n.solicitedPending--
+}
+
 // getClient returns the number client or an error if not connected.
 func (n *Node) getClient(c string) (*client, error) {
 	n.clientLock.Lock()
@@ -260,12 +283,17 @@ func (n *Node) connectionListener() {
 func (n *Node) newConnection(conn net.Conn) {
 	log.Debug("newConnection: %v", conn.RemoteAddr().String())
 
-	// are we soliciting connections?
-	solicited := n.numClients() < n.degree
+	// are we soliciting connections? The client is in the list or the
+	// connection failed when this function returns.
+	solicited := n.reserveSolicited()
+	if solicited {
+		defer n.releaseSolicited()
+	}
 	log.Debug("solicited: %v", solicited)
 
+	in := &progressReader{conn: conn, timeout: n.handshakeTimeout}
 	enc := gob.NewEncoder(&deadlineWriter{conn: conn, timeout: n.timeout})
-	dec := gob.NewDecoder(conn)
+	dec := gob.NewDecoder(in)
 
 	// the handshake involves the following:
 	// 1.  We send our hello: our name, our solicitation status, and our version
@@ -275,8 +303,6 @@ func (n *Node) newConnection(conn net.Conn) {
 	// 3.  For a control link, add the client to our client list and broadcast
 	//     a MSA announcing the new connection. The remote node does the same.
 	// 4.  For another class, add the link to the client of the same session.
-	conn.SetDeadline(time.Now().Add(n.timeout))
-
 	err := enc.Encode(hello{Protocol: PROTOCOL, Name: n.name, Solicited: solicited, Version: n.version})
 	if err != nil {
 		log.Error("newConnection encode hello: %v: %v", n.name, err)
@@ -301,8 +327,8 @@ func (n *Node) newConnection(conn net.Conn) {
 		return
 	}
 
-	conn.SetDeadline(time.Time{})
-	l := newLink(h.Class, conn, enc, dec, n.timeout, n.GetMSATimeout)
+	in.timeout = n.readTimeout
+	l := newLink(h.Class, conn, enc, dec, in, n.timeout, n.GetMSATimeout)
 
 	if h.Class != Control {
 		c, err := n.getClient(h.Name)
@@ -482,7 +508,7 @@ func (n *Node) dial(host string, solicited bool) error {
 
 	log.Debug("handshake from: %v", h.Name)
 
-	l := newLink(Control, conn.conn, conn.enc, conn.dec, n.timeout, n.GetMSATimeout)
+	l := newLink(Control, conn.conn, conn.enc, conn.dec, conn.in, n.timeout, n.GetMSATimeout)
 	c := newClient(h.Name, addr, conn.session, l)
 	if !n.register(c, n.name) {
 		l.close(errors.New("duplicate"))
@@ -506,7 +532,7 @@ func (n *Node) dialLink(c *client, class Class) (*link, error) {
 		return nil, err
 	}
 
-	l := newLink(class, conn.conn, conn.enc, conn.dec, n.timeout, n.GetMSATimeout)
+	l := newLink(class, conn.conn, conn.enc, conn.dec, conn.in, n.timeout, n.GetMSATimeout)
 	c.setLink(class, l)
 
 	// the control link can close while this link connects
@@ -526,7 +552,13 @@ type dialed struct {
 	conn    net.Conn
 	enc     *gob.Encoder
 	dec     *gob.Decoder
+	in      *progressReader
 	session uint64
+}
+
+// handshakeTimeout returns the read deadline during the handshake.
+func (n *Node) handshakeTimeout() time.Duration {
+	return n.timeout
 }
 
 // handshake dials addr, reads the hello of the peer, and sends the hello that
@@ -538,13 +570,12 @@ func (n *Node) handshake(addr string, reply func(hello) (hello, error)) (*dialed
 		return nil, hello{}, err
 	}
 
-	conn.SetDeadline(time.Now().Add(n.timeout))
-
 	d := &dialed{
 		conn: conn,
 		enc:  gob.NewEncoder(&deadlineWriter{conn: conn, timeout: n.timeout}),
-		dec:  gob.NewDecoder(conn),
+		in:   &progressReader{conn: conn, timeout: n.handshakeTimeout},
 	}
+	d.dec = gob.NewDecoder(d.in)
 
 	h, err := readHello(d.dec)
 	if err != nil {
@@ -570,7 +601,7 @@ func (n *Node) handshake(addr string, reply func(hello) (hello, error)) (*dialed
 		return nil, h, err
 	}
 
-	conn.SetDeadline(time.Time{})
+	d.in.timeout = n.readTimeout
 	d.session = mine.Session
 
 	return d, h, nil

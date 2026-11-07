@@ -5,6 +5,7 @@
 package main
 
 import (
+	"sync"
 	"testing"
 
 	"github.com/sandia-minimega/minimega/v2/internal/iomeshage"
@@ -67,5 +68,48 @@ func TestMeshageLogWriterDrop(t *testing.T) {
 	w.log(line)
 	if got := len(w.queue); got != 0 {
 		t.Errorf("stopped writer queued %d lines, want 0", got)
+	}
+}
+
+// TestStopMeshageLoggingConcurrent stops mesh logging from more than one
+// goroutine at the same time. Each writer must stop one time only.
+func TestStopMeshageLoggingConcurrent(t *testing.T) {
+	for round := 0; round < 10; round++ {
+		w := &meshageLogWriter{
+			dest:  "head",
+			queue: make(chan meshageLogMessage, 1),
+			stop:  make(chan struct{}),
+		}
+
+		meshLogLock.Lock()
+		meshLogWriter = w
+		logMeshNode = "head"
+		meshLogLock.Unlock()
+
+		var wg sync.WaitGroup
+		for i := 0; i < 8; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				stopMeshageLogging()
+				getLogMeshNode()
+			}()
+		}
+		wg.Wait()
+
+		select {
+		case <-w.stop:
+		default:
+			t.Fatal("the writer did not stop")
+		}
+		if node := getLogMeshNode(); node != "" {
+			t.Errorf("log mesh node = %q after stop, want empty", node)
+		}
+
+		meshLogLock.Lock()
+		if meshLogWriter != nil {
+			t.Error("writer is set after stop")
+		}
+		meshLogLock.Unlock()
 	}
 }

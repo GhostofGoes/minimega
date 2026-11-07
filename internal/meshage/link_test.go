@@ -5,6 +5,7 @@
 package meshage
 
 import (
+	"bytes"
 	"encoding/gob"
 	"errors"
 	"net"
@@ -26,7 +27,8 @@ func pipeLinkKeepalive(t *testing.T, timeout, keepalive time.Duration) (*link, *
 
 	a, b := net.Pipe()
 	enc := gob.NewEncoder(&deadlineWriter{conn: a, timeout: timeout})
-	l := newLink(Control, a, enc, gob.NewDecoder(a), timeout, func() time.Duration { return keepalive })
+	in := &progressReader{conn: a, timeout: func() time.Duration { return time.Hour }}
+	l := newLink(Control, a, enc, gob.NewDecoder(in), in, timeout, func() time.Duration { return keepalive })
 	t.Cleanup(func() {
 		l.close(errLinkClosed)
 		b.Close()
@@ -159,6 +161,108 @@ func TestLinkTimeout(t *testing.T) {
 	}
 }
 
+// slowWrite encodes the values with a new encoder and writes the result to
+// conn in chunks, with a pause before each chunk.
+func slowWrite(conn net.Conn, chunk int, pause time.Duration, values ...interface{}) error {
+	var buf bytes.Buffer
+	enc := gob.NewEncoder(&buf)
+	for _, v := range values {
+		if err := enc.Encode(v); err != nil {
+			return err
+		}
+	}
+
+	for data := buf.Bytes(); len(data) > 0; {
+		time.Sleep(pause)
+
+		end := min(chunk, len(data))
+		if _, err := conn.Write(data[:end]); err != nil {
+			return err
+		}
+		data = data[end:]
+	}
+
+	return nil
+}
+
+// TestLinkACKBehindLargeMessage checks that the link stays open while the
+// peer writes a large message, which takes longer than the timeout, before
+// the ACK.
+func TestLinkACKBehindLargeMessage(t *testing.T) {
+	const timeout = 200 * time.Millisecond
+
+	l, _, dec, conn := pipeLink(t, timeout)
+
+	errs := make(chan error, 1)
+	go func() {
+		errs <- l.send(&Message{Command: MESSAGE})
+	}()
+
+	var m Message
+	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if err := dec.Decode(&m); err != nil {
+		t.Fatal(err)
+	}
+
+	// 64 KiB in 8 chunks, 100ms each: 800ms in total
+	large := &Message{Command: MESSAGE, Body: strings.Repeat("x", 64<<10)}
+	ack := &Message{Command: ACK, Seq: m.Seq}
+	start := time.Now()
+	if err := slowWrite(conn, 8<<10, timeout/2, large, ack); err != nil {
+		t.Fatalf("write from the peer: %v", err)
+	}
+	if d := time.Since(start); d <= timeout {
+		t.Fatalf("the write took %v; the test needs more than the timeout %v", d, timeout)
+	}
+
+	select {
+	case err := <-errs:
+		if err != nil {
+			t.Fatalf("send = %v, want nil", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("no result from send after the ACK")
+	}
+	if l.closed() {
+		t.Errorf("link closed: %v", l.closeErr())
+	}
+}
+
+// TestProgressReader decodes a message that arrives in chunks over more time
+// than the read deadline. A peer that stops writing makes the read fail.
+func TestProgressReader(t *testing.T) {
+	const timeout = 100 * time.Millisecond
+
+	a, b := net.Pipe()
+	defer a.Close()
+	defer b.Close()
+
+	in := &progressReader{conn: a, timeout: func() time.Duration { return timeout }}
+	dec := gob.NewDecoder(in)
+
+	want := strings.Repeat("y", 32<<10)
+	go slowWrite(b, 4<<10, timeout/2, &Message{Command: MESSAGE, Body: want})
+
+	start := time.Now()
+	var m Message
+	if err := dec.Decode(&m); err != nil {
+		t.Fatalf("Decode = %v, want nil", err)
+	}
+	if d := time.Since(start); d <= timeout {
+		t.Errorf("the message took %v; the test needs more than the timeout %v", d, timeout)
+	}
+	if m.Body != want {
+		t.Errorf("got a body of %d bytes, want %d", len(m.Body.(string)), len(want))
+	}
+	if last := in.lastRead(); time.Since(last) > time.Second {
+		t.Errorf("last read at %v, want after the start %v", last, start)
+	}
+
+	if err := dec.Decode(&m); err == nil {
+		t.Error("Decode from a peer that does not write succeeded")
+	}
+}
+
 // TestLinkACKFirst checks that the writer sends a queued ACK before the next
 // message.
 func TestLinkACKFirst(t *testing.T) {
@@ -277,16 +381,28 @@ func TestRegister(t *testing.T) {
 	}
 }
 
+// freePort returns a port that is free for TCP and UDP, because a node
+// listens on both.
 func freePort(t *testing.T) int {
 	t.Helper()
 
-	l, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer l.Close()
+	for i := 0; i < 20; i++ {
+		l, err := net.Listen("tcp", ":0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		port := l.Addr().(*net.TCPAddr).Port
 
-	return l.Addr().(*net.TCPAddr).Port
+		u, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4zero, Port: port})
+		l.Close()
+		if err == nil {
+			u.Close()
+			return port
+		}
+	}
+
+	t.Fatal("no port that is free for TCP and UDP")
+	return 0
 }
 
 // testNodes starts one node for each name. The nodes dial each other on the
@@ -437,6 +553,151 @@ func TestNodeLinkFallback(t *testing.T) {
 
 	waitLinks(t, a, "b")
 	waitLinks(t, b, "a")
+}
+
+// stallProxy forwards TCP connections to target. It can stop the data from
+// the dialer on one connection.
+type stallProxy struct {
+	ln     net.Listener
+	target string
+
+	mu      sync.Mutex
+	stalled map[string]bool // by the address of the dialer
+	conns   []net.Conn
+}
+
+func newStallProxy(t *testing.T, target string) *stallProxy {
+	t.Helper()
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	p := &stallProxy{ln: ln, target: target, stalled: map[string]bool{}}
+	t.Cleanup(func() {
+		ln.Close()
+
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		for _, c := range p.conns {
+			c.Close()
+		}
+	})
+
+	go func() {
+		for {
+			down, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			up, err := net.Dial("tcp", target)
+			if err != nil {
+				down.Close()
+				continue
+			}
+
+			p.mu.Lock()
+			p.conns = append(p.conns, down, up)
+			p.mu.Unlock()
+
+			go p.forward(down.RemoteAddr().String(), up, down)
+			go p.forward("", down, up)
+		}
+	}()
+
+	return p
+}
+
+// forward copies src to dst. While the connection of dialer is stalled, it
+// keeps the data that it read.
+func (p *stallProxy) forward(dialer string, dst, src net.Conn) {
+	buf := make([]byte, 32<<10)
+	for {
+		n, err := src.Read(buf)
+		if err != nil {
+			dst.Close()
+			return
+		}
+
+		for p.isStalled(dialer) {
+			time.Sleep(10 * time.Millisecond)
+		}
+
+		if _, err := dst.Write(buf[:n]); err != nil {
+			src.Close()
+			return
+		}
+	}
+}
+
+func (p *stallProxy) isStalled(dialer string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	return p.stalled[dialer]
+}
+
+func (p *stallProxy) stall(dialer string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	p.stalled[dialer] = true
+}
+
+// TestNodeBulkStall stops the data on the bulk link from a to b. Control and
+// log messages must still arrive. With one link for all classes, they would
+// wait behind the bulk message.
+func TestNodeBulkStall(t *testing.T) {
+	nodes := testNodes(t, "a", "b")
+	a, b := nodes["a"], nodes["b"]
+	a.Classify = classifyPrefix
+
+	proxy := newStallProxy(t, net.JoinHostPort("127.0.0.1", strconv.Itoa(b.port)))
+	a.resolve = func(string) string { return proxy.ln.Addr().String() }
+
+	dialTest(t, a, b)
+
+	c, err := a.getClient("b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	proxy.stall(c.link(Bulk).conn.LocalAddr().String())
+
+	stalled := make(chan error, 1)
+	go func() {
+		_, err := a.Set([]string{"b"}, "bulk:stalled")
+		stalled <- err
+	}()
+
+	select {
+	case err := <-stalled:
+		t.Fatalf("Set on a stalled bulk link returned %v", err)
+	case m := <-b.Messages(Bulk):
+		t.Fatalf("got %v on a stalled bulk link", m.Body)
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	for _, body := range []string{"control:1", "log:2"} {
+		class := classifyPrefix(body)
+
+		start := time.Now()
+		if _, err := a.Set([]string{"b"}, body); err != nil {
+			t.Fatalf("Set %v with a stalled bulk link: %v", body, err)
+		}
+		if d := time.Since(start); d > time.Second {
+			t.Errorf("Set %v took %v with a stalled bulk link", body, d)
+		}
+
+		select {
+		case m := <-b.Messages(class):
+			if m.Body != body {
+				t.Errorf("got %v, want %v", m.Body, body)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("no %v message with a stalled bulk link", class)
+		}
+	}
 }
 
 // TestNodeForward sends messages of each class through a node in the middle.

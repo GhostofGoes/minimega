@@ -8,14 +8,19 @@ import (
 	"fmt"
 	"math/rand"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
 	log "github.com/sandia-minimega/minimega/v2/pkg/minilog"
 )
 
-// mesh node we are currently logging to
+// mesh node we are currently logging to, guarded by meshLogLock
 var logMeshNode string
+
+// meshLogLock guards logMeshNode and meshLogWriter, because CLI commands can
+// run at the same time.
+var meshLogLock sync.Mutex
 
 // Message is a log message that can be sent over the minimega mesh to another
 // node in the mesh. It's primary use is to consolidate logs from all nodes in a
@@ -38,7 +43,7 @@ const (
 )
 
 // meshLogWriter is the writer of the "meshage" logger, nil when mesh logging
-// is disabled.
+// is disabled. It is guarded by meshLogLock.
 var meshLogWriter *meshageLogWriter
 
 type meshageLogWriter struct {
@@ -144,8 +149,25 @@ func (this *meshageLogWriter) send(m meshageLogMessage) {
 	meshageNode.Set([]string{this.dest}, m)
 }
 
+// getLogMeshNode returns the mesh node we are currently logging to.
+func getLogMeshNode() string {
+	meshLogLock.Lock()
+	defer meshLogLock.Unlock()
+
+	return logMeshNode
+}
+
 // stopMeshageLogging disables mesh logging.
 func stopMeshageLogging() {
+	meshLogLock.Lock()
+	defer meshLogLock.Unlock()
+
+	stopMeshageLoggingLocked()
+}
+
+// stopMeshageLoggingLocked disables mesh logging. The caller holds
+// meshLogLock.
+func stopMeshageLoggingLocked() {
 	log.DelLogger("meshage")
 
 	if meshLogWriter != nil {
@@ -179,6 +201,12 @@ func setupMeshageLogging(node string) error {
 	// function just in case the mesh hasn't been fully formed by the time this
 	// function is called (for example, at startup when the destination node is
 	// specified via the -headnode flag).
+
+	meshLogLock.Lock()
+	defer meshLogLock.Unlock()
+
+	// stop the writer of an earlier setup, so that only one writer runs
+	stopMeshageLoggingLocked()
 
 	meshLogWriter = newMeshageLogWriter(node)
 

@@ -131,9 +131,7 @@ func (n *Node) readLink(c *client, l *link) error {
 	for {
 		var m Message
 
-		// The peer sends a keepalive on an idle link each MSA period.
-		l.conn.SetReadDeadline(time.Now().Add(deadlineMultiplier * n.GetMSATimeout()))
-
+		// The progressReader of the link sets the read deadline.
 		if err := l.dec.Decode(&m); err != nil {
 			l.close(err)
 			return err
@@ -160,6 +158,12 @@ func (n *Node) readLink(c *client, l *link) error {
 			return l.closeErr()
 		}
 	}
+}
+
+// readTimeout returns the read deadline of a link. The peer sends a keepalive
+// on an idle link each MSA period.
+func (n *Node) readTimeout() time.Duration {
+	return deadlineMultiplier * n.GetMSATimeout()
 }
 
 // clientHandler is called as a goroutine after a successful handshake. It

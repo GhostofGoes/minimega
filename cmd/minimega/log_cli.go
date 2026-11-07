@@ -202,10 +202,10 @@ func cliLogFile(ns *Namespace, c *minicli.Command, resp *minicli.Response) error
 
 func cliLogMesh(ns *Namespace, c *minicli.Command, resp *minicli.Response) error {
 	if len(c.StringArgs) == 0 {
-		if logMeshNode == "" {
+		if node := getLogMeshNode(); node == "" {
 			resp.Response = "mesh logging disabled"
 		} else {
-			resp.Response = fmt.Sprintf("sending all logs to node %s", logMeshNode)
+			resp.Response = fmt.Sprintf("sending all logs to node %s", node)
 		}
 
 		return nil
