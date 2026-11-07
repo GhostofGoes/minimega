@@ -241,6 +241,12 @@ func (n *Namespace) Destroy() error {
 	n.Recorder.Clear()
 	n.Player.Clear()
 
+	// Remove the tap mirrors before their taps go away: a mirror row stays in
+	// Open vSwitch when its output tap is deleted.
+	if err := mirrorDelete(n, Wildcard); err != nil {
+		log.Error("unable to delete mirrors: %v", err)
+	}
+
 	// Kill and flush all the VMs, including the VMs that are launching
 	n.WaitLaunches()
 	n.Kill(Wildcard)
@@ -256,9 +262,6 @@ func (n *Namespace) Destroy() error {
 	if err != nil {
 		return err
 	}
-
-	// We don't need to delete mirrors -- deleting the taps should clean those
-	// up automatically.
 
 	// Free up any VLANs associated with the namespace
 	vlans.Delete(n.Name, "")
