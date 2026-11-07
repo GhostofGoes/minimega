@@ -132,7 +132,7 @@ func randomMac() (string, error) {
 
 		if isUsableRandomMAC(hw) {
 			mac := net.HardwareAddr(hw[:]).String()
-			log.Info("generated mac: %v", mac)
+			log.Debug("generated mac: %v", mac)
 			return mac, nil
 		}
 	}
