@@ -995,7 +995,9 @@ commands, and small responses. The bulk link carries files, VM launches, and
 large responses. The log link carries the log lines that a node sends with
 `-headnode` or `log mesh`. When the bulk or log link is down, its messages use
 the control link. A link can send up to 64 messages before it gets their
-acknowledgments. All nodes in a mesh must use the same version of the meshage
+acknowledgments. A link closes when a message has no acknowledgment and the
+link received nothing for two MSA periods (`-msa` or `mesh msa`). The default
+is 20 seconds. All nodes in a mesh must use the same version of the meshage
 handshake. A node with an older version cannot connect.
 
 <a id="TOC_7.1.2."></a>

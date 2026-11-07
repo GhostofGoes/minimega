@@ -160,8 +160,10 @@ func (n *Node) readLink(c *client, l *link) error {
 	}
 }
 
-// readTimeout returns the read deadline of a link. The peer sends a keepalive
-// on an idle link each MSA period.
+// readTimeout returns the read deadline of a link, and how long a message can
+// wait for its ACK while the link receives nothing. The peer sends a keepalive
+// on an idle link each MSA period, so a link closes after two missed
+// keepalives.
 func (n *Node) readTimeout() time.Duration {
 	return deadlineMultiplier * n.GetMSATimeout()
 }

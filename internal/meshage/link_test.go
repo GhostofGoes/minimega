@@ -30,7 +30,7 @@ func pipeLinkKeepalive(t *testing.T, timeout, keepalive time.Duration) (*link, *
 	a, b := net.Pipe()
 	enc := gob.NewEncoder(&deadlineWriter{conn: a, timeout: timeout})
 	in := &progressReader{conn: a, timeout: func() time.Duration { return time.Hour }}
-	l := newLink(Control, a, enc, gob.NewDecoder(in), in, timeout, func() time.Duration { return keepalive })
+	l := newLink(Control, a, enc, gob.NewDecoder(in), in, func() time.Duration { return timeout }, func() time.Duration { return keepalive })
 	t.Cleanup(func() {
 		l.close(errLinkClosed)
 		b.Close()
@@ -521,6 +521,30 @@ func TestNodeLinks(t *testing.T) {
 
 	if err := a.Dial("b"); err == nil || !strings.Contains(err.Error(), "already connected") {
 		t.Errorf("second dial = %v, want already connected", err)
+	}
+}
+
+// TestNodeACKTimeout checks that the ACK timeout of a link is two MSA
+// periods, and that it follows a change of the MSA period.
+func TestNodeACKTimeout(t *testing.T) {
+	nodes := testNodes(t, "a", "b")
+	a, b := nodes["a"], nodes["b"]
+
+	dialTest(t, a, b)
+
+	c, err := a.getClient("b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	l := c.link(Control)
+
+	if got, want := l.timeout(), 2*DEFAULT_MSA_TIMEOUT*time.Second; got != want {
+		t.Errorf("ACK timeout = %v, want %v", got, want)
+	}
+
+	a.SetMSATimeout(30)
+	if got, want := l.timeout(), time.Minute; got != want {
+		t.Errorf("ACK timeout after the MSA change = %v, want %v", got, want)
 	}
 }
 

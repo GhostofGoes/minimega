@@ -168,12 +168,15 @@ type pending struct {
 // ACK at the same time. The reader of the link queues the ACKs for the
 // writer, so it does not wait for a write to finish.
 type link struct {
-	class   Class
-	conn    net.Conn
-	enc     *gob.Encoder
-	dec     *gob.Decoder
-	in      *progressReader // the reader of dec
-	timeout time.Duration
+	class Class
+	conn  net.Conn
+	enc   *gob.Encoder
+	dec   *gob.Decoder
+	in    *progressReader // the reader of dec
+
+	// timeout returns how long a message can wait for its ACK while the link
+	// receives nothing.
+	timeout func() time.Duration
 
 	// keepalive returns how long the link can be idle before the writer
 	// sends a keepalive.
@@ -191,7 +194,7 @@ type link struct {
 	once    sync.Once
 }
 
-func newLink(class Class, conn net.Conn, enc *gob.Encoder, dec *gob.Decoder, in *progressReader, timeout time.Duration, keepalive func() time.Duration) *link {
+func newLink(class Class, conn net.Conn, enc *gob.Encoder, dec *gob.Decoder, in *progressReader, timeout, keepalive func() time.Duration) *link {
 	l := &link{
 		class:     class,
 		conn:      conn,
@@ -300,21 +303,21 @@ func (l *link) writer() {
 		seq := m.Seq
 		l.mu.Lock()
 		if _, ok := l.waiting[seq]; ok {
-			p.timer = time.AfterFunc(l.timeout, func() { l.ackTimeout(seq) })
+			p.timer = time.AfterFunc(l.timeout(), func() { l.ackTimeout(seq) })
 		}
 		l.mu.Unlock()
 	}
 }
 
 // ackTimeout closes the link when the message seq has no ACK and the link
-// received nothing for l.timeout. The peer sends its ACKs between messages, so
+// received nothing for l.timeout(). The peer sends its ACKs between messages, so
 // a link that receives a large message waits longer for an ACK.
 func (l *link) ackTimeout(seq uint64) {
 	l.mu.Lock()
 	// the ACK can arrive at the same time as the timeout
 	p, ok := l.waiting[seq]
 	if ok {
-		if wait := l.timeout - time.Since(l.in.lastRead()); wait > 0 {
+		if wait := l.timeout() - time.Since(l.in.lastRead()); wait > 0 {
 			p.timer.Reset(wait)
 			l.mu.Unlock()
 			return
