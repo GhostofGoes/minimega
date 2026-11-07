@@ -218,8 +218,7 @@ func cliLogMesh(ns *Namespace, c *minicli.Command, resp *minicli.Response) error
 	}
 
 	// reset logging to mesh if it's already enabled
-	log.DelLogger("meshage")
-	logMeshNode = ""
+	stopMeshageLogging()
 
 	return setupMeshageLogging(node)
 }
@@ -319,8 +318,7 @@ func cliLogClear(ns *Namespace, c *minicli.Command, resp *minicli.Response) erro
 
 	// Reset mesh if explicitly cleared or we're clearing everything
 	if c.BoolArgs["mesh"] || len(c.BoolArgs) == 0 {
-		log.DelLogger("meshage")
-		logMeshNode = ""
+		stopMeshageLogging()
 	}
 
 	// Reset syslog if explicitly cleared or we're clearing everything
