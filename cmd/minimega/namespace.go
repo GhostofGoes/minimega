@@ -330,6 +330,13 @@ func vmConflicts(vms []VM, queue []*QueuedVMs) error {
 	return nil
 }
 
+// clearQueue removes all the queued VMs and the index of their names and
+// UUIDs.
+func (n *Namespace) clearQueue() {
+	n.queue = nil
+	n.queuedNames, n.queuedUUIDs = nil, nil
+}
+
 // indexQueue makes the index of the names and UUIDs in the queue, if it does
 // not exist.
 func (n *Namespace) indexQueue() {
@@ -456,8 +463,7 @@ func (n *Namespace) schedule(assignment map[string][]*QueuedVMs) error {
 	}
 
 	// Clear the queuedVMs -- we're just about to launch them (hopefully!)
-	n.queue = nil
-	n.queuedNames, n.queuedUUIDs = nil, nil
+	n.clearQueue()
 
 	stats := &scheduleStat{
 		total: total,

@@ -178,11 +178,10 @@ func TestQueueIndex(t *testing.T) {
 		t.Errorf("Queue of a new name = %v", err)
 	}
 
-	// what schedule does when the queue launches
-	n.queue = nil
-	n.queuedNames, n.queuedUUIDs = nil, nil
+	// what schedule and `ns flush` do
+	n.clearQueue()
 
 	if err := n.Queue("a2", KVM, VMConfig{}); err != nil {
-		t.Errorf("Queue after the queue launched = %v", err)
+		t.Errorf("Queue after the queue was cleared = %v", err)
 	}
 }

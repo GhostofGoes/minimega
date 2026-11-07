@@ -341,7 +341,7 @@ func cliNamespaceQueueing(ns *Namespace, c *minicli.Command, resp *minicli.Respo
 }
 
 func cliNamespaceFlush(ns *Namespace, c *minicli.Command, resp *minicli.Response) error {
-	ns.queue = nil
+	ns.clearQueue()
 	return nil
 }
 
