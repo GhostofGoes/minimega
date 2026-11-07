@@ -76,20 +76,20 @@ func (r *RecordingReader) readChunk() error {
 	return nil
 }
 
+// Read reads the data of the chunks. At the end of the file, or after an
+// error, it returns the bytes that are left before it returns the error.
 func (r *RecordingReader) Read(dst []byte) (int, error) {
-	if r.err != nil {
-		return 0, r.err
-	}
-
-	// Read the next chunk
-	if len(dst) > r.buf.Len() {
+	if len(dst) > r.buf.Len() && r.err == nil {
 		r.err = r.readChunk()
-		if r.err != nil {
-			return 0, r.err
+		for r.err == nil && r.buf.Len() == 0 {
+			r.err = r.readChunk()
 		}
 	}
 
-	var n int
-	n, r.err = r.buf.Read(dst)
-	return n, r.err
+	if r.buf.Len() > 0 || len(dst) == 0 {
+		n, _ := r.buf.Read(dst)
+		return n, nil
+	}
+
+	return 0, r.err
 }
