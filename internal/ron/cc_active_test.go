@@ -55,6 +55,8 @@ func newCCTestServer(vms ...VM) *Server {
 		clients:   map[string]*client{},
 		vms:       map[string]VM{},
 		responses: make(chan *Client, 1024),
+
+		clientExpiry: CLIENT_EXPIRED * time.Second,
 	}
 
 	for _, vm := range vms {
