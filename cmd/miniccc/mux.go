@@ -5,9 +5,8 @@
 package main
 
 import (
-	"errors"
+	"encoding/gob"
 	"fmt"
-	"io"
 	"math"
 	"net"
 	"sort"
@@ -18,8 +17,41 @@ import (
 	log "github.com/sandia-minimega/minimega/v2/pkg/minilog"
 )
 
-// mux routes incoming messages from the server based on message type
-func mux(done chan struct{}) {
+// serve starts to serve the connection that dial opened and sends the
+// handshake. It returns a function that waits until the connection is lost,
+// stops serving it, and returns the cause.
+func serve() func() error {
+	client.Lock()
+	conn, dec, lost := client.conn, client.dec, client.lost
+	client.Unlock()
+
+	done := make(chan struct{})
+
+	go mux(done, dec, lost)
+	heartbeat() // handshake is first heartbeat
+
+	return func() error {
+		err := <-lost
+
+		close(done)
+		conn.Close()
+
+		return err
+	}
+}
+
+// connLost reports err as the cause of the loss of the connection that lost
+// belongs to. Only the first error on a connection is kept.
+func connLost(lost chan<- error, err error) {
+	select {
+	case lost <- err:
+	default:
+	}
+}
+
+// mux routes incoming messages from the server based on message type. It
+// reports the error that ends the connection on lost.
+func mux(done chan struct{}, dec *gob.Decoder, lost chan<- error) {
 	// start piping data to minitunnel and trunking it over the ron
 	local, remote := net.Pipe()
 	defer local.Close()
@@ -45,21 +77,13 @@ func mux(done chan struct{}) {
 		)
 
 		err = timeout(d*time.Second, func() (err error) {
-			err = client.dec.Decode(&m)
+			err = dec.Decode(&m)
 			if err != nil {
 				err = fmt.Errorf("decoding cc message: %w", err)
 			}
 
 			return
 		})
-
-		if errors.Is(err, errTimeout) || errors.Is(err, io.EOF) {
-			log.Warn("server connection lost: resetting client")
-
-			// server connection lost, so reset client
-			resetClient()
-			return
-		}
 
 		if err != nil {
 			break
@@ -70,15 +94,12 @@ func mux(done chan struct{}) {
 		switch m.Type {
 		case ron.MESSAGE_CLIENT:
 			// ACK of the handshake
-			if client.UUID == "" && m.Client != nil && m.Client.UUID != "" {
-				client.UUID = m.Client.UUID
-				log.Info("adopted serial-bound UUID: %v", client.UUID)
-			}
+			uuid := ackHandshake(m.Client)
 			if !tunnelStarted {
-				go ron.Trunk(remote, client.UUID, sendMessage)
+				go ron.Trunk(remote, uuid, sendMessage)
 				tunnelStarted = true
 			}
-			log.Info("handshake complete")
+			log.Debug("handshake complete")
 
 			go periodic(done)
 			go commandHandler(done)
@@ -110,7 +131,8 @@ func mux(done chan struct{}) {
 		}
 	}
 
-	log.Info("mux exit: %v", err)
+	log.Debug("mux exit: %v", err)
+	connLost(lost, err)
 }
 
 func commandHandler(done chan struct{}) {
@@ -127,7 +149,7 @@ func commandHandler(done chan struct{}) {
 				processCommand(commands[id])
 			}
 		case <-done:
-			log.Info("command handler exit")
+			log.Debug("command handler exit")
 			return
 		}
 	}

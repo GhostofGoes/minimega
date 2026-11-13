@@ -33,13 +33,14 @@ github.com/fsnotify/fsnotify/internal
 # github.com/goftp/server v0.0.0-20200708154336-f64f7c2d8a42 => ./packages/github.com/goftp/server
 ## explicit; go 1.13
 github.com/goftp/server
-# github.com/google/gopacket v1.1.19
-## explicit; go 1.12
-github.com/google/gopacket
-github.com/google/gopacket/layers
-github.com/google/gopacket/macs
-github.com/google/gopacket/pcap
-github.com/google/gopacket/pcapgo
+# github.com/gopacket/gopacket v1.6.1
+## explicit; go 1.24.0
+github.com/gopacket/gopacket
+github.com/gopacket/gopacket/endian
+github.com/gopacket/gopacket/layers
+github.com/gopacket/gopacket/macs
+github.com/gopacket/gopacket/pcap
+github.com/gopacket/gopacket/pcapgo
 # github.com/jbuchbinder/gopnm v0.0.0-20251119211316-bb594e0d2e34
 ## explicit; go 1.18
 github.com/jbuchbinder/gopnm
@@ -67,9 +68,20 @@ github.com/thoj/go-ircevent
 # github.com/twmb/murmur3 v1.1.8
 ## explicit; go 1.11
 github.com/twmb/murmur3
+# github.com/vishvananda/netlink v1.3.1
+## explicit; go 1.12
+github.com/vishvananda/netlink
+github.com/vishvananda/netlink/nl
+# github.com/vishvananda/netns v0.0.5
+## explicit; go 1.17
+github.com/vishvananda/netns
 # github.com/ziutek/telnet v0.1.0
 ## explicit; go 1.22.5
 github.com/ziutek/telnet
+# go.uber.org/goleak v1.3.0
+## explicit; go 1.20
+go.uber.org/goleak
+go.uber.org/goleak/internal/stack
 # golang.org/x/crypto v0.48.0
 ## explicit; go 1.24.0
 golang.org/x/crypto/bcrypt

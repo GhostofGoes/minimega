@@ -7,6 +7,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -182,7 +183,8 @@ type KVMConfig struct {
 	VirtioPorts string
 
 	// Specify the graphics card to emulate. "cirrus" or "std" should work with
-	// most operating systems.
+	// most operating systems. Use "virtio" to let a VNC client, such as the
+	// browser console, change the screen size of the VM.
 	//
 	// Default: "std"
 	Vga string
@@ -260,6 +262,9 @@ type KvmVM struct {
 
 	vncShim net.Listener // shim for VNC connections
 	VNCPort int
+
+	// onExit, if set, receives the VM name when QEMU exits.
+	onExit func(name string)
 }
 
 type BlockDevice struct {
@@ -813,6 +818,36 @@ func (vm *KvmVM) connectQMP() (err error) {
 	return errors.New("qmp timeout")
 }
 
+// proxyVNC connects one VNC client of the shim to the QEMU VNC socket of the
+// VM. addr is the shim address, which paste-as-keys playback dials.
+func (vm *KvmVM) proxyVNC(ns *Namespace, addr string, remote net.Conn) {
+	defer remote.Close()
+
+	name := vm.GetName()
+
+	local, err := net.Dial("unix", vm.path("vnc"))
+	if err != nil {
+		log.Error("unable to dial vnc socket of vm %v: %v", name, err)
+		return
+	}
+
+	opts := vnc.ProxyOptions{
+		Name:              name,
+		ExtendedClipboard: vm.BidirectionalCopyPaste,
+		OnMessage:         func(m vnc.ClientMessage) { ns.Recorder.Route(name, m) },
+	}
+
+	if !opts.ExtendedClipboard {
+		opts.OnPaste = func(text string) {
+			if err := ns.Player.Paste(name, addr, text); err != nil {
+				log.Warn("unable to paste to vm %v: %v", name, err)
+			}
+		}
+	}
+
+	vnc.Proxy(context.Background(), remote, local, opts)
+}
+
 func (vm *KvmVM) connectVNC() error {
 	if vm.Baremetal {
 		return nil
@@ -831,70 +866,15 @@ func (vm *KvmVM) connectVNC() error {
 		defer l.Close()
 
 		// should never create...
-		ns := GetOrCreateNamespace(vm.Namespace)
-
-		for {
-			// Sit waiting for new connections
-			remote, err := l.Accept()
-			if err != nil && strings.Contains(err.Error(), "use of closed network connection") {
-				return
-			} else if err != nil {
-				log.Errorln(err)
-				return
-			}
-
-			log.Info("vnc shim connect: %v -> %v", remote.RemoteAddr(), vm.Name)
-
-			go func() {
-				defer remote.Close()
-
-				// Dial domain socket
-				local, err := net.Dial("unix", vm.path("vnc"))
-				if err != nil {
-					log.Error("unable to dial vm vnc: %v", err)
-					return
-				}
-				defer local.Close()
-
-				// copy local -> remote
-				go io.Copy(remote, local)
-
-				// Reads will implicitly copy from remote -> local
-				tee := io.TeeReader(remote, local)
-				for {
-					msg, err := vnc.ReadClientMessage(tee)
-					if err == nil {
-						// for cut text, send text immediately as string if not bi-directional
-						if cut, ok := msg.(*vnc.ClientCutText); ok && !vm.BidirectionalCopyPaste {
-							if cut.Length > 0 {
-								log.Info("sending text for ClientCutText: %s", cut.Text)
-								err = ns.Player.PlaybackString(vm.Name, vm.vncShim.Addr().String(), string(cut.Text))
-								if err != nil {
-									log.Warnln(err)
-								}
-							}
-						}
-						ns.Recorder.Route(vm.GetName(), msg)
-						continue
-					}
-
-					// shim is no longer connected
-					if err == io.EOF || strings.Contains(err.Error(), "broken pipe") {
-						log.Info("vnc shim quit: %v", vm.Name)
-						break
-					}
-
-					// ignore these
-					if strings.Contains(err.Error(), "unknown client-to-server message") {
-						log.Debugln(err)
-						continue
-					}
-
-					// unknown error
-					log.Warnln(err)
-				}
-			}()
+		ns, err := GetOrCreateNamespace(vm.Namespace)
+		if err != nil {
+			log.Error("unable to start vnc shim for vm %v: %v", vm.Name, err)
+			return
 		}
+
+		vnc.Serve(l, func(remote net.Conn) {
+			vm.proxyVNC(ns, l.Addr().String(), remote)
+		})
 	}()
 
 	return nil
@@ -920,6 +900,8 @@ func (vm *KvmVM) addTap(name, bridge, mac string, vlan int, qinq bool) (string, 
 	if err != nil {
 		return tap, err
 	}
+
+	br.SetTapOwner(tap, vm.Namespace, vm.Name)
 
 	if qinq {
 		if err := br.SetTapQinQ(tap, vlan); err != nil {
@@ -962,7 +944,7 @@ func (vm *KvmVM) createBonds() error {
 	for i := range vm.Bonds {
 		bond := &vm.Bonds[i]
 
-		if bond.created {
+		if bond.Created {
 			// bond has already been created, don't need to do it again
 			continue
 		}
@@ -970,8 +952,6 @@ func (vm *KvmVM) createBonds() error {
 		if err := vm.addBond(bond); err != nil {
 			return vm.setErrorf("unable to reate bond %v: %v", i, err)
 		}
-
-		bond.created = true
 	}
 
 	if len(vm.Bonds) > 0 {
@@ -1126,6 +1106,12 @@ func (vm *KvmVM) waitForExit(p *os.Process, wait chan bool) {
 					break
 				}
 			}
+		}
+
+		// Stop VNC work before the state change, so that no relaunch of the
+		// name can start first. Do it without vm.lock: shim connections take it.
+		if vm.onExit != nil {
+			vm.onExit(vm.GetName())
 		}
 
 		vm.lock.Lock()
@@ -1489,11 +1475,6 @@ func (vm VMConfig) qemuArgs(id int, vmPath string) []string {
 
 	args = append(args, "-pidfile")
 	args = append(args, filepath.Join(vmPath, "qemu.pid"))
-
-	if !vm.Baremetal {
-		args = append(args, "-k")
-		args = append(args, "en-us")
-	}
 
 	if vm.CPU != "" {
 		args = append(args, "-cpu")

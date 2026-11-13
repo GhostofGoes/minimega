@@ -38,8 +38,9 @@ behavior change makes it stale.
   - [`cmd/plumbing/`](cmd/plumbing/) contains support commands excluded from
     canonical build and test loops.
 - [`internal/`](internal/) contains private packages: `bridge`, `gonetflow`,
-  `iomeshage`, `meshage`, `miniplumber`, `minitunnel`, `nbd`, `present`, `qemu`,
-  `qmp`, `recovery`, `ron`, `version`, `vlans`, `vmconfig`, and `vnc`.
+  `iomeshage`, `meshage`, `miniplumber`, `minitunnel`, `nbd`, `nscapture`,
+  `pcapfile`, `present`, `qemu`, `qmp`, `recovery`, `ron`, `version`, `vlans`,
+  `vmconfig`, and `vnc`.
 - [`pkg/`](pkg/) contains reusable packages: `minicli`, `miniclient`, `minilog`,
   `minipager`, and `ranges`.
 - [`tests/`](tests/) contains minitest command files and matching `.want`
@@ -157,8 +158,8 @@ When changing [`cmd/minimega/`](cmd/minimega/):
 
 - Route asynchronous command execution through `runCommands`; do not call
   `minicli.ProcessCommand` directly.
-- Acquire locks in this order: `cmdChannel`, `vmLock`, `VM.lock`, then other
-  locks. minimega locks precede locks in other packages.
+- Acquire locks in this order: `cmdChannel`, `vlanUseLock`, `vmLock`,
+  `VM.lock`, then other locks. minimega locks precede locks in other packages.
 - Use exported `VMs` and namespace helpers instead of directly accessing global
   maps or namespace state.
 - Lowercase helpers may require an existing lock; preserve `// LOCK: ...`

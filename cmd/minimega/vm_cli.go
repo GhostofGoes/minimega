@@ -39,7 +39,7 @@ info include:
 - namespace* : namespace the VM belongs to
 - type*      : one of (kvm, container, android)
 - uuid*      : QEMU system uuid
-- cc_active* : indicates whether cc is connected
+- cc_active* : true if a miniccc client for the VM is connected (see cc clients)
 - vcpus      : the number of allocated CPUs
 - memory     : allocated memory, in megabytes
 - vlan*      : vlan, as an integer
@@ -66,6 +66,8 @@ Additional fields are available for KVM-based VMs:
 - vnc_port      : port for VNC shim
 - usb-use-xhci  : usb controller (true = xhci; false = ehci)
 - tpm-socket	: path of emulated tpm socket
+- bidirectional-copy-paste : true if VNC clipboard text goes to qemu-vdagent
+- vga           : graphics card that QEMU emulates (for example, std or virtio)
 
 Additional fields are available for container-based VMs:
 
@@ -131,7 +133,9 @@ example:
 
 If queueing is enabled (see "ns"), VMs will be queued for launching until "vm
 launch" is called with no additional arguments. This allows the scheduler to
-better allocate resources across the cluster.
+better allocate resources across the cluster. With queueing, minimega checks
+the names and UUIDs of the queued VMs against the VMs in the namespace when the
+queue launches.
 
 Android VMs use host-side emulator console/ADB port pairs. minimega currently
 uses 64 valid port pairs per host, so each host can run at most 64 Android VMs
@@ -759,7 +763,7 @@ func cliClearVMNetBond(ns *Namespace, c *minicli.Command, resp *minicli.Response
 			}
 		}
 
-		log.Info("vm bonds: %v", vm.GetBonds())
+		log.Debug("vm bonds: %v", vm.GetBonds())
 
 		if err := writeVMConfig(vm); err != nil {
 			// don't propagate this error
@@ -778,24 +782,19 @@ func cliVMLaunch(ns *Namespace, c *minicli.Command, resp *minicli.Response) erro
 
 	// adding VM to queue
 	if len(c.StringArgs) > 0 {
-		// create a local copy of the current or specified VMConfig
-		var vmConfig VMConfig
-
-		if name := c.StringArgs["config"]; name != "" {
-			if _, ok := ns.savedVMConfig[name]; !ok {
-				return fmt.Errorf("config %v does not exist", name)
-			}
-			vmConfig = ns.savedVMConfig[name].Copy()
-		} else {
-			vmConfig = ns.vmConfig.Copy()
-		}
-
 		vmType, err := findVMType(c.BoolArgs)
 		if err != nil {
 			return err
 		}
 
+		// create a local copy of the current or specified VMConfig
+		vmConfig, done, err := ns.copyVMConfig(c.StringArgs["config"])
+		if err != nil {
+			return err
+		}
+
 		err = ns.Queue(c.StringArgs["name"], vmType, vmConfig)
+		done()
 
 		if err == nil && !ns.QueueVMs {
 			// no error queueing and user has disabled queueing -- launch now!
@@ -1093,6 +1092,12 @@ func cliVMHotplug(ns *Namespace, c *minicli.Command, resp *minicli.Response) err
 }
 
 func cliVMNetMod(ns *Namespace, c *minicli.Command, resp *minicli.Response) error {
+	if c.BoolArgs["add"] || c.BoolArgs["connect"] {
+		// Use the VLAN until the VMs store it, see vlanUseLock
+		done := vlanUseLock.Use()
+		defer done()
+	}
+
 	target := c.StringArgs["vm"]
 
 	var fn vmApplyFunc
@@ -1122,7 +1127,7 @@ func cliVMNetMod(ns *Namespace, c *minicli.Command, resp *minicli.Response) erro
 				return true, err
 			}
 
-			log.Info("vm networks: %v", vm.GetNetworks())
+			log.Debug("vm networks: %v", vm.GetNetworks())
 
 			if err := writeVMConfig(vm); err != nil {
 				// don't propagate this error
@@ -1149,7 +1154,7 @@ func cliVMNetMod(ns *Namespace, c *minicli.Command, resp *minicli.Response) erro
 				return true, err
 			}
 
-			log.Info("vm networks: %v", vm.GetNetworks())
+			log.Debug("vm networks: %v", vm.GetNetworks())
 
 			if err := writeVMConfig(vm); err != nil {
 				// don't propagate this error
@@ -1169,7 +1174,7 @@ func cliVMNetMod(ns *Namespace, c *minicli.Command, resp *minicli.Response) erro
 				return true, err
 			}
 
-			log.Info("vm networks: %v", vm.GetNetworks())
+			log.Debug("vm networks: %v", vm.GetNetworks())
 
 			if err := writeVMConfig(vm); err != nil {
 				// don't propagate this error
@@ -1179,7 +1184,7 @@ func cliVMNetMod(ns *Namespace, c *minicli.Command, resp *minicli.Response) erro
 			return true, nil
 		}
 	} else if c.BoolArgs["bond"] {
-		log.Info("adding bond for VM %s", target)
+		log.Debug("adding bond for VM %s", target)
 
 		var (
 			name       = c.StringArgs["name"]
@@ -1249,7 +1254,7 @@ func cliVMNetMod(ns *Namespace, c *minicli.Command, resp *minicli.Response) erro
 				return true, err
 			}
 
-			log.Info("vm bonds: %v", vm.GetBonds())
+			log.Debug("vm bonds: %v", vm.GetBonds())
 
 			if err := writeVMConfig(vm); err != nil {
 				// don't propagate this error

@@ -14,7 +14,7 @@ import (
 
 	log "github.com/sandia-minimega/minimega/v2/pkg/minilog"
 
-	"github.com/google/gopacket/macs"
+	"github.com/gopacket/gopacket/macs"
 )
 
 var validMACPrefix [][3]byte
@@ -209,7 +209,7 @@ func ParseNetConfig(spec string, nics map[string]bool) (*NetConfig, error) {
 		return nil, errors.New("malformed netspec")
 	}
 
-	log.Info(`got bridge="%v", alias="%v", mac="%v", driver="%v"`, b, v, m, d)
+	log.Debug(`got bridge="%v", alias="%v", mac="%v", driver="%v"`, b, v, m, d)
 
 	if b == "" {
 		b = DefaultBridge
@@ -286,7 +286,9 @@ type BondConfig struct {
 	VLAN       int
 	Raw        string
 
-	created bool
+	// Created is true after the bond is added to its bridge. It is exported so
+	// that the VMs in mesh responses keep it.
+	Created bool `json:"-"`
 }
 
 type BondConfigs []BondConfig
@@ -481,7 +483,7 @@ func ParseBondConfig(spec string) (*BondConfig, error) {
 		}
 	}
 
-	log.Info(
+	log.Debug(
 		`got interfaces="%v", mode="%v", lacp="%v", fallback="%v", qinq="%v", name="%v"`,
 		ifaces, b, l, !nf, q, n,
 	)

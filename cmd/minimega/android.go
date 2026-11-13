@@ -771,6 +771,8 @@ func (vm *AndroidVM) addTap(name, bridge, mac string, vlan int, qinq bool) (stri
 		return tap, err
 	}
 
+	br.SetTapOwner(tap, vm.Namespace, vm.Name)
+
 	if qinq {
 		if err := br.SetTapQinQ(tap, vlan); err != nil {
 			return tap, err
@@ -809,15 +811,13 @@ func (vm *AndroidVM) createBonds() error {
 	for i := range vm.Bonds {
 		bond := &vm.Bonds[i]
 
-		if bond.created {
+		if bond.Created {
 			continue
 		}
 
 		if err := vm.addBond(bond); err != nil {
 			return vm.setErrorf("unable to create android bond %v: %v", i, err)
 		}
-
-		bond.created = true
 	}
 
 	if len(vm.Bonds) > 0 {

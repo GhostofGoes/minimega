@@ -9,6 +9,7 @@ import (
 	"io/ioutil"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/sandia-minimega/minimega/v2/internal/recovery"
@@ -31,12 +32,35 @@ func recover() error {
 		return fmt.Errorf("unable to recover previous vms: %w", err)
 	}
 
+	// New VMs must not reuse the ID of a VM from the previous instance, because
+	// its instance directory or link can still exist in the base directory.
+	maxID := -1
+	noteID := func(id string) {
+		if n, err := strconv.Atoi(id); err == nil && n > maxID {
+			maxID = n
+		}
+	}
+
+	entries, err := os.ReadDir(*f_base)
+	if err != nil {
+		return fmt.Errorf("unable to read base directory: %w", err)
+	}
+
+	for _, e := range entries {
+		noteID(e.Name())
+	}
+
 	for namespace, vms := range namespaces {
 		log.Info("recovering vms for namespace %s", namespace)
 
-		ns := GetOrCreateNamespace(namespace)
+		ns, err := GetOrCreateNamespace(namespace)
+		if err != nil {
+			return fmt.Errorf("unable to recover namespace %s: %w", namespace, err)
+		}
 
 		for _, vm := range vms {
+			noteID(vm.VMID)
+
 			body, err := ioutil.ReadFile(filepath.Join(*f_base, vm.VMID, "name"))
 			if err != nil {
 				return fmt.Errorf("unable to read name file for vm %s: %w", vm.VMID, err)
@@ -96,6 +120,7 @@ func recover() error {
 					}
 
 					br.RecoverTap(c.Tap, c.MAC, c.VLAN, false)
+					br.SetTapOwner(c.Tap, namespace, name)
 				}
 			}
 
@@ -145,6 +170,7 @@ func recover() error {
 
 			// add VM to namespace
 			ns.VMs.m[kvm.ID] = kvm
+			ns.VMs.hookExit(kvm)
 
 			state, err := VMStateFromString(vm.State)
 			if err != nil {
@@ -187,6 +213,8 @@ func recover() error {
 			}
 		}
 	}
+
+	vmID.SkipPast(maxID)
 
 	return nil
 }

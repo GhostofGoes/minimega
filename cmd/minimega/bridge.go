@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"text/tabwriter"
 	"time"
 
@@ -40,6 +41,14 @@ type Tap struct {
 
 var bridges = bridge.NewBridges(DefaultBridge, TapFmt, BondFmt)
 
+// reapTaps removes the defunct taps on all bridges now. It logs an error because
+// the work that marked the taps is already done and the periodic reaper retries.
+func reapTaps() {
+	if err := bridges.ReapTaps(); err != nil {
+		log.Error("reaping taps: %v", err)
+	}
+}
+
 // tapReaperStart periodically calls bridges.ReapTaps
 func tapReaperStart() {
 	go func() {
@@ -60,12 +69,82 @@ func bridgesDestroy() error {
 	}
 
 	// Clean up bridges file
-	bridgeFile := filepath.Join(*f_base, "bridges")
-	if err := os.Remove(bridgeFile); err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("could not remove bridge file: %v", err)
+	return bridgesFile.reset(func() error {
+		bridgeFile := filepath.Join(*f_base, "bridges")
+		if err := os.Remove(bridgeFile); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("could not remove bridge file: %v", err)
+		}
+		return nil
+	})
+}
+
+// bridgeFileDelay is the maximum time that a change other than a new bridge
+// waits before bridgeFileWriter writes it.
+const bridgeFileDelay = time.Second
+
+// bridgeFileWriter writes the bridges state file, which nuke reads to find the
+// bridges to delete. It writes the file at once for a bridge that the last
+// write did not include. It writes other changes, such as VLANs, at most once
+// each delay.
+type bridgeFileWriter struct {
+	mu    sync.Mutex
+	delay time.Duration
+	// write writes the file and returns the names of the bridges in it.
+	write   func() map[string]bool
+	names   map[string]bool
+	pending bool
+}
+
+var bridgesFile = &bridgeFileWriter{
+	delay: bridgeFileDelay,
+	write: func() map[string]bool {
+		info := bridges.Info()
+		mustWrite(filepath.Join(*f_base, "bridges"), formatBridgeInfo(info))
+
+		names := map[string]bool{}
+		for _, i := range info {
+			names[i.Name] = true
+		}
+		return names
+	},
+}
+
+// update records a use of bridge name.
+func (w *bridgeFileWriter) update(name string) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	if !w.names[name] {
+		w.pending = false
+		w.names = w.write()
+		return
 	}
 
-	return nil
+	if !w.pending {
+		w.pending = true
+		time.AfterFunc(w.delay, w.flush)
+	}
+}
+
+func (w *bridgeFileWriter) flush() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	if w.pending {
+		w.pending = false
+		w.names = w.write()
+	}
+}
+
+// reset cancels a pending write, forgets the bridges, and runs fn.
+func (w *bridgeFileWriter) reset(fn func() error) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	w.pending = false
+	w.names = nil
+
+	return fn()
 }
 
 // getBridge is a wrapper for `bridges.Get` that gets the bridge and then
@@ -76,14 +155,13 @@ func getBridge(b string) (*bridge.Bridge, error) {
 		return nil, err
 	}
 
-	mustWrite(filepath.Join(*f_base, "bridges"), bridgeInfo())
+	bridgesFile.update(br.Name)
 
 	return br, nil
 }
 
-// bridgeInfo returns formatted information about all the bridges.
-func bridgeInfo() string {
-	info := bridges.Info()
+// formatBridgeInfo returns formatted information about the bridges in info.
+func formatBridgeInfo(info []bridge.BridgeInfo) string {
 	if len(info) == 0 {
 		return ""
 	}
@@ -101,7 +179,7 @@ func bridgeInfo() string {
 }
 
 // hostTapCreate creates a host tap based on the supplied arguments.
-func hostTapCreate(b, tap string, v int) (string, error) {
+func hostTapCreate(ns, b, tap string, v int) (string, error) {
 	if b == "" {
 		b = DefaultBridge
 	}
@@ -121,6 +199,7 @@ func hostTapCreate(b, tap string, v int) (string, error) {
 
 	tap, err = br.CreateHostTap(tap, v)
 	if err == nil {
+		br.SetTapOwner(tap, ns, "")
 		mustWrite(filepath.Join(*f_base, "taps"), hostTapInfo())
 	}
 
@@ -174,20 +253,20 @@ func hostTapDelete(ns *Namespace, s string) error {
 		return nil
 	}
 
+	var err error
+
 	if s == Wildcard {
 		for tap := range ns.Taps {
-			if err := delTap(tap); err != nil {
-				return err
+			if err = delTap(tap); err != nil {
+				break
 			}
 		}
-
-		return nil
-	}
-
-	err := delTap(s)
-	if err == nil {
+	} else if err = delTap(s); err == nil {
 		mustWrite(filepath.Join(*f_base, "taps"), hostTapInfo())
 	}
+
+	// remove the deleted taps before the command returns
+	reapTaps()
 
 	return err
 }
@@ -207,29 +286,25 @@ func recoverHostTaps() error {
 				continue
 			}
 
-			fields := strings.Fields(scanner.Text())
-
-			if len(fields) != 3 {
-				return fmt.Errorf("expected exactly three columns in taps file: got %d", len(fields))
-			}
-
-			var (
-				bridge = fields[0]
-				tap    = fields[1]
-				alias  = fields[2]
-			)
-
-			br, err := bridges.Get(bridge)
+			r, err := parseHostTap(scanner.Text())
 			if err != nil {
-				return fmt.Errorf("unable to get bridge %s for host tap %s: %w", bridge, tap, err)
+				return err
 			}
 
-			vlan, err := vlans.GetVLAN("", alias)
+			br, err := bridges.Get(r.bridge)
 			if err != nil {
-				return fmt.Errorf("unable to get VLAN ID for alias %s on host tap %s: %w", alias, tap, err)
+				return fmt.Errorf("unable to get bridge %s for host tap %s: %w", r.bridge, r.tap, err)
 			}
 
-			br.RecoverTap(tap, "", vlan, true)
+			vlan, err := vlans.GetVLAN("", r.alias)
+			if err != nil {
+				return fmt.Errorf("unable to get VLAN ID for alias %s on host tap %s: %w", r.alias, r.tap, err)
+			}
+
+			br.RecoverTap(r.tap, "", vlan, true)
+			if r.namespace != "" {
+				br.SetTapOwner(r.tap, r.namespace, "")
+			}
 		}
 
 		if err := scanner.Err(); err != nil {
@@ -242,9 +317,34 @@ func recoverHostTaps() error {
 	return nil
 }
 
+// hostTapRecord is one line of the host taps recovery file.
+type hostTapRecord struct {
+	bridge, tap, alias, namespace string
+}
+
+// parseHostTap parses one line of the host taps recovery file. A line without
+// the namespace column takes the namespace from the VLAN alias.
+func parseHostTap(line string) (hostTapRecord, error) {
+	fields := strings.Fields(line)
+
+	switch len(fields) {
+	case 3:
+		a := vlans.ParseAlias("", fields[2])
+		return hostTapRecord{fields[0], fields[1], fields[2], a.Namespace}, nil
+	case 4:
+		return hostTapRecord{fields[0], fields[1], fields[2], fields[3]}, nil
+	}
+
+	return hostTapRecord{}, fmt.Errorf("expected three or four columns in taps file: got %d", len(fields))
+}
+
 // hostTapInfo returns formatted information about all the host taps.
 func hostTapInfo() string {
-	taps := bridges.HostTaps()
+	return formatHostTaps(bridges.HostTaps())
+}
+
+// formatHostTaps returns the host taps recovery file contents for taps.
+func formatHostTaps(taps []bridge.Tap) string {
 	if len(taps) == 0 {
 		return ""
 	}
@@ -254,11 +354,11 @@ func hostTapInfo() string {
 	w := new(tabwriter.Writer)
 	w.Init(&o, 5, 0, 1, ' ', 0)
 
-	fmt.Fprintf(w, "Bridge\tTap\tVLAN\n")
+	fmt.Fprintf(w, "Bridge\tTap\tVLAN\tNamespace\n")
 
 	for _, t := range taps {
 		alias := strings.Fields(vlans.PrintVLAN("", t.VLAN))[0]
-		fmt.Fprintf(w, "%v\t%v\t%v\n", t.Bridge, t.Name, alias)
+		fmt.Fprintf(w, "%v\t%v\t%v\t%v\n", t.Bridge, t.Name, alias, t.Namespace)
 	}
 
 	w.Flush()

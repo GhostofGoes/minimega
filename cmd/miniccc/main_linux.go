@@ -18,6 +18,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"syscall"
+	"time"
 
 	"github.com/sandia-minimega/minimega/v2/internal/version"
 	log "github.com/sandia-minimega/minimega/v2/pkg/minilog"
@@ -119,38 +120,33 @@ func main() {
 	<-sig
 }
 
-var done chan struct{}
-
-// called by mux if loss of server is detected
+// resetClient connects to the server and returns after it sends the
+// handshake. Each time the connection is lost, for any reason, it connects
+// again: the server side detects the loss of connection and resets as well.
 func resetClient() {
-	if done != nil {
-		// Stop periodic heartbeat and command handler (started by mux) so they can
-		// be safely restarted again below.
-		close(done)
-		done = nil
+	connect := func() func() error {
+		if err := dial(); err != nil {
+			log.Fatal("unable to connect: %v", err)
+		}
+
+		refreshUpdateInfo()
+
+		return serve()
 	}
 
-	// If called by mux due to loss of server connection, clean up shop and try
-	// again since the server side will detect a loss of connection and reset as
-	// well.
-	if client.conn != nil {
-		client.conn.Close()
+	wait := connect()
 
-		client.enc = nil
-		client.dec = nil
-		client.conn = nil
-	}
+	go func() {
+		for {
+			start := time.Now()
+			log.Info("cc connection lost: %v; reconnecting", wait())
 
-	if err := dial(); err != nil {
-		log.Fatal("unable to connect: %v", err)
-	}
+			// no busy loop when the server ends each connection at once
+			time.Sleep(firstRetryInterval - time.Since(start))
 
-	refreshUpdateInfo()
-
-	done = make(chan struct{})
-
-	go mux(done)
-	heartbeat() // handshake is first heartbeat
+			wait = connect()
+		}
+	}()
 }
 
 func updateTag() error {

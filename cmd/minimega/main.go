@@ -19,6 +19,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/sandia-minimega/minimega/v2/internal/bridge"
 	"github.com/sandia-minimega/minimega/v2/internal/version"
 	"github.com/sandia-minimega/minimega/v2/internal/vlans"
 	"github.com/sandia-minimega/minimega/v2/pkg/minicli"
@@ -253,6 +254,8 @@ func main() {
 	// check all the external dependencies
 	if err := checkExternal(); err != nil {
 		log.Warnln(err.Error())
+	} else if err := bridge.CleanStaleMirrors(); err != nil {
+		log.Warn("unable to remove stale capture mirrors: %v", err)
 	}
 
 	// rebase f_iomBase if f_base changed but iomBase did not
@@ -319,7 +322,9 @@ func main() {
 	}
 
 	// has to happen after meshageNode is created
-	GetOrCreateNamespace(DefaultNamespace)
+	if _, err := GetOrCreateNamespace(DefaultNamespace); err != nil {
+		log.Fatal("unable to create default namespace: %v", err)
+	}
 	SetNamespace(DefaultNamespace)
 
 	// set default VLAN range

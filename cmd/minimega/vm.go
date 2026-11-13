@@ -146,7 +146,7 @@ var vmInfo = []string{
 	// kvm fields
 	"vcpus", "disks", "snapshot", "initrd", "kernel", "cdrom", "save",
 	"append", "serial-ports", "virtio-ports", "vnc_port", "usb-use-xhci",
-	"tpm-socket", "bidirectional-copy-paste",
+	"tpm-socket", "bidirectional-copy-paste", "vga",
 	// android fields
 	"android_avd", "android_console_port", "android_adb_port", "android_serial",
 	"android_grpc_port",
@@ -408,6 +408,8 @@ func (vm *BaseVM) addBond(bond *BondConfig) error {
 	if bond.QinQ {
 		br.SetTapQinQ(bond.Name, bond.VLAN)
 	}
+
+	bond.Created = true
 
 	return nil
 }
@@ -750,6 +752,8 @@ func (vm *BaseVM) networkConnect(pos, vlan int, bridge string) error {
 	if err := dst.AddTap(nic.Tap, nic.MAC, vlan, false); err != nil {
 		return err
 	}
+
+	dst.SetTapOwner(nic.Tap, vm.Namespace, vm.Name)
 
 	// Record updates to the VM config
 	nic.Alias = ""

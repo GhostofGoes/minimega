@@ -31,7 +31,11 @@ With no arguments, "namespace" prints summary info about namespaces:
 - active : active or not
 
 When a namespace is specified, it changes the active namespace or runs a single
-command in the different namespace.`,
+command in the different namespace.
+
+Namespace names may only contain letters, numbers, hyphens, underscores, and
+periods. The names "." and ".." are rejected because the namespace name is used
+as a directory name.`,
 		Patterns: []string{
 			"namespace [name]",
 			"namespace <name> (command)",
@@ -148,15 +152,12 @@ func cliNamespace(c *minicli.Command, respChan chan<- minicli.Responses) {
 	resp := &minicli.Response{Host: hostname}
 
 	if name, ok := c.StringArgs["name"]; ok {
-		// check the name is sane
-		if !validName.MatchString(name) {
-			resp.Error = validNameErr.Error()
+		// validates the name and creates the namespace if it is new
+		if _, err := GetOrCreateNamespace(name); err != nil {
+			resp.Error = err.Error()
 			respChan <- minicli.Responses{resp}
 			return
 		}
-
-		// validates the name and creates the namespace if it is new
-		GetOrCreateNamespace(name)
 
 		if c.Subcommand != nil {
 			// Tag the subcommand (rather than switching the active namespace
@@ -227,19 +228,24 @@ func cliNamespaceAddHost(ns *Namespace, c *minicli.Command, resp *minicli.Respon
 		peers[peer] = true
 	}
 
+	ns.configLock.Lock()
+	defer ns.configLock.Unlock()
+
 	// Test that the host is actually in the mesh. If it's not, we could
 	// try to mesh dial it... Returning an error is simpler, for now.
 	for i := range hosts {
 		// Add all the peers if we see a wildcard
 		if hosts[i] == Wildcard {
-			var added []string
+			var all, added []string
 			for peer := range peers {
 				if !ns.Hosts[peer] {
 					added = append(added, peer)
 				}
 				ns.Hosts[peer] = true
+				all = append(all, peer)
 			}
 
+			nsCaptureAddHosts(ns, all)
 			return ns.sendCCAutoUpdate(added)
 		}
 
@@ -263,6 +269,7 @@ func cliNamespaceAddHost(ns *Namespace, c *minicli.Command, resp *minicli.Respon
 		ns.Hosts[host] = true
 	}
 
+	nsCaptureAddHosts(ns, hosts)
 	return ns.sendCCAutoUpdate(added)
 }
 
@@ -287,6 +294,9 @@ func cliNamespaceDelHost(ns *Namespace, c *minicli.Command, resp *minicli.Respon
 	if err != nil {
 		return fmt.Errorf("invalid hosts -- %v", err)
 	}
+
+	ns.configLock.Lock()
+	defer ns.configLock.Unlock()
 
 	for _, host := range hosts {
 		if host == Wildcard {
@@ -321,7 +331,7 @@ func cliNamespaceLoad(ns *Namespace, c *minicli.Command, resp *minicli.Response)
 func cliNamespaceQueue(ns *Namespace, c *minicli.Command, resp *minicli.Response) error {
 	var buf bytes.Buffer
 
-	for _, q := range ns.queue {
+	for _, q := range ns.queued() {
 		var names []string
 		for _, n := range q.Names {
 			if n != "" {
@@ -348,7 +358,7 @@ func cliNamespaceQueueing(ns *Namespace, c *minicli.Command, resp *minicli.Respo
 	if c.BoolArgs["true"] || c.BoolArgs["false"] {
 		ns.QueueVMs = c.BoolArgs["true"]
 
-		if len(ns.queue) > 0 {
+		if len(ns.queued()) > 0 {
 			log.Warn("queueing behavior changed when VMs already queued")
 		}
 	} else {
@@ -359,7 +369,10 @@ func cliNamespaceQueueing(ns *Namespace, c *minicli.Command, resp *minicli.Respo
 }
 
 func cliNamespaceFlush(ns *Namespace, c *minicli.Command, resp *minicli.Response) error {
-	ns.queue = nil
+	ns.configLock.Lock()
+	defer ns.configLock.Unlock()
+
+	ns.clearQueue()
 	return nil
 }
 
@@ -522,7 +535,11 @@ func cliNamespaceDelBridge(ns *Namespace, c *minicli.Command, resp *minicli.Resp
 }
 
 func cliNamespaceSave(c *minicli.Command, respChan chan<- minicli.Responses) {
-	ns := resolveNamespace(c)
+	ns, err := resolveNamespace(c)
+	if err != nil {
+		respChan <- errResp(err)
+		return
+	}
 
 	resp := &minicli.Response{Host: hostname}
 
@@ -594,7 +611,11 @@ func cliClearNamespace(c *minicli.Command, respChan chan<- minicli.Responses) {
 
 	// clean up any bridges that we created
 	if c.Source == "" {
-		ns := GetOrCreateNamespace(name)
+		ns, err := GetOrCreateNamespace(name)
+		if err != nil {
+			respChan <- errResp(err)
+			return
+		}
 
 		cmds := []*minicli.Command{}
 
@@ -669,7 +690,11 @@ func cliNamespaceRun(c *minicli.Command, respChan chan<- minicli.Responses) {
 		}
 	}
 
-	ns := resolveNamespace(c)
+	ns, err := resolveNamespace(c)
+	if err != nil {
+		respChan <- errResp(err)
+		return
+	}
 
 	res := minicli.Responses{}
 

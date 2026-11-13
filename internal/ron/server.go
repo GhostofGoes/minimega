@@ -79,6 +79,11 @@ type Server struct {
 
 	handlerDone chan struct{} // closed when responseHandler returns
 
+	stopReaper chan struct{} // closed by Destroy to stop clientReaper
+
+	reaperRate   time.Duration // how often clientReaper checks for expired clients
+	clientExpiry time.Duration // how long a client can go without a check-in
+
 	plumber *miniplumber.Plumber
 
 	// set to non-zero value by Server.Destroy
@@ -88,6 +93,12 @@ type Server struct {
 // NewServer creates a ron server. Must call Listen* to actually allow ron to
 // start accepting connections from clients.
 func NewServer(path, subpath string, plumber *miniplumber.Plumber) (*Server, error) {
+	return newServer(path, subpath, plumber, REAPER_RATE*time.Second, CLIENT_EXPIRED*time.Second)
+}
+
+// newServer creates a ron server that checks for expired clients every
+// reaperRate and expires clients that do not check in within clientExpiry.
+func newServer(path, subpath string, plumber *miniplumber.Plumber, reaperRate, clientExpiry time.Duration) (*Server, error) {
 	s := &Server{
 		UseVMs:        true,
 		conns:         make(map[string]net.Conn),
@@ -100,6 +111,9 @@ func NewServer(path, subpath string, plumber *miniplumber.Plumber) (*Server, err
 		lastBroadcast: time.Now(),
 		responses:     make(chan *Client, 1024),
 		handlerDone:   make(chan struct{}),
+		stopReaper:    make(chan struct{}),
+		reaperRate:    reaperRate,
+		clientExpiry:  clientExpiry,
 		plumber:       plumber,
 	}
 
@@ -132,12 +146,15 @@ func (s *Server) AutoUpdate() bool {
 }
 
 func (s *Server) Destroy() {
-	if s.destroyed() {
+	if !atomic.CompareAndSwapUint64(&s.isdestroyed, 0, 1) {
 		// already been destroyed once before
 		return
 	}
 
-	s.setDestroyed()
+	// keep reaping while Destroy waits, so that silent clients expire
+	if s.stopReaper != nil {
+		defer close(s.stopReaper)
+	}
 
 	// close all the serial connections
 	s.connsLock.Lock()
@@ -355,7 +372,7 @@ func (s *Server) DialSerial(path, uuid string) error {
 			// This blocks, but will return on a loss of connection to the client.
 			s.clientHandler(cli)
 
-			log.Info("client handler for %s completed", path)
+			log.Debug("client handler for %s completed", path)
 		}
 	}()
 
@@ -761,14 +778,14 @@ func (s *Server) DeleteResponses(prefix string) error {
 // ClearResponses deletes all responses received so far. It may not affect
 // responses that are still in-flight.
 func (s *Server) ClearResponses() error {
-	log.Info("clearing responses")
+	log.Debug("clearing responses")
 
 	// grab the client lock so that no more responses can be processed until
 	// we're finished.
 	s.clientLock.Lock()
 	defer s.clientLock.Unlock()
 
-	log.Info("cleared responses")
+	log.Debug("cleared responses")
 
 	return os.RemoveAll(s.responsePath(nil))
 }
@@ -780,15 +797,23 @@ func (s *Server) RegisterVM(vm VM) {
 	s.vms[vm.GetUUID()] = vm
 }
 
+// UnregisterVM removes the VM and clears its cc_active state. Do not call it
+// while the VM lock is held: SetCCActive takes that lock.
 func (s *Server) UnregisterVM(vm VM) {
 	s.clientLock.Lock()
 	defer s.clientLock.Unlock()
 
 	delete(s.vms, vm.GetUUID())
+	vm.SetCCActive(false)
 }
 
-func (s *Server) setDestroyed() {
-	atomic.StoreUint64(&s.isdestroyed, 1)
+// setCCActive sets cc_active on the VM registered for uuid, if there is one.
+// uuid is the key in s.clients, which handshake set to the s.vms key. Caller
+// must hold clientLock.
+func (s *Server) setCCActive(uuid string, active bool) {
+	if vm, ok := s.vms[uuid]; ok {
+		vm.SetCCActive(active)
+	}
 }
 
 func (s *Server) destroyed() bool {
@@ -846,7 +871,7 @@ func (s *Server) serve(addr string, ln net.Listener) {
 
 		remote := conn.RemoteAddr()
 
-		log.Info("client connected: %v -> %v", remote, addr)
+		log.Debug("client connected: %v -> %v", remote, addr)
 		c, err := s.handshake(conn, "")
 		if err != nil {
 			if err != io.EOF {
@@ -941,7 +966,7 @@ func (s *Server) handshake(conn net.Conn, expectedUUID string) (*client, error) 
 	}
 
 	if majorVersion(m.Version) > 0 {
-		log.Info("starting heartbeat to client %s", m.Client.UUID)
+		log.Debug("starting heartbeat to client %s", m.Client.UUID)
 
 		// Only send heartbeats to client if message version is present to prevent
 		// older clients from failing against this version of the server (sending a
@@ -988,6 +1013,7 @@ func (s *Server) handshake(conn net.Conn, expectedUUID string) (*client, error) 
 	c.checkin = time.Now()
 
 	s.clients[c.UUID] = c
+	s.setCCActive(c.UUID, true)
 
 	if update != "" {
 		s.startUpdate(c, update)
@@ -1016,7 +1042,7 @@ func bindClientUUID(m *Message, expectedUUID string) error {
 // client and transport handler for connections.
 func (s *Server) clientHandler(c *client) {
 	defer c.conn.Close()
-	defer s.removeClient(c.UUID)
+	defer s.removeClient(c)
 
 	// Set up minitunnel, dialing the server that should be running on the
 	// client's side. Data is Trunk'd via Messages.
@@ -1122,18 +1148,23 @@ func (s *Server) addClient(c *client) error {
 		return fmt.Errorf("client %v already exists!", c.UUID)
 	}
 	s.clients[c.UUID] = c
+	s.setCCActive(c.UUID, true)
 
 	return nil
 }
 
 // removeClient conditionally remove client from the client list, closing
-// connections if possible.
-func (s *Server) removeClient(uuid string) {
-	log.Debug("removeClient: %v", uuid)
-
+// connections if possible. It does nothing if the client list has a different
+// client for the same UUID, for example after the client reconnected.
+func (s *Server) removeClient(c *client) {
 	s.clientLock.Lock()
 	defer s.clientLock.Unlock()
-	if c, ok := s.clients[uuid]; ok {
+
+	// updateClient replaces c.Client while it holds clientLock
+	uuid := c.UUID
+	log.Debug("removeClient: %v", uuid)
+
+	if s.clients[uuid] == c {
 		c.conn.Close()
 
 		// with the client conn closed, close any lingering plumbing
@@ -1150,6 +1181,7 @@ func (s *Server) removeClient(uuid string) {
 		close(c.cancelHeartbeat)
 
 		delete(s.clients, uuid)
+		s.setCCActive(uuid, false)
 	}
 }
 
@@ -1265,32 +1297,21 @@ func (s *Server) route(m *Message) {
 		}
 
 		if c.maxCommandID == maxCommandID {
-			log.Info("no commands for %v", uuid)
+			log.Debug("no commands for %v", uuid)
 			return
 		}
 
 		if m.Type == MESSAGE_COMMAND {
 			if s.UseVMs {
-				vm, ok := s.vms[uuid]
-				if !ok {
+				filters := make([]*Filter, 0, len(m.Commands))
+				for _, cmd := range m.Commands {
+					filters = append(filters, cmd.Filter)
+				}
+
+				if !s.loadVMTags(uuid, c, filters) {
 					// odd, someone must have unregistered the client...
 					log.Error("unregistered client %v", uuid)
 					return
-				}
-				// update client's tags in case we're matching based on them
-				c.Tags = vm.GetTags()
-
-				// load the relevant info fields, overriding any tag values
-				for _, cmd := range m.Commands {
-					if cmd.Filter != nil && cmd.Filter.Tags != nil {
-						for k := range cmd.Filter.Tags {
-							// only replace non-zero fields
-							v, _ := vm.Info(k)
-							if v != "" {
-								c.Tags[k] = v
-							}
-						}
-					}
 				}
 			}
 
@@ -1307,7 +1328,7 @@ func (s *Server) route(m *Message) {
 
 			if len(m2.Commands) == 0 {
 				c.maxCommandID = maxCommandID
-				log.Info("no commands for %v", uuid)
+				log.Debug("no commands for %v", uuid)
 				return
 			}
 
@@ -1369,6 +1390,33 @@ func (s *Server) route(m *Message) {
 	}
 
 	wg.Wait()
+}
+
+// loadVMTags sets c.Tags from the tags of the VM registered for uuid, then
+// overrides each key in the Tags of filters with the non-empty VM info field of
+// the same name, so that c.Matches can match on them. It returns false when no
+// VM is registered for uuid. The caller must hold clientLock.
+func (s *Server) loadVMTags(uuid string, c *client, filters []*Filter) bool {
+	vm, ok := s.vms[uuid]
+	if !ok {
+		return false
+	}
+
+	c.Tags = vm.GetTags()
+
+	for _, f := range filters {
+		if f == nil || f.Tags == nil {
+			continue
+		}
+
+		for k := range f.Tags {
+			if v, _ := vm.Info(k); v != "" {
+				c.Tags[k] = v
+			}
+		}
+	}
+
+	return true
 }
 
 // process responses, writing files when necessary
@@ -1434,7 +1482,7 @@ func (s *Server) updateClient(cin *Client) {
 		// the client probably disconnected between sending the heartbeat and
 		// us processing it. We'll still process any command responses but
 		// shouldn't try to update the client itself.
-		log.Info("unknown client %v", cin.UUID)
+		log.Debug("unknown client %v", cin.UUID)
 		return
 	}
 
@@ -1448,7 +1496,7 @@ func (s *Server) updateClient(cin *Client) {
 	vm, ok := s.vms[cin.UUID]
 	if !ok {
 		// see above but for the VM.
-		log.Info("unregistered client %v", cin.UUID)
+		log.Debug("unregistered client %v", cin.UUID)
 		return
 	}
 
@@ -1473,32 +1521,41 @@ func (s *Server) commandCheckIn(id int, uuid string) {
 
 // clientReaper periodically flushes old entries from the client list
 func (s *Server) clientReaper() {
+	ticker := time.NewTicker(s.reaperRate)
+	defer ticker.Stop()
+
 	for {
-		if s.destroyed() {
+		select {
+		case <-s.stopReaper:
 			log.Debug("reaping client reaper")
 			return
+		case <-ticker.C:
 		}
 
-		time.Sleep(time.Duration(REAPER_RATE) * time.Second)
+		s.reapClients()
+	}
+}
 
-		s.clientLock.Lock()
-		for k, v := range s.clients {
-			// checked in more recently than expiration time
-			active := time.Now().Sub(v.checkin) < CLIENT_EXPIRED*time.Second
+// reapClients removes the clients that did not check in during the last
+// CLIENT_EXPIRED seconds. It sets cc_active to false for the VMs of these
+// clients and to true for the VMs of all other clients.
+func (s *Server) reapClients() {
+	s.clientLock.Lock()
+	defer s.clientLock.Unlock()
 
-			if !active {
-				log.Debug("client %v expired", k)
-				// the same as removeClient except we already hold clientLock
-				v.conn.Close()
-				close(v.cancelHeartbeat)
-				delete(s.clients, k)
-			}
+	for k, v := range s.clients {
+		// checked in more recently than expiration time
+		active := time.Now().Sub(v.checkin) < s.clientExpiry
 
-			if vm, ok := s.vms[k]; ok {
-				vm.SetCCActive(active)
-			}
+		if !active {
+			log.Debug("client %v expired", k)
+			// the same as removeClient except we already hold clientLock
+			v.conn.Close()
+			close(v.cancelHeartbeat)
+			delete(s.clients, k)
 		}
-		s.clientLock.Unlock()
+
+		s.setCCActive(k, active)
 	}
 }
 

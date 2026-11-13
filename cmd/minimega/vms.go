@@ -24,7 +24,22 @@ import (
 type VMs struct {
 	m  map[int]VM
 	mu sync.Mutex
+
+	// stopVNC, if set, stops the VNC recordings, playback, and pastes of the
+	// named VM. Kill calls it for each VM that it kills, and Flush and
+	// FlushAll for each VM that they delete. A KVM VM also calls it when QEMU
+	// exits.
+	stopVNC func(name string)
+
+	// pending holds the VMs that Launch has reserved and is launching, keyed
+	// by ID. Each one moves to m when its Launch returns.
+	pending     map[int]VM
+	pendingNICs int
+	launched    *sync.Cond // broadcast when a VM leaves pending
 }
+
+// newVM creates the VMs that Launch launches. Tests replace it.
+var newVM = NewVM
 
 // vmApplyFunc is passed into VMs.apply
 type vmApplyFunc func(VM, bool) (bool, error)
@@ -75,12 +90,12 @@ func (q QueuedVMs) GetFiles(updatee string) error {
 	return nil
 }
 
-// Count of launched VMs.
+// Count of launched VMs, including the VMs that are launching.
 func (vms *VMs) Count() int {
 	vms.mu.Lock()
 	defer vms.mu.Unlock()
 
-	return len(vms.m)
+	return len(vms.m) + len(vms.pending)
 }
 
 func (vms *VMs) CountTypeState(t VMType, mask VMState) int {
@@ -95,6 +110,15 @@ func (vms *VMs) CountTypeState(t VMType, mask VMState) int {
 		}
 	}
 
+	// A launching VM holds its lock, so do not call GetState on it.
+	if mask&VM_BUILDING != 0 {
+		for _, vm := range vms.pending {
+			if vm.GetType() == t {
+				count++
+			}
+		}
+	}
+
 	return count
 }
 
@@ -106,13 +130,20 @@ func (vms *VMs) Limit() int {
 	// assume unlimited
 	limit := -1
 
-	for _, vm := range vms.m {
+	update := func(vm VM) {
 		// update if limit is unlimited or we're not unlimited and we're less
 		// than the previous limit
 		v := vm.GetCoschedule()
 		if limit == -1 || (v != -1 && v < limit) {
 			limit = v
 		}
+	}
+
+	for _, vm := range vms.m {
+		update(vm)
+	}
+	for _, vm := range vms.pending {
+		update(vm)
 	}
 
 	return limit
@@ -125,12 +156,17 @@ func (vms *VMs) Commit() (uint64, uint64, int) {
 
 	cpu := uint64(0)
 	mem := uint64(0)
-	net := 0
+	net := vms.pendingNICs
 
 	for _, vm := range vms.m {
 		cpu += vm.GetCPUs()
 		mem += vm.GetMem()
 		net += len(vm.GetNetworks())
+	}
+
+	for _, vm := range vms.pending {
+		cpu += vm.GetCPUs()
+		mem += vm.GetMem()
 	}
 
 	return cpu, mem, net
@@ -271,45 +307,58 @@ func (vms *VMs) Launch(requestor, namespace string, q *QueuedVMs) <-chan error {
 
 		// prefetch any files associated with VMs
 		if err := q.GetFiles(requestor); err != nil {
-			errs <- err
+			errs <- launchBatchError{err}
 			return
 		}
-
-		vms.mu.Lock()
-		defer vms.mu.Unlock()
-
-		var wg sync.WaitGroup
 
 		log.Info("launching %v %v vms", len(q.Names), q.VMType)
 		start := time.Now()
 
+		nics := len(q.Networks)
+
+		// Hold vms.mu only to create the VMs and to reserve their names and
+		// IDs. The launches run without it.
+		var reserved []VM
+		var failed []error
+
+		vms.mu.Lock()
 		for _, name := range q.Names {
 			// Create new VM and test it for conflicts against other VMs.
-			vm, err := NewVM(name, namespace, q.VMType, q.VMConfig)
+			vm, err := newVM(name, namespace, q.VMType, q.VMConfig)
 			if err == nil {
-				for _, vm2 := range vms.m {
-					if err = vm2.Conflicts(vm); err != nil {
-						break
-					}
-				}
+				err = vms.conflicts(vm)
 			}
 
 			if err != nil {
-				errs <- err
+				failed = append(failed, err)
 				continue
 			}
 
-			// Add the newly created VM to the map so that it gets included in
-			// future conflict tests.
-			vms.m[vm.GetID()] = vm
+			// Reserve the VM so that it gets included in future conflict tests.
+			if vms.pending == nil {
+				vms.pending = map[int]VM{}
+			}
+			vms.pending[vm.GetID()] = vm
+			vms.pendingNICs += nics
 
-			// The actual launching can happen in parallel while we keep checking
-			// for conflicts.
+			vms.hookExit(vm)
+
+			reserved = append(reserved, vm)
+		}
+		vms.mu.Unlock()
+
+		for _, err := range failed {
+			errs <- err
+		}
+
+		var wg sync.WaitGroup
+
+		for _, vm := range reserved {
 			wg.Add(1)
-			go func(name string) {
+			go func(vm VM) {
 				defer wg.Done()
+				defer vms.finishLaunch(vm, nics)
 
-				// Note: the VM is already in the VMs map
 				if err := vm.Launch(); err != nil {
 					errs <- err
 					return
@@ -319,7 +368,7 @@ func (vms *VMs) Launch(requestor, namespace string, q *QueuedVMs) <-chan error {
 					errs <- err
 					return
 				}
-			}(name)
+			}(vm)
 		}
 
 		wg.Wait()
@@ -329,6 +378,62 @@ func (vms *VMs) Launch(requestor, namespace string, q *QueuedVMs) <-chan error {
 	}()
 
 	return errs
+}
+
+// conflicts tests vm for conflicts against the launched and the launching
+// VMs. Assumes vms.mu is held.
+func (vms *VMs) conflicts(vm VM) error {
+	for _, vm2 := range vms.m {
+		if err := vm2.Conflicts(vm); err != nil {
+			return err
+		}
+	}
+
+	for _, vm2 := range vms.pending {
+		if err := vm2.Conflicts(vm); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// finishLaunch moves vm from pending to the launched VMs, whether or not its
+// Launch succeeded.
+func (vms *VMs) finishLaunch(vm VM, nics int) {
+	vms.mu.Lock()
+	defer vms.mu.Unlock()
+
+	delete(vms.pending, vm.GetID())
+	vms.pendingNICs -= nics
+	vms.m[vm.GetID()] = vm
+
+	vms.launchedCond().Broadcast()
+}
+
+// launchedCond returns the condition that finishLaunch broadcasts. Assumes
+// vms.mu is held.
+func (vms *VMs) launchedCond() *sync.Cond {
+	if vms.launched == nil {
+		vms.launched = sync.NewCond(&vms.mu)
+	}
+
+	return vms.launched
+}
+
+// waitLaunches waits until no VM is launching. Assumes vms.mu is held.
+func (vms *VMs) waitLaunches() {
+	for len(vms.pending) > 0 {
+		vms.launchedCond().Wait()
+	}
+}
+
+// WaitLaunches waits until the VMs that are launching are in the VMs map.
+func (vms *VMs) WaitLaunches() {
+	vms.mu.Lock()
+	defer vms.mu.Unlock()
+
+	vms.waitLaunches()
 }
 
 // Stop VMs matching target.
@@ -354,15 +459,35 @@ func (vms *VMs) Kill(target string) error {
 			return true, err
 		}
 
+		vms.vmEnded(vm)
+
 		return true, nil
 	})
 }
 
-// Flush VMs matching target.
+// hookExit makes a KVM VM stop its VNC recordings, playback, and pastes when
+// QEMU exits. Call it for each VM that Launch creates or recovery finds.
+func (vms *VMs) hookExit(vm VM) {
+	if kvm, ok := vm.(*KvmVM); ok {
+		kvm.onExit = vms.stopVNC
+	}
+}
+
+// vmEnded stops the VNC recordings, playback, and pastes of vm.
+func (vms *VMs) vmEnded(vm VM) {
+	if vms.stopVNC != nil {
+		vms.stopVNC(vm.GetName())
+	}
+}
+
+// Flush VMs matching target. Flush destroys the taps of the VMs before it
+// returns.
 func (vms *VMs) Flush(target string, cc *ron.Server) error {
 	var mapLock sync.Mutex
+	var flushed []int
 
-	return vms.Apply(target, func(vm VM, _ bool) (bool, error) {
+	vms.mu.Lock()
+	errs := vms.apply(target, func(vm VM, _ bool) (bool, error) {
 		if vm.GetState()&(VM_QUIT|VM_ERROR) == 0 {
 			return false, nil
 		}
@@ -379,23 +504,51 @@ func (vms *VMs) Flush(target string, cc *ron.Server) error {
 			return true, err
 		}
 
+		vms.vmEnded(vm)
+
 		mapLock.Lock()
 		defer mapLock.Unlock()
 
-		delete(vms.m, vm.GetID())
+		flushed = append(flushed, vm.GetID())
 
 		return true, nil
 	})
+
+	// apply iterates over vms.m, so delete after it returns
+	for _, id := range flushed {
+		delete(vms.m, id)
+	}
+	vms.mu.Unlock()
+
+	// destroy the taps of all the flushed VMs in one pass of the reaper
+	reapTaps()
+
+	return makeErrSlice(errs)
 }
 
 // FlushAll deletes VMs that are in the QUIT or ERROR state, disconnecting them
-// from the provided ron.Server first.
+// from the provided ron.Server first. It waits for running launches first, so
+// that it also deletes the VMs whose launch failed. FlushAll destroys the taps
+// of the VMs before it returns.
 func (vms *VMs) FlushAll(cc *ron.Server) error {
+	vms.flushAll(cc)
+
+	// destroy the taps of all the flushed VMs in one pass of the reaper
+	reapTaps()
+
+	return nil
+}
+
+// flushAll deletes VMs like FlushAll but leaves their taps for the reaper.
+func (vms *VMs) flushAll(cc *ron.Server) {
 	vms.mu.Lock()
 	defer vms.mu.Unlock()
 
+	vms.waitLaunches()
+
 	var wg sync.WaitGroup
 	var mapLock sync.Mutex
+	var flushed []int
 
 	for i, vm := range vms.m {
 		if vm.GetState()&(VM_QUIT|VM_ERROR) != 0 {
@@ -412,16 +565,20 @@ func (vms *VMs) FlushAll(cc *ron.Server) error {
 					log.Error("clogged vm %v: %v", vm.GetID(), err)
 				}
 
+				vms.vmEnded(vm)
+
 				mapLock.Lock()
 				defer mapLock.Unlock()
-				delete(vms.m, i)
+				flushed = append(flushed, i)
 				wg.Done()
 			}(i, vm)
 		}
 	}
 	wg.Wait()
 
-	return nil
+	for _, i := range flushed {
+		delete(vms.m, i)
+	}
 }
 
 func (vms *VMs) ProcStats(d time.Duration) []*VMProcStats {
@@ -599,21 +756,60 @@ func meshageVMLauncher() {
 		go func(m *meshage.Message) {
 			cmd := m.Body.(meshageVMLaunch)
 
-			ns := GetOrCreateNamespace(cmd.Namespace)
-
-			errs := []string{}
-			for _, err := range ns.Launch(cmd.From, cmd.QueuedVMs) {
-				errs = append(errs, err.Error())
-			}
-
 			to := []string{m.Source}
-			msg := meshageVMResponse{Errors: errs, TID: cmd.TID}
+			msg := meshageVMLaunchResponse(cmd)
 
 			if _, err := meshageNode.Set(to, msg); err != nil {
 				log.Errorln(err)
 			}
 		}(m)
 	}
+}
+
+// meshageVMLaunchResponse launches the VMs in cmd and returns the response to
+// send back to the scheduler. If the namespace in cmd does not exist and its
+// name is not valid, no VMs are launched and the response contains the error.
+func meshageVMLaunchResponse(cmd meshageVMLaunch) meshageVMResponse {
+	ns, err := GetOrCreateNamespace(cmd.Namespace)
+	if err != nil {
+		log.Error("invalid namespace from mesh: %v", err)
+
+		return meshageVMResponse{Errors: []string{err.Error()}, TID: cmd.TID}
+	}
+
+	launchErrs := ns.Launch(cmd.From, cmd.QueuedVMs)
+
+	errs := []string{}
+	for _, err := range launchErrs {
+		errs = append(errs, err.Error())
+	}
+
+	return meshageVMResponse{
+		Errors:   errs,
+		Launched: launchedCount(len(cmd.QueuedVMs.Names), launchErrs),
+		TID:      cmd.TID,
+	}
+}
+
+// launchBatchError is an error that stops the launch of all the VMs of a
+// queued entry.
+type launchBatchError struct {
+	err error
+}
+
+func (e launchBatchError) Error() string { return e.err.Error() }
+func (e launchBatchError) Unwrap() error { return e.err }
+
+// launchedCount returns the number of VMs of a queued entry with total VMs that
+// launched, from the errors of the launch.
+func launchedCount(total int, errs []error) int {
+	for _, err := range errs {
+		if errors.As(err, new(launchBatchError)) {
+			return 0
+		}
+	}
+
+	return max(total-len(errs), 0)
 }
 
 // globalVMs gets the VMs from all hosts in the mesh, filtered to the current

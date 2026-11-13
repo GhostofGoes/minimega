@@ -185,8 +185,9 @@ func (b *Bridge) DestroyTap(tap string) error {
 	return b.destroyTap(tap)
 }
 
-// destroyTap cleans up the underlying device, ReapTaps will actually remove
-// the tap from the bridge and list of taps on the bridge.
+// destroyTap marks the tap as defunct. ReapTaps will actually remove the tap
+// from the bridge, destroy the underlying device, and remove the tap from the
+// list of taps on the bridge.
 func (b *Bridge) destroyTap(t string) error {
 	log.Info("destroying tap on bridge: %v %v", b.Name, t)
 
@@ -196,6 +197,8 @@ func (b *Bridge) destroyTap(t string) error {
 	}
 
 	tap.Defunct = true
+
+	b.failTapCaptures(t)
 
 	if tap.Host {
 		// Tap is managed by OVS -- calling del-port will delete it for us.
@@ -215,7 +218,9 @@ func (b *Bridge) destroyTap(t string) error {
 		}
 	}
 
-	return destroyTap(tap.Name)
+	tap.deleteLink = true
+
+	return nil
 }
 
 // RemoveTap removes a tap from the bridge but doesn't remove the underlying

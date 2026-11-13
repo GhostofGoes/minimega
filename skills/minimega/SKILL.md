@@ -102,7 +102,9 @@ inside a running cluster.
 ### Namespaces
 
 The active namespace scopes VMs, taps, captures, VLAN aliases, and other state.
-The default namespace is `minimega`.
+The default namespace is `minimega`. Namespace and VM names may only contain
+letters, numbers, hyphens, underscores, and periods; `.` and `..` are rejected
+because names are used as directory names.
 
 ```text
 namespace                         # list namespaces
@@ -154,6 +156,37 @@ When `ns queueing true` is active, `vm launch <type> <name>` queues VMs.
 Run `vm launch` with no additional arguments to flush the queue and invoke the
 scheduler.
 
+### VNC
+
+Each KVM VM has a VNC shim at the `vnc_port` column of `vm info`. Viewers,
+recordings, playbacks, and pastes each open a connection through it. QEMU
+allows 32 shared clients for each VM and closes each new connection after that.
+See `doc/content/articles/vnc.md`.
+
+- **Copy and paste.** `vm config bidirectional-copy-paste` selects the mode.
+  With `false` (the default), the shim types client clipboard text as key
+  events: printable ASCII, Tab, and Enter only, paced 10 ms for each key event,
+  in order for each VM. `vnc type` uses the same path. That is approximately
+  50 characters each second (25 with Shift), a maximum of 65,536 characters
+  for each text, and a maximum of 8 texts that wait for each VM ("paste queue
+  full"). Keys typed during a paste mix with it. With `true`, the text
+  goes to QEMU `qemu-vdagent` (UTF-8, both directions). This mode needs QEMU
+  6.1 or later and `spice-vdagent` in the guest.
+- **Recording.** `vnc record kb|fb <vm> <file>` writes on the VM host; a
+  relative path is under `-filepath`. Recordings stop on `vnc stop`, VM kill,
+  flush, or guest shutdown. kb files keep keysyms only: QEMU extended key events become
+  `KeyEvent` lines, and pointer masks have 9 bits. Playback sends keysyms
+  through QEMU's `en-us` keymap and drops the Back and Forward bits (128, 256).
+  A text paste or `vnc type` and a `vnc play` cannot run on one VM at the same
+  time ("already playing").
+- **Keyboard layout.** minimega does not pass `-k` to QEMU. For QEMU extended
+  key events (noVNC sends them), the guest layout decides the character from
+  the key position. `vm config qemu-append -k en-us` gives keysym translation
+  instead.
+- **Resize.** A client can change the guest screen size only with
+  `vm config vga virtio`. The `vga` column of `vm info` shows the card. fb
+  recordings follow a guest resize.
+
 ## Command usage and integration
 
 - Run `help` for command groups and `help <command>` for exact syntax. Treat
@@ -183,6 +216,7 @@ host name                          # inspect local host
 mesh status                        # inspect cluster connectivity
 vm info                            # inspect VMs
 vlans                              # inspect allocated VLANs
+vlans blacklist                    # inspect blacklisted VLANs
 file list                          # inspect iomeshage files
 cc clients                         # inspect miniccc clients and capabilities
 cc auto-update [true,false]        # show or set miniccc auto-update per namespace
@@ -213,6 +247,15 @@ Consult command help before mutating state; subcommand requirements evolve.
   limits each host to 64 active Android VMs, or fewer when ports are occupied.
 - **Namespace deletion is destructive.** It kills VMs and removes namespace
   captures, VLAN aliases, and taps.
+- **Remove one blacklisted VLAN with `clear vlans blacklist <vlan>`.** Do not
+  use `clear vlans all` for this; it clears every alias in every namespace.
+  The command fails if the VLAN is not blacklisted or in use. It checks VMs on
+  this node and all namespace hosts, but VM configs, queued or launching VMs,
+  and host taps on this node only. It also fails if a namespace host does not
+  return its VMs; remove hosts that left the mesh with `ns del-hosts`. It
+  cannot stop commands on other hosts. Without a VLAN ID, `clear vlans
+  blacklist` clears aliases that start with `blacklist`. The blacklist is local
+  to each node.
 - **Most functional operations alter the host.** Use an isolated Linux system
   for privileged tests involving KVM, Open vSwitch, taps, mounts, or cgroups.
 - **`cc auto-update` updates only capable clients.** A client gets an update
@@ -224,6 +267,23 @@ Consult command help before mutating state; subcommand requirements evolve.
   holds commands for an updating client for up to two minutes. The update
   kills the `cc background` processes of the client. A read-only folder for the
   miniccc binary keeps a fixed version.
+- **Packet captures have IDs, states, and counters.** `capture` lists the ID,
+  state (`running`, `failed`, or `full`), packets, kernel drops, and file size
+  of each pcap capture, with `path` as the last column. A failed or full capture
+  stays in the list until `capture pcap delete id <id>`. `clear capture pcap`
+  stops only pcap captures. Give `snaplen=`, `filter=`, `maxsize=`,
+  `format=pcap|pcapng`, and (VM only) `direction=` after the file name instead of changing the namespace
+  settings around one capture.
+- **Namespace captures run on the head.** `capture pcap namespace <file>`
+  merges the edge traffic of every namespace host into one file on the node
+  that runs it and returns an ID. List with `capture pcap namespace` and stop
+  with `capture pcap delete namespace <id|file|all>` on that same node; plain
+  `capture` does not list them. Every mesh node, relays included, must support
+  it, or the start fails.
+- **A bridge has at most 32 working mirrors.** Open vSwitch silently ignores
+  more. Tap mirrors and captures share them; minimega refuses a new mirror at
+  32. `bridge mirrors` lists every Mirror row with its owner namespace and
+  kind, also rows that minimega did not make (`external`).
 - **Do not parse default tables by column position.** Select columns explicitly
   because command output is also consumed by phēnix, FIREWHEEL, and scripts.
 
@@ -247,6 +307,8 @@ Repository paths, relative to the minimega repository root:
   operation, and logging.
 - `doc/content/articles/namespaces.md`: namespace scheduling.
 - `doc/content/articles/vmtypes.md`: KVM and container behavior.
+- `doc/content/articles/vnc.md`: VNC recording, playback, typing, and copy and
+  paste.
 - `docker/README.md`: container operation and configuration.
 
 External:
