@@ -214,7 +214,7 @@ enabled by default in linux 3.18+.
 When launching `container` type VMs, the following occurs, in order:
 
 - A new VM handler is created within minimega, which is populated with a copy of the VM configuration
-- If this is the first container to be launched, minimega cgroup subtrees will be created for the freezer, memory, and devices cgroup subsystems.
+- If this is the first container to be launched, minimega cgroup subtrees will be created for the freezer, memory, devices, and cpu cgroup subsystems (cgroup v1), or one `minimega` cgroup with the `cpu` and `memory` controllers (cgroup v2).
 - If this is a new container, checks are performed to ensure there are no networking or disk conflicts
 - An instance directory and container configuration are written to disk (by default /tmp/minimega/N, where N is the VM ID)
 - If the VM is in snapshot mode, an `overlayfs` mountpoint is created within the instance directory
@@ -243,6 +243,44 @@ When the container shim is launched in a new set of namespaces, the following oc
 
 #### Notes
 
+minimega supports cgroup v1 and cgroup v2, and uses the one that is mounted at
+the path of the `-cgroup` flag (`/sys/fs/cgroup` by default).
+
+**cgroup v2**
+
+Current linux distributions mount cgroup v2 (the unified hierarchy) by
+default. minimega creates a `minimega` cgroup in the `-cgroup` path, and one
+cgroup for each container in it. It sets `memory.max` and `cpu.max` from the
+`memory` and `vcpus` of the container, pauses the container with
+`cgroup.freeze`, and attaches an eBPF program to the cgroup that permits the
+same devices as the `devices` subsystem of cgroup v1 does.
+
+minimega requires:
+
+- linux 5.2 or newer
+- the `cpu` and `memory` controllers in `cgroup.controllers` of the `-cgroup`
+  path
+- no processes in the cgroup at the `-cgroup` path, unless it is the root
+  cgroup. cgroup v2 does not give controllers to the children of a cgroup that
+  holds processes.
+
+minimega runs in the root cgroup namespace when it is started on the host or by
+systemd, so the default `-cgroup` path works. A container engine such as Docker
+gives minimega a cgroup of its own, and the processes in it must first move to
+a child cgroup. The minimega Docker image does this when it starts.
+
+minimega enables the `cpu` and `memory` controllers for the children of the
+`-cgroup` path if they are not enabled there, and does not disable them again.
+
+The cgroup of a container is below the `-cgroup` path, not below the cgroup of
+minimega itself. A service manager that stops every process in the cgroup of a
+service, as systemd does, therefore does not stop the containers. minimega
+kills its containers when it exits. After a crash they keep running until the
+`nuke` command kills them, and minimega does not launch a container whose
+cgroup still has processes.
+
+**cgroup v1**
+
 Many linux distributions explicitly disable the `memory` cgroup, which is
 required for minimega to boot `container` type VMs. On debian based linux hosts
 (including ubuntu), add
@@ -264,9 +302,11 @@ mount -t tmpfs cgroup /sys/fs/cgroup
 mkdir /sys/fs/cgroup/memory
 mkdir /sys/fs/cgroup/freezer
 mkdir /sys/fs/cgroup/devices
+mkdir /sys/fs/cgroup/cpu
 mount -t cgroup cgroup -o memory /sys/fs/cgroup/memory
 mount -t cgroup cgroup -o freezer /sys/fs/cgroup/freezer
 mount -t cgroup cgroup -o devices /sys/fs/cgroup/devices
+mount -t cgroup cgroup -o cpu /sys/fs/cgroup/cpu
 ```
 
 <a id="TOC_4.3."></a>

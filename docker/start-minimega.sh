@@ -84,10 +84,46 @@ shutdown() {
   cleanup_stale_minimega_state
 }
 
+# Let minimega create cgroups for containers on a cgroup v2 host. Docker starts
+# this script in the root of the container's cgroup namespace, and cgroup v2
+# only gives the CPU and memory controllers to the children of a cgroup that
+# holds no processes. Move every process to a child cgroup and enable the
+# controllers. `docker exec` then puts its processes in that child cgroup too.
+setup_cgroup2() {
+  # Nothing to do on cgroup v1, or in the root cgroup of the host (--cgroupns host).
+  if [[ ! -f "${MM_CGROUP}/cgroup.controllers" || ! -f "${MM_CGROUP}/cgroup.type" ]]; then
+    return 0
+  fi
+
+  local pid
+
+  mkdir -p "${MM_CGROUP}/init" || return 1
+  # A process that starts here during the move, such as a `docker exec`, makes
+  # the kernel refuse the controllers, so try a few times.
+  for _ in 1 2 3; do
+    # Read the whole list first, because it changes as the processes move.
+    for pid in $(<"${MM_CGROUP}/cgroup.procs"); do
+      # A process may exit before it is moved.
+      echo "${pid}" > "${MM_CGROUP}/init/cgroup.procs" 2>/dev/null || true
+    done
+
+    if echo "+cpu +memory" 2>/dev/null > "${MM_CGROUP}/cgroup.subtree_control"; then
+      return 0
+    fi
+  done
+
+  # once more, to report the error
+  echo "+cpu +memory" > "${MM_CGROUP}/cgroup.subtree_control"
+}
+
 trap shutdown EXIT
 trap 'exit 143' TERM INT
 
 cleanup_stale_minimega_state
+
+if ! setup_cgroup2; then
+  echo "unable to set up cgroup v2 in ${MM_CGROUP}, minimega will not launch containers" | tee -a ${MM_LOGFILE}
+fi
 
 # Start Open vSwitch
 /usr/share/openvswitch/scripts/ovs-ctl start ${OVS_APPEND} |& tee -a ${MM_LOGFILE}
