@@ -10,7 +10,7 @@ import (
 	"io"
 )
 
-func writeMessage(w io.Writer, msgType uint8, msg interface{}) error {
+func writeMessage(w io.Writer, msgType uint8, msg any) error {
 	if err := binary.Write(w, binary.BigEndian, &msgType); err != nil {
 		return fmt.Errorf("unable to write message type -- %s", err.Error())
 	}

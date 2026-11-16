@@ -55,7 +55,8 @@ tests/live/
   image/        vmbetter config (live.conf) and overlay for the guest kernel and initramfs
   harness/      package harness: shared helpers (socket client, cc, polling,
                 artifact parsers) and their offline unit tests
-  core/         the 22-VM test group: topology.mm, topology_test.go, live_test.go
+  core/         the 22-VM test group: topology.mm, topology_test.go, live_test.go,
+                vnc_test.go
 ```
 
 Each test group is a sub-folder holding its `topology.mm` and the Go tests
@@ -130,7 +131,8 @@ phases (screenshots, QMP, serial, ...) still run.
 | Command and control | `cc exec` (one, all, tag and column filters), `cc exitcode`, `cc send`/`recv`, `cc background`, `cc process list/kill`, `cc responses`, `cc delete` |
 | Guest view of config | SMBIOS serial from `qemu-append`, VM UUID, disk sizes per interface, snapshot isolation, Q35 vs i440FX, xHCI, SMP, NIC driver and MAC, dual-homed addressing |
 | Networking | same-LAN ping, OSPF routes, cross-router ping and traceroute, no-cc host reachable, DNS, HTTP to protonuke, firewall drop vs control, host tap (both directions), QoS delay and loss, `capture pcap` |
-| VM operations | `vm screenshot` (std and cirrus), `vm serial`, `vm qmp`, `vnc record`, `vm tag` + tag filter, `vm top`, `vm stop/start`, `vm net disconnect/connect`, `vm hotplug add/remove`, `vm save`, VM names that `vm launch` accepts or rejects, `vm kill` + `vm flush` + `vm config clone` + queued relaunch |
+| VM operations | `vm screenshot` (std and cirrus), `vm serial`, `vm qmp`, `vm tag` + tag filter, `vm top`, `vm stop/start`, `vm net disconnect/connect`, `vm hotplug add/remove`, `vm save`, VM names that `vm launch` accepts or rejects, `vm kill` + `vm flush` + `vm config clone` + queued relaunch |
+| VNC | the RFB handshake and a frame through miniweb and the VNC shim, `vnc record fb` decoded, keys typed on the `host-d3` console with QEMU extended key events, `vnc record kb` + `vnc play`, paste as keys, `vnc type`, `vnc inject` (key and `LoadFile`, with and without a playback), `vm kill` while recording and playing (entries stop, files close) |
 | Teardown | `clear namespace` removes VMs, QEMU processes, and OVS ports |
 
 Out of scope: containers, Android, bare-metal VMs, and multi-node meshes.
