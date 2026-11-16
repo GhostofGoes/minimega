@@ -62,6 +62,7 @@ tests/live/
                 artifact parsers) and their offline unit tests
   core/         the 22-VM test group: topology.mm, topology_test.go, live_test.go
   containers/   the container test group (5 containers and 1 KVM VM), same files
+  mesh/         two-node mesh group: setup.sh (peer container), topology.mm, mesh_test.go
 ```
 
 Each test group is a sub-folder holding its `topology.mm` and the Go tests
@@ -139,7 +140,7 @@ phases (screenshots, QMP, serial, ...) still run.
 | VM operations | `vm screenshot` (std and cirrus), `vm serial`, `vm qmp`, `vnc record`, `vm tag` + tag filter, `vm top`, `vm stop/start`, `vm net disconnect/connect`, `vm hotplug add/remove`, `vm save`, `vm kill` + `vm flush` + `vm config clone` + queued relaunch |
 | Teardown | `clear namespace` removes VMs, QEMU processes, and OVS ports |
 
-Out of scope: Android, bare-metal VMs, and multi-node meshes.
+Out of scope: Android and bare-metal VMs.
 
 ## Containers group
 
@@ -178,6 +179,20 @@ freezer state) and checks the device filter from inside the containers.
 | Networking | ping on a LAN, ping across the router between containers and the KVM VM, HTTP to protonuke in a container |
 | VM operations | `vm top`, `vm stop/start`, `vm kill` + `vm start`, `vm kill` + `vm flush` + `vm config clone` + queued relaunch |
 | Teardown | `clear namespace` removes VMs, processes, OVS ports, overlay mounts, network namespaces, and cgroups |
+
+## Mesh group
+
+`LIVE_GROUP=mesh` covers a namespace that spans two minimega nodes. Its
+`setup.sh`, which `run.sh` sources once minimega is up, starts a second
+container from the same image (`minimega-peer`, with its own base directory
+`${LIVE_MM_BASE}/peer`), joins it to the mesh, and packs the guest initramfs
+into `live/containerfs.tar.gz` on the first node only. `topology.mm` then
+launches four containers with `vm config filesystem tar:live/containerfs.tar.gz`,
+two scheduled on each node, and `mesh_test.go` checks the mesh, the placement,
+that the peer fetched and extracted the tarball itself, and that every
+container runs. The group launches no KVM VMs, but `run.sh` still builds the
+guest image (the containers' filesystem comes from its initramfs), and the host
+must support minimega containers.
 
 ## Running locally
 
@@ -234,6 +249,9 @@ slower.
   `harness.CCOK`/`harness.CCEventually` for guest commands and
   `harness.Eventually` for anything asynchronous.
 - If you change `core/topology.mm`, update `core/topology_test.go` to match.
+- A group that needs more than the one container can add a `setup.sh`, which
+  `run.sh` sources (with its variables and helpers) before loading
+  `topology.mm`; define `group_cleanup` there to remove what it started.
 - Add a group by creating `tests/live/<name>/` with a `topology.mm` and
   `//go:build live` tests in `package <name>` that import
   `github.com/sandia-minimega/minimega/v2/tests/live/harness`. Call
