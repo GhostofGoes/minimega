@@ -304,11 +304,17 @@ func (n *Namespace) Queue(arg string, vmType VMType, vmConfig VMConfig) error {
 		return fmt.Errorf("vm already queued with UUID `%s`", vmConfig.UUID)
 	}
 
-	n.queue = append(n.queue, &QueuedVMs{
+	q := &QueuedVMs{
 		VMConfig: vmConfig,
 		VMType:   vmType,
 		Names:    names,
-	})
+	}
+
+	if vmType == CONTAINER {
+		q.FilesystemTar = tarSource(vmConfig.FilesystemPath)
+	}
+
+	n.queue = append(n.queue, q)
 
 	return nil
 }

@@ -146,6 +146,15 @@ tarball. If the tarball resides outside of the iomeshage directory, minimega
 will still untar the tarball if it exists on the local node running the
 container to the same directory where the tarball resides.
 
+In a namespace, each host that launches containers with a `tar:` filesystem
+fetches and extracts the tarball itself before launching them, so the tarball
+only needs to exist on one node in the mesh (or, outside of the iomeshage
+directory, at the same path on every host). A host that already has the
+extracted directory uses it as is, so delete that directory on every host to
+pick up a changed tarball. minimega remembers which tarball it extracted until
+it restarts: after a restart, run the `tar:` command again before launching
+containers on other hosts.
+
 <a id="TOC_2.4."></a>
 
 ### http://, https:// prefix
