@@ -327,9 +327,10 @@ func TestQueueVMNameRules(t *testing.T) {
 }
 
 // TestVMLaunchResponseWarnings checks that "vm launch" puts the warnings in
-// its response.
+// its response. With queueing, Schedule checks the existing VMs, so the test
+// uses a queued VM.
 func TestVMLaunchResponseWarnings(t *testing.T) {
-	ns := queueTestNamespace(t, []string{"web1"}, nil)
+	ns := queueTestNamespace(t, nil, []string{"web1"})
 	ns.QueueVMs = true
 
 	resp := &minicli.Response{}
@@ -338,7 +339,7 @@ func TestVMLaunchResponseWarnings(t *testing.T) {
 	}
 
 	lines := strings.Split(resp.Response, "\n")
-	if len(lines) != 2 || !strings.Contains(lines[0], "existing vm `web1`") || !strings.Contains(lines[1], "`web_2`") {
+	if len(lines) != 2 || !strings.Contains(lines[0], "`web_2`") || !strings.Contains(lines[1], "queued vm `web1`") {
 		t.Errorf("response = %q, want the two warnings", resp.Response)
 	}
 

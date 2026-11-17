@@ -140,3 +140,60 @@ func TestMeshageVMResponseWait(t *testing.T) {
 		t.Error("the wait for a delivered response is still registered")
 	}
 }
+
+func TestVMConflicts(t *testing.T) {
+	vm := &KvmVM{BaseVM: &BaseVM{Name: "taken", BaseConfig: BaseConfig{UUID: "u1"}}}
+	vms := []VM{vm}
+
+	for _, tt := range []struct {
+		q    *QueuedVMs
+		want string
+	}{
+		{&QueuedVMs{Names: []string{"free", ""}}, ""},
+		{&QueuedVMs{Names: []string{"free", "taken"}}, "name `taken`"},
+		{&QueuedVMs{Names: []string{"free"}, VMConfig: VMConfig{BaseConfig: BaseConfig{UUID: "u1"}}}, "UUID `u1`"},
+		{&QueuedVMs{Names: []string{"free", "TAKEN", "Taken"}}, ""},
+	} {
+		warnings, err := vmConflicts(vms, []*QueuedVMs{tt.q})
+		if tt.want == "" && err != nil {
+			t.Errorf("%v: %v, want no error", tt.q.Names, err)
+		}
+		if tt.want != "" && (err == nil || !strings.Contains(err.Error(), tt.want)) {
+			t.Errorf("%v: %v, want an error with %q", tt.q.Names, err, tt.want)
+		}
+
+		// a name that differs from "taken" only in letter case gives a warning
+		caseOnly := 0
+		for _, name := range tt.q.Names {
+			if name != "taken" && vmNameKey(name) == "taken" {
+				caseOnly++
+			}
+		}
+		if err == nil && len(warnings) != caseOnly {
+			t.Errorf("%v: warnings %q, want %v", tt.q.Names, warnings, caseOnly)
+		}
+	}
+}
+
+// TestQueueIndex checks that queued names conflict with each other, and that
+// the index starts again with an empty queue.
+func TestQueueIndex(t *testing.T) {
+	n := &Namespace{Name: "test", QueueVMs: true}
+
+	if _, err := n.Queue("a[1-3]", KVM, VMConfig{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := n.Queue("a2", KVM, VMConfig{}); err == nil || !strings.Contains(err.Error(), "already queued") {
+		t.Errorf("Queue of a queued name = %v, want already queued", err)
+	}
+	if _, err := n.Queue("b1", KVM, VMConfig{}); err != nil {
+		t.Errorf("Queue of a new name = %v", err)
+	}
+
+	// what schedule and `ns flush` do
+	n.clearQueue()
+
+	if _, err := n.Queue("a2", KVM, VMConfig{}); err != nil {
+		t.Errorf("Queue after the queue was cleared = %v", err)
+	}
+}
