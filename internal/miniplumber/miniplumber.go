@@ -48,14 +48,27 @@ const (
 	MESSAGE_VIA_HOST
 )
 
+// mesh is what the plumber needs from a meshage node to talk to the plumbers
+// on the other hosts of a distributed environment.
+type mesh interface {
+	Name() string
+	Set(recipients []string, body interface{}) ([]string, error)
+	Broadcast(body interface{}) ([]string, error)
+}
+
 type Plumber struct {
-	node      *meshage.Node         // meshage node to use for distributed environments
+	node      mesh                  // meshage node to use for distributed environments
 	Messages  chan *meshage.Message // incoming messages from meshage
 	pipes     map[string]*Pipe
 	pipelines map[string]*pipeline
 	lock      sync.Mutex
 	tidLock   sync.Mutex
 	tids      map[int64]*tid
+
+	// messages from other hosts that wait to be applied to a pipe, by pipe.
+	// A pipe has an entry while a goroutine (drain) applies its messages.
+	inboxes   map[string][]Message
+	inboxLock sync.Mutex
 }
 
 type tid struct {
@@ -76,10 +89,13 @@ type Pipe struct {
 	log           bool
 	viaCommand    []string
 	viaHost       string
-	readerCache   []int64
 	numMessages   int64
-	writes        []string // values queued by Write, sent in order by drainWrites
-	writing       bool
+
+	// set by PipeDelete, so that NewReader does not add to a deleted pipe
+	deleted bool
+
+	writes  []string // values queued by Write, sent in order by drainWrites
+	writing bool
 }
 
 type Reader struct {
@@ -88,8 +104,8 @@ type Reader struct {
 	once sync.Once
 	ID   int64
 
-	lock   sync.Mutex // held while sending on C so C is not closed mid-send
-	closed bool
+	sendLock sync.Mutex // guards closed and sends on C
+	closed   bool
 }
 
 type pipeline struct {
@@ -98,7 +114,8 @@ type pipeline struct {
 	done       chan bool
 	canceler   sync.Once
 
-	// wg tracks terminal I/O that must finish before the pipeline is removed
+	// wg tracks terminal I/O and processes that must finish before the
+	// pipeline is removed
 	wg sync.WaitGroup
 }
 
@@ -124,16 +141,10 @@ func (t *tid) Close() {
 	})
 }
 
-func (r *Reader) Close() {
-	r.once.Do(func() {
-		close(r.Done)
-	})
-}
-
-// send delivers v unless the reader is closed first
+// send delivers v unless the reader is closed first.
 func (r *Reader) send(v string) {
-	r.lock.Lock()
-	defer r.lock.Unlock()
+	r.sendLock.Lock()
+	defer r.sendLock.Unlock()
 
 	if r.closed {
 		return
@@ -145,14 +156,30 @@ func (r *Reader) send(v string) {
 	}
 }
 
+func (r *Reader) Close() {
+	r.once.Do(func() {
+		close(r.Done)
+	})
+}
+
 // New returns a new Plumber object over meshage node n
 func New(n *meshage.Node) *Plumber {
+	// a nil node must not become a mesh that is not nil
+	if n == nil {
+		return newPlumber(nil)
+	}
+
+	return newPlumber(n)
+}
+
+func newPlumber(n mesh) *Plumber {
 	p := &Plumber{
 		node:      n,
 		Messages:  make(chan *meshage.Message, 1024),
 		pipes:     make(map[string]*Pipe),
 		pipelines: make(map[string]*pipeline),
 		tids:      make(map[int64]*tid),
+		inboxes:   make(map[string][]Message),
 	}
 
 	if p.node != nil {
@@ -162,80 +189,72 @@ func New(n *meshage.Node) *Plumber {
 	return p
 }
 
-func (p *Plumber) forward(pipe, data string, r int64) error {
+// forward a value written to a pipe on this host to the plumbers on the other
+// hosts, for recipient r as chosen by schedule. No lock may be held.
+func (p *Plumber) forward(pp *Pipe, data string, r int64) error {
 	if p.node == nil {
 		return nil
 	}
 
-	refreshed := false
-	for {
-		// refresh the reader cache before taking locks (see updateReaderCache)
-		if r == SCHEDULE_ALL && !refreshed && p.hasVia(pipe) {
-			if err := p.updateReaderCache(pipe); err != nil {
-				return err
-			}
-			refreshed = true
-		}
-
-		m, ok, err := p.forwardMessage(pipe, data, r, r != SCHEDULE_ALL || refreshed)
-		if err != nil {
-			return err
-		}
-		if !ok {
-			// a via was set after the check above
-			continue
-		}
-
-		_, err = p.node.Broadcast(m)
-		return err
-	}
-}
-
-// forwardMessage builds the message that forward broadcasts. ok is false if
-// the pipe has a via and the reader cache was not refreshed for this value.
-func (p *Plumber) forwardMessage(pipe, data string, r int64, cached bool) (*Message, bool, error) {
-	p.lock.Lock()
-	defer p.lock.Unlock()
-
 	m := &Message{
 		From: p.node.Name(),
 		Type: MESSAGE_FORWARD,
-		Pipe: pipe,
+		Pipe: pp.name,
 		Data: make(map[int64]string),
 	}
 
-	pp, ok := p.pipes[pipe]
-	if !ok {
-		return nil, false, fmt.Errorf("so such pipe: %v", pipe)
-	}
-
-	// forwarding with an enabled via is much more involved than just
-	// forwarding the value unmodified. We instead create values for
-	// /every/ recipient, possibly cached by the previous call to schedule,
-	// and ship the list of recipient values up.
 	pp.lock.Lock()
-	defer pp.lock.Unlock()
+	via := len(pp.viaCommand) != 0
+	_, local := pp.readers[r]
+	pp.lock.Unlock()
 
-	// no vias!
-	if len(pp.viaCommand) == 0 {
+	if !via {
 		m.Data[r] = data
 	} else {
-		if !cached {
-			return nil, false, nil
+		// forwarding with an enabled via is much more involved than just
+		// forwarding the value unmodified. We instead create a value for
+		// /every/ recipient on the other hosts, and ship the list of
+		// recipient values up.
+		var readers []int64
+
+		if r == SCHEDULE_ALL {
+			var err error
+
+			readers, err = p.remoteReaders(pp.name)
+			if err != nil {
+				return err
+			}
+		} else if !local {
+			readers = []int64{r}
 		}
 
-		for _, k := range pp.readerCache {
+		pp.lock.Lock()
+		for _, k := range readers {
 			d, err := pp.via(data)
 			if err != nil {
-				return nil, false, err
+				pp.lock.Unlock()
+				return err
 			}
 			m.Data[k] = d
 		}
+		pp.lock.Unlock()
+
+		// every recipient is on this host
+		if len(m.Data) == 0 {
+			return nil
+		}
 	}
 
-	return m, true, nil
+	_, err := p.node.Broadcast(m)
+	return err
 }
 
+// handleMessages receives the messages of the plumbers on the other hosts. It
+// must not wait for anything that waits for a message in turn: a write to a
+// pipe waits for the pipe's readers, and a reader can be a pipeline, whose
+// write to its next pipe waits for the other hosts' answers (QUERY_RESPONSE)
+// in round-robin and random modes. So the messages that touch a pipe go to
+// the pipe's inbox, and queries are answered by goroutines of their own.
 func (p *Plumber) handleMessages() {
 	for {
 		m := (<-p.Messages).Body.(Message)
@@ -243,16 +262,17 @@ func (p *Plumber) handleMessages() {
 		log.Debug("got message type %v from %v", m.Type, m.From)
 
 		switch m.Type {
-		case MESSAGE_FORWARD:
-			p.writeNoForward(m.Pipe, m.Data)
+		case MESSAGE_FORWARD, MESSAGE_VIA_WRITE, MESSAGE_VIA_HOST:
+			p.enqueue(m)
 		case MESSAGE_QUERY:
-			p.sendReaders(&m)
+			go p.sendReaders(&m)
 		case MESSAGE_QUERY_RESPONSE:
 			p.tidLock.Lock()
 			t, ok := p.tids[m.TID]
 			p.tidLock.Unlock()
 
 			if !ok {
+				// the query timed out; keep handling messages
 				log.Errorln("dropping message for invalid TID: ", m.TID)
 				continue
 			}
@@ -261,8 +281,55 @@ func (p *Plumber) handleMessages() {
 			case t.C <- &m:
 			case <-t.Done:
 			}
+		default:
+			log.Error("unknown plumber message type: %v", m.Type)
+		}
+	}
+}
+
+// enqueue adds a message from another host to the inbox of its pipe, and
+// starts a goroutine that applies the pipe's messages if none is running. It
+// never waits for a pipe or for the plumber lock.
+func (p *Plumber) enqueue(m Message) {
+	p.inboxLock.Lock()
+	defer p.inboxLock.Unlock()
+
+	inbox, busy := p.inboxes[m.Pipe]
+	p.inboxes[m.Pipe] = append(inbox, m)
+
+	if !busy {
+		go p.drain(m.Pipe)
+	}
+}
+
+// drain applies the messages in a pipe's inbox, in the order of their
+// arrival, and returns when the inbox is empty.
+func (p *Plumber) drain(pipe string) {
+	for {
+		p.inboxLock.Lock()
+		inbox := p.inboxes[pipe]
+		if len(inbox) == 0 {
+			delete(p.inboxes, pipe)
+			p.inboxLock.Unlock()
+			return
+		}
+		m := inbox[0]
+		inbox[0] = Message{}
+		p.inboxes[pipe] = inbox[1:]
+		p.inboxLock.Unlock()
+
+		switch m.Type {
+		case MESSAGE_FORWARD:
+			p.writeNoForward(m.Pipe, m.Data)
 		case MESSAGE_VIA_WRITE:
-			p.Write(m.Pipe, m.Value)
+			// wait for the write, to keep the order of the values
+			p.lock.Lock()
+			w, done := p.newWriter(m.Pipe)
+			p.lock.Unlock()
+
+			w <- m.Value
+			close(w)
+			<-done
 		case MESSAGE_VIA_HOST:
 			p.lock.Lock()
 
@@ -274,6 +341,10 @@ func (p *Plumber) handleMessages() {
 			}
 			pp := p.pipes[m.Pipe]
 
+			p.lock.Unlock()
+
+			// a write to the pipe holds the pipe lock, so don't wait for
+			// it with the plumber lock
 			pp.lock.Lock()
 
 			if m.Value != "" {
@@ -283,9 +354,6 @@ func (p *Plumber) handleMessages() {
 			}
 
 			pp.lock.Unlock()
-			p.lock.Unlock()
-		default:
-			log.Error("unknown plumber message type: %v", m.Type)
 		}
 	}
 }
@@ -294,8 +362,11 @@ func (p *Plumber) newTID() *tid {
 	p.tidLock.Lock()
 	defer p.tidLock.Unlock()
 
+	s := rand.NewSource(time.Now().UnixNano())
+	r := rand.New(s)
+
 	t := &tid{
-		TID:  rand.Int63(),
+		TID:  r.Int63(),
 		C:    make(chan *Message),
 		Done: make(chan struct{}),
 	}
@@ -311,11 +382,11 @@ func (p *Plumber) unregisterTID(t *tid) {
 	p.tidLock.Lock()
 	defer p.tidLock.Unlock()
 
-	if _, ok := p.tids[t.TID]; ok {
-		delete(p.tids, t.TID)
-	}
+	delete(p.tids, t.TID)
 }
 
+// sendReaders answers another host's query for the readers of a pipe on this
+// host. It holds no lock while it sends the answer.
 func (p *Plumber) sendReaders(m *Message) {
 	resp := &Message{
 		TID:  m.TID,
@@ -325,14 +396,16 @@ func (p *Plumber) sendReaders(m *Message) {
 	}
 
 	p.lock.Lock()
-	if pp, ok := p.pipes[m.Pipe]; ok {
+	pp, ok := p.pipes[m.Pipe]
+	p.lock.Unlock()
+
+	if ok {
 		pp.lock.Lock()
 		for k, _ := range pp.readers {
 			resp.Readers = append(resp.Readers, k)
 		}
 		pp.lock.Unlock()
 	}
-	p.lock.Unlock()
 
 	_, err := p.node.Set([]string{m.From}, resp)
 	if err != nil {
@@ -365,9 +438,11 @@ func (p *Plumber) Plumb(production ...string) error {
 		return fmt.Errorf("pipeline already exists: %v", production)
 	}
 
+	// done must exist before the pipeline can be found and deleted
 	p.pipelines[name] = &pipeline{
 		name:       name,
 		production: production,
+		done:       make(chan bool),
 	}
 
 	go p.startPipeline(p.pipelines[name])
@@ -391,6 +466,11 @@ func (p *Plumber) Via(pipe string, command []string) {
 	defer pp.lock.Unlock()
 
 	pp.viaCommand = command
+
+	// a plumber without a mesh has no other hosts to tell
+	if p.node == nil {
+		return
+	}
 
 	m := &Message{
 		From:  p.node.Name(),
@@ -498,6 +578,7 @@ func (p *Plumber) PipeDelete(pipe string) error {
 		for _, c := range pp.readers {
 			c.Close()
 		}
+		pp.deleted = true
 		delete(p.pipes, pipe)
 
 		return nil
@@ -560,19 +641,13 @@ func (p *Plumber) Pipelines() []string {
 	return ret
 }
 
-func (p *Plumber) NewReader(pipe string) *Reader {
-	p.lock.Lock()
-	defer p.lock.Unlock()
-
-	return p.newReader(pipe)
-}
-
 func (p *Plumber) id() int64 {
-	return rand.Int63()
+	s := rand.NewSource(time.Now().UnixNano())
+	r := rand.New(s)
+	return r.Int63()
 }
 
-// assume the lock is held
-func (p *Plumber) newReader(pipe string) *Reader {
+func (p *Plumber) NewReader(pipe string) *Reader {
 	log.Debug("newReader: %v", pipe)
 
 	r := &Reader{
@@ -581,27 +656,39 @@ func (p *Plumber) newReader(pipe string) *Reader {
 		ID:   p.id(),
 	}
 
-	if _, ok := p.pipes[pipe]; !ok {
-		p.pipes[pipe] = &Pipe{
-			name:    pipe,
-			readers: make(map[int64]*Reader),
+	// A write holds the pipe lock while it waits for a reader, so do not wait
+	// for the pipe lock with the plumber lock held.
+	var pp *Pipe
+	for {
+		p.lock.Lock()
+		if _, ok := p.pipes[pipe]; !ok {
+			p.pipes[pipe] = &Pipe{
+				name:    pipe,
+				readers: make(map[int64]*Reader),
+			}
 		}
+		pp = p.pipes[pipe]
+		p.lock.Unlock()
+
+		pp.lock.Lock()
+		if !pp.deleted {
+			break
+		}
+		pp.lock.Unlock()
 	}
-	pp := p.pipes[pipe]
-	pp.lock.Lock()
 	pp.readers[r.ID] = r
 	pp.lock.Unlock()
 
 	go func() {
 		<-r.Done
-
-		r.lock.Lock()
-		r.closed = true
-		close(r.C)
-		r.lock.Unlock()
-
 		pp.lock.Lock()
 		defer pp.lock.Unlock()
+
+		r.sendLock.Lock()
+		r.closed = true
+		close(r.C)
+		r.sendLock.Unlock()
+
 		delete(pp.readers, r.ID)
 	}()
 
@@ -609,6 +696,14 @@ func (p *Plumber) newReader(pipe string) *Reader {
 }
 
 func (p *Plumber) NewWriter(pipe string) chan<- string {
+	w, _ := p.NewWriterDone(pipe)
+	return w
+}
+
+// NewWriterDone is like NewWriter, and also returns a channel that is closed
+// once the writer has been closed and every message sent on it has been
+// written to the pipe.
+func (p *Plumber) NewWriterDone(pipe string) (chan<- string, <-chan struct{}) {
 	p.lock.Lock()
 	defer p.lock.Unlock()
 
@@ -616,10 +711,11 @@ func (p *Plumber) NewWriter(pipe string) chan<- string {
 }
 
 // assume the lock is held
-func (p *Plumber) newWriter(pipe string) chan<- string {
+func (p *Plumber) newWriter(pipe string) (chan<- string, <-chan struct{}) {
 	log.Debug("newWriter: %v", pipe)
 
 	c := make(chan string)
+	done := make(chan struct{})
 
 	if _, ok := p.pipes[pipe]; !ok {
 		p.pipes[pipe] = &Pipe{
@@ -633,19 +729,22 @@ func (p *Plumber) newWriter(pipe string) chan<- string {
 	pp.lock.Unlock()
 
 	go func() {
+		defer close(done)
+
 		for v := range c {
-			p.send(pipe, pp, v)
+			p.sendValue(pipe, pp, v)
 		}
 		pp.lock.Lock()
 		pp.numWriters--
 		pp.lock.Unlock()
 	}()
 
-	return c
+	return c, done
 }
 
-// send delivers v to the readers of pipe, both local and across meshage
-func (p *Plumber) send(pipe string, pp *Pipe, v string) {
+// sendValue sends v to the readers of pipe, local and across meshage. No lock
+// may be held.
+func (p *Plumber) sendValue(pipe string, pp *Pipe, v string) {
 	// don't do local writes if the via doesn't belong to
 	// us - post it to the owner instead.
 	if p.node != nil {
@@ -654,33 +753,29 @@ func (p *Plumber) send(pipe string, pp *Pipe, v string) {
 		pp.lock.Unlock()
 
 		if viaHost != p.node.Name() && viaHost != "" {
-			p.lock.Lock()
-
 			m := &Message{
-				From: p.node.Name(),
-				Type: MESSAGE_VIA_WRITE,
-				Pipe: pipe,
+				From:  p.node.Name(),
+				Type:  MESSAGE_VIA_WRITE,
+				Pipe:  pipe,
+				Value: v,
 			}
-
-			m.Value = v
 
 			_, err := p.node.Set([]string{viaHost}, m)
 			if err != nil {
 				log.Errorln(err)
 			}
-			p.lock.Unlock()
 
 			return
 		}
 	}
 
-	r, err := p.schedule(pipe)
+	r, err := p.schedule(pp)
 	if err != nil {
 		log.Errorln(err)
 		return
 	}
 
-	err = p.forward(pipe, v, r)
+	err = p.forward(pp, v, r)
 	if err != nil {
 		log.Errorln(err)
 		return
@@ -689,8 +784,8 @@ func (p *Plumber) send(pipe string, pp *Pipe, v string) {
 	pp.write(v, r)
 }
 
-// Write sends value to pipe without waiting for it to be delivered. Values
-// written to the same pipe are delivered in the order they were written.
+// Write queues value for pipe and returns. A single goroutine for each pipe
+// sends the queued values, so that they keep their order.
 func (p *Plumber) Write(pipe string, value string) {
 	p.lock.Lock()
 	defer p.lock.Unlock()
@@ -708,14 +803,13 @@ func (p *Plumber) Write(pipe string, value string) {
 
 	pp.writes = append(pp.writes, value)
 
-	// a single goroutine per pipe sends queued values so they stay in order
 	if !pp.writing {
 		pp.writing = true
 		go p.drainWrites(pipe, pp)
 	}
 }
 
-// drainWrites sends the values queued by Write until none remain
+// drainWrites sends the values that Write queued until none remain.
 func (p *Plumber) drainWrites(pipe string, pp *Pipe) {
 	for {
 		pp.lock.Lock()
@@ -732,23 +826,13 @@ func (p *Plumber) drainWrites(pipe string, pp *Pipe) {
 		pp.writes = pp.writes[1:]
 		pp.lock.Unlock()
 
-		p.send(pipe, pp, v)
+		p.sendValue(pipe, pp, v)
 	}
 }
 
 // Based on the pipe mode, choose a recipient - system wide. This means
-// querying other plumber's state over meshage.
-func (p *Plumber) schedule(pipe string) (int64, error) {
-	var readers []int64
-
-	p.lock.Lock()
-	pp, ok := p.pipes[pipe]
-	p.lock.Unlock()
-
-	if !ok {
-		return 0, fmt.Errorf("no such pipe: %v", pipe)
-	}
-
+// querying other plumber's state over meshage. No lock may be held.
+func (p *Plumber) schedule(pp *Pipe) (int64, error) {
 	pp.lock.Lock()
 	mode := pp.mode
 	pp.lock.Unlock()
@@ -757,8 +841,7 @@ func (p *Plumber) schedule(pipe string) (int64, error) {
 		return SCHEDULE_ALL, nil
 	}
 
-	// refresh the reader cache before taking locks (see updateReaderCache)
-	err := p.updateReaderCache(pipe)
+	readers, err := p.remoteReaders(pp.name)
 	if err != nil {
 		return 0, err
 	}
@@ -766,16 +849,9 @@ func (p *Plumber) schedule(pipe string) (int64, error) {
 	pp.lock.Lock()
 	defer pp.lock.Unlock()
 
-	// the mode may have changed while unlocked
-	if pp.mode == MODE_ALL {
-		return SCHEDULE_ALL, nil
-	}
-
 	for k, _ := range pp.readers {
 		readers = append(readers, k)
 	}
-
-	readers = append(readers, pp.readerCache...)
 
 	sort.Sort(int64Sorter(readers))
 
@@ -784,7 +860,7 @@ func (p *Plumber) schedule(pipe string) (int64, error) {
 	}
 
 	// pick a winner!
-	switch pp.mode {
+	switch mode {
 	case MODE_RR:
 		i := sort.Search(len(readers), func(i int) bool { return readers[i] > pp.lastRecipient })
 		if i == len(readers) {
@@ -800,21 +876,23 @@ func (p *Plumber) schedule(pipe string) (int64, error) {
 	return 0, nil
 }
 
-// TODO: maybe don't update on /every/ call, but instead set some kind of max
+// remoteReaders asks the plumbers on the other hosts for their readers of a
+// pipe.
+//
+// No lock may be held: the other plumbers need their locks to answer, also
+// when they are asking us at the same time, and we need ours to answer them.
+//
+// TODO: maybe don't ask on /every/ call, but instead set some kind of max
 // rate
-// The caller must not hold the plumber or pipe locks: responses arrive through
-// handleMessages, which may be waiting on them.
-func (p *Plumber) updateReaderCache(pipe string) error {
+func (p *Plumber) remoteReaders(pipe string) ([]int64, error) {
+	// a plumber without a mesh has no remote readers
 	if p.node == nil {
-		return nil
+		return nil, nil
 	}
 
 	t := p.newTID()
 	defer p.unregisterTID(t)
 
-	readers := []int64{}
-
-	// get readers from other plumbers
 	m := &Message{
 		TID:  t.TID,
 		From: p.node.Name(),
@@ -824,8 +902,10 @@ func (p *Plumber) updateReaderCache(pipe string) error {
 
 	nodes, err := p.node.Broadcast(m)
 	if err != nil {
-		return err
+		return nil, err
 	}
+
+	var readers []int64
 
 	// wait for n responses, or a timeout
 	for i := 0; i < len(nodes); i++ {
@@ -836,46 +916,21 @@ func (p *Plumber) updateReaderCache(pipe string) error {
 			}
 			readers = append(readers, resp.Readers...)
 		case <-time.After(TIMEOUT):
-			return fmt.Errorf("timeout")
+			return nil, fmt.Errorf("timeout")
 		}
 	}
 
-	p.lock.Lock()
-	defer p.lock.Unlock()
-
-	if pp, ok := p.pipes[pipe]; ok {
-		pp.lock.Lock()
-		pp.readerCache = readers
-		pp.lock.Unlock()
-	}
-
-	return nil
-}
-
-// hasVia reports whether pipe has a via command
-func (p *Plumber) hasVia(pipe string) bool {
-	p.lock.Lock()
-	defer p.lock.Unlock()
-
-	pp, ok := p.pipes[pipe]
-	if !ok {
-		return false
-	}
-
-	pp.lock.Lock()
-	defer pp.lock.Unlock()
-
-	return len(pp.viaCommand) != 0
+	return readers, nil
 }
 
 // write to a named pipe without forwarding the message over meshage or
-// scheduling its delivery
+// scheduling its delivery. The plumber lock is not held during the write,
+// which waits for the pipe's readers.
 func (p *Plumber) writeNoForward(pipe string, data map[int64]string) {
 	p.lock.Lock()
 	pp, ok := p.pipes[pipe]
 	p.lock.Unlock()
 
-	// pp.write can wait on readers, which may need the plumber lock
 	if ok {
 		for r, v := range data {
 			pp.write(v, r)
@@ -885,8 +940,6 @@ func (p *Plumber) writeNoForward(pipe string, data map[int64]string) {
 
 // started in a goroutine, don't assume the lock is held
 func (p *Plumber) startPipeline(pl *pipeline) {
-	pl.done = make(chan bool)
-
 	var b <-chan string
 	for i, e := range pl.production {
 		log.Debug("starting pipeline production element: %v", e)
@@ -969,7 +1022,11 @@ func (pl *pipeline) exec(production []string, in <-chan string, write bool) (<-c
 
 			for {
 				select {
-				case v := <-in:
+				case v, ok := <-in:
+					if !ok {
+						// the upstream reader was closed
+						return
+					}
 					_, err := stdin.Write([]byte(v))
 					if err != nil {
 						log.Errorln(err)
@@ -1004,7 +1061,13 @@ func (pl *pipeline) exec(production []string, in <-chan string, write bool) (<-c
 				log.Debug("exec got: %v", scanner.Text())
 			}
 			if err := scanner.Err(); err != nil {
-				log.Errorln(err)
+				select {
+				case <-pl.done:
+					// stdout was closed under us when the
+					// pipeline was torn down
+				default:
+					log.Errorln(err)
+				}
 				return
 			}
 		}()
@@ -1034,13 +1097,19 @@ func (pl *pipeline) exec(production []string, in <-chan string, write bool) (<-c
 
 	// command is running
 
+	pl.wg.Add(1)
 	go func() {
+		defer pl.wg.Done()
+
 		<-pl.done
 		cmd.Process.Kill()
+		// reap the process so it doesn't stay around as a zombie
+		cmd.Wait()
 	}()
 
 	return out, nil
 }
+
 func (pl *pipeline) pipe(pin *Reader, pout chan<- string, in <-chan string) <-chan string {
 	log.Debug("pipe")
 
@@ -1051,7 +1120,12 @@ func (pl *pipeline) pipe(pin *Reader, pout chan<- string, in <-chan string) <-ch
 
 			for {
 				select {
-				case v := <-in:
+				case v, ok := <-in:
+					if !ok {
+						// the upstream reader was closed; don't
+						// write its zero value downstream
+						return
+					}
 					select {
 					case pout <- v:
 					case <-pl.done:
@@ -1221,8 +1295,8 @@ func (p *Pipe) via(value string) (string, error) {
 
 // don't assume the plumber lock is held
 func (p *Pipe) write(value string, r int64) {
-	// values are sent after the pipe lock is released, so a reader that is
-	// slow or waiting on the plumber cannot block other users of the pipe
+	// values are sent after the pipe lock is released, so a reader that does
+	// not read cannot block other users of the pipe, such as PipeDelete
 	type delivery struct {
 		reader *Reader
 		value  string

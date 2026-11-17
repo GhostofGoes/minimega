@@ -53,8 +53,8 @@ flowchart LR
 tests/live/
   run.sh        run one group against a Docker image
   image/        vmbetter config (live.conf) and overlay for the guest kernel and initramfs
-  harness/      package harness: shared helpers (socket client, cc, polling,
-                artifact parsers) and their offline unit tests
+  harness/      package harness: shared helpers (socket client, cc, pipes,
+                polling, artifact parsers) and their offline unit tests
   core/         the 23-VM test group: topology.mm, topology_test.go, live_test.go,
                 vnc_test.go
   mesh/         two-node mesh group: setup.sh (peer container), topology.mm, mesh_test.go
@@ -134,8 +134,9 @@ phases (screenshots, QMP, serial, ...) still run.
 |---|---|
 | Control plane | `version`, `check`, `host`, `namespace`, `ns hosts/queue/queueing`, `vm info`, `vm info summary`, `vlans`, `bridge` + OVS port/VLAN tags, `file list`, `-hashfiles` (one hash per copied file, no hash mid-copy, appends, renames, new directories), `disk info/snapshot` |
 | miniweb | every UI page with and without a namespace prefix and the assets they load, `/vms/info.json` and `/vms/top.json` against `vm info`, `hosts`/`vlans`/`namespaces`/`files` JSON, file download, screenshots (PNG, `size`, `base64`), the noVNC page and its websocket's RFB greeting, `POST /vm/<name>/stop` and `start`, the console left disabled, and unknown and cleared namespaces that stay absent |
+| Pipes | `minimega -pipe` (exits 0 with its lines in the pipe, no command socket errors in the minimega log), `pipe` writes, modes and vias, clients attached over the socket, `plumb` through a process and its teardown |
 | Boot | all 23 VMs `RUNNING`, 22 miniccc clients, every expected address learned from tap snooping |
-| Command and control | `cc exec` (one, all, tag and column filters), `cc exitcode`, `cc send`/`recv`, `cc background`, `cc process list/kill`, `cc responses`, `cc delete`, named pipe ordering (`pipe` and `miniccc -pipe` into a VM reader) |
+| Command and control | `cc exec` (one, all, tag and column filters), `cc exitcode`, `cc send`/`recv`, `cc background`, `cc process list/kill`, `cc responses`, `cc delete`, named pipe ordering (`pipe` and `miniccc -pipe` into a VM reader), pipes from a guest (`miniccc -pipe` both ways, `cc exec stdout=<pipe>`) |
 | Guest view of config | SMBIOS serial from `qemu-append`, VM UUID, disk sizes per interface, snapshot isolation, Q35 vs i440FX, xHCI, SMP, NIC driver and MAC, dual-homed addressing, router addresses on the right NIC despite GRE fallback devices |
 | Networking | DHCP relay (lease, netmask, gateway, DNS, reachability), same-LAN ping, OSPF routes, cross-router ping and traceroute, no-cc host reachable, DNS, custom dnsmasq lines (wildcard `address=`, `cname=`, `clear router dnsmasq`), HTTP to protonuke, firewall drop vs control, host tap (both directions), `tap create`/`tap delete` with addresses and a failing address, QoS delay and loss, `capture pcap` |
 | VM operations | `vm screenshot` (std and cirrus), `vm serial`, `vm qmp`, `vm tag` + tag filter, `vm top`, `vm stop/start`, `vm net disconnect/connect`, `vm hotplug add/remove`, `vm save`, VM names that `vm launch` accepts or rejects, `vm kill` + `vm flush` + `vm config clone` + queued relaunch, `vnc-port` (RFB banner, range, Android, and same- and cross-namespace duplicate rejection, rebind after restart) |
