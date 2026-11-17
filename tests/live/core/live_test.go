@@ -104,6 +104,7 @@ func TestLive(t *testing.T) {
 		p("NetDisconnectConnect", testNetDisconnectConnect, network),
 		p("Hotplug", testHotplug, cc),
 		p("Save", testSave, cc),
+		p("VMNameRules", testVMNameRules, inv),
 		p("KillFlushRelaunch", testKillFlushRelaunch, cc),
 
 		// teardown
@@ -1065,6 +1066,68 @@ func testSave(t *testing.T) {
 		harness.MustRun(t, "vm start host-c2")
 	}
 	harness.CCEventually(t, "host-c2", "true", time.Minute)
+}
+
+func testVMNameRules(t *testing.T) {
+	// clone needs a launched VM; without NICs the test VMs get no taps
+	harness.MustRun(t, "vm config clone host-a4")
+	harness.MustRun(t, "clear vm config net")
+	defer harness.Run("clear vm config")
+
+	label63 := strings.Repeat("a", 63)
+	cases := []struct {
+		desc  string
+		name  string // "vm launch kvm" argument
+		valid bool
+	}{
+		{"Underscore", "web_1", false},
+		{"OneCharacter", "a", false},
+		{"LeadingHyphen", "-web", false},
+		{"TrailingHyphen", "web-", false},
+		{"LeadingDot", ".web", false},
+		{"TrailingDot", "web.", false},
+		{"EmptyLabel", "web..lan", false},
+		{"Slash", "web/1", false},
+		{"Backslash", `web\\1`, false}, // minimega reads `\\` as one backslash
+		{"Label64", label63 + "a", false},
+		{"ListWithBadName", "ok,bad_name", false},
+		{"TwoCharacters", "ab", true},
+		{"OneCharacterLabels", "a.b", true},
+		{"Dotted", "Name-Rules.live.test", true},
+		{"Label63", label63, true},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.desc, func(t *testing.T) {
+			_, err := harness.Run("vm launch kvm " + tc.name)
+			if !tc.valid {
+				if err == nil || !strings.Contains(err.Error(), "valid host name") {
+					t.Errorf("err = %v, want a host name error", err)
+				}
+				if q := strings.TrimSpace(harness.MustText(t, "ns queue")); q != "" {
+					harness.Run("ns flush")
+					t.Errorf("rejected name was queued: %q", q)
+				}
+				return
+			}
+
+			if err != nil {
+				t.Fatalf("valid name rejected: %v", err)
+			}
+			harness.MustRun(t, "vm launch")
+			defer harness.Run("vm flush")
+			if s := harness.VMInfo(t)[tc.name]["state"]; s != "BUILDING" {
+				t.Errorf("state = %q, want BUILDING", s)
+			}
+			harness.MustRun(t, "vm kill "+tc.name)
+			harness.Eventually(t, 30*time.Second, 2*time.Second, func() error {
+				if s := harness.VMInfo(t)[tc.name]["state"]; s != "QUIT" {
+					return fmt.Errorf("state = %v", s)
+				}
+				return nil
+			})
+		})
+	}
 }
 
 func testKillFlushRelaunch(t *testing.T) {

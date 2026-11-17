@@ -167,11 +167,11 @@ Each call to `vm launch` queues a new VM:
 ```text
 minimega[minimega]$ namespace foo
 minimega[foo]$ ns queueing true
-minimega[foo]$ vm launch kvm a
-minimega[foo]$ vm launch kvm b
+minimega[foo]$ vm launch kvm vm-a
+minimega[foo]$ vm launch kvm vm-b
 minimega[foo]$ vm info
 minimega[foo]$ ns queue
-... displays VM configuration for a and b ...
+... displays VM configuration for vm-a and vm-b ...
 ```
 
 Calling `vm launch` with no additional arguments flushes the queue and invokes
@@ -246,21 +246,21 @@ least loaded scheduler works, quad[0-3] will most likely not be scheduled on the
 same node.
 
 ```text
-minimega$ vm launch kvm a
-minimega$ vm config colocate a
-minimega$ vm launch kvm b
+minimega$ vm launch kvm vm-a
+minimega$ vm config colocate vm-a
+minimega$ vm launch kvm vm-b
 ```
 
-Instructs the scheduler to schedule `b` on the same node as `a`.
+Instructs the scheduler to schedule `vm-b` on the same node as `vm-a`.
 
 ```text
 minimega$ vm config coschedule 1
-minimega$ vm launch kvm a
-minimega$ vm config colocate a
-minimega$ vm launch kvm b
+minimega$ vm launch kvm vm-a
+minimega$ vm config colocate vm-a
+minimega$ vm launch kvm vm-b
 ```
 
-Instructs the scheduler to schedule `b` on the same node as `a` on the same
+Instructs the scheduler to schedule `vm-b` on the same node as `vm-a` on the same
 node with no other VMs.
 
 Note that `vm config schedule` and `vm config colocate` cannot be used for the

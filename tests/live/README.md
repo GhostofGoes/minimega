@@ -130,7 +130,7 @@ phases (screenshots, QMP, serial, ...) still run.
 | Command and control | `cc exec` (one, all, tag and column filters), `cc exitcode`, `cc send`/`recv`, `cc background`, `cc process list/kill`, `cc responses`, `cc delete` |
 | Guest view of config | SMBIOS serial from `qemu-append`, VM UUID, disk sizes per interface, snapshot isolation, Q35 vs i440FX, xHCI, SMP, NIC driver and MAC, dual-homed addressing |
 | Networking | same-LAN ping, OSPF routes, cross-router ping and traceroute, no-cc host reachable, DNS, HTTP to protonuke, firewall drop vs control, host tap (both directions), QoS delay and loss, `capture pcap` |
-| VM operations | `vm screenshot` (std and cirrus), `vm serial`, `vm qmp`, `vnc record`, `vm tag` + tag filter, `vm top`, `vm stop/start`, `vm net disconnect/connect`, `vm hotplug add/remove`, `vm save`, `vm kill` + `vm flush` + `vm config clone` + queued relaunch |
+| VM operations | `vm screenshot` (std and cirrus), `vm serial`, `vm qmp`, `vnc record`, `vm tag` + tag filter, `vm top`, `vm stop/start`, `vm net disconnect/connect`, `vm hotplug add/remove`, `vm save`, VM names that `vm launch` accepts or rejects, `vm kill` + `vm flush` + `vm config clone` + queued relaunch |
 | Teardown | `clear namespace` removes VMs, QEMU processes, and OVS ports |
 
 Out of scope: containers, Android, bare-metal VMs, and multi-node meshes.
