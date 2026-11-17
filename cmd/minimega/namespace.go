@@ -288,6 +288,14 @@ func (n *Namespace) Queue(arg string, vmType VMType, vmConfig VMConfig) ([]strin
 		return nil, errors.New("cannot launch multiple VMs with a pre-configured UUID")
 	}
 
+	if vmType == ANDROID && vmConfig.VNCListenPort != 0 {
+		return nil, errAndroidVNCPort
+	}
+
+	if len(names) > 1 && vmType == KVM && vmConfig.VNCListenPort != 0 {
+		return nil, errors.New("cannot launch multiple VMs with a pre-configured VNC port")
+	}
+
 	for _, name := range names {
 		if name != "" {
 			warning, err := checkVMName(name)

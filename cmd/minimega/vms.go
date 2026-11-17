@@ -326,6 +326,9 @@ func (vms *VMs) Launch(requestor, namespace string, q *QueuedVMs) <-chan error {
 			if err == nil {
 				err = vms.conflicts(vm)
 			}
+			if kvm, ok := vm.(*KvmVM); ok && err == nil {
+				err = reserveVNCPort(kvm)
+			}
 
 			if err != nil {
 				failed = append(failed, err)
