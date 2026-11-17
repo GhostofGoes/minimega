@@ -946,6 +946,8 @@ func (s *Server) RegisterVM(vm VM) {
 	s.vms[vm.GetUUID()] = vm
 }
 
+// UnregisterVM removes the VM and clears its cc_active state. Do not call it
+// while the VM lock is held: SetCCActive takes that lock.
 func (s *Server) UnregisterVM(vm VM) {
 	s.clientLock.Lock()
 	defer s.clientLock.Unlock()
@@ -955,6 +957,17 @@ func (s *Server) UnregisterVM(vm VM) {
 	s.uploadLock.Lock()
 	delete(s.uploads, vm.GetUUID())
 	s.uploadLock.Unlock()
+
+	vm.SetCCActive(false)
+}
+
+// setCCActive sets cc_active on the VM registered for uuid, if there is one.
+// uuid is the key in s.clients, which handshake set to the s.vms key. Caller
+// must hold clientLock.
+func (s *Server) setCCActive(uuid string, active bool) {
+	if vm, ok := s.vms[uuid]; ok {
+		vm.SetCCActive(active)
+	}
 }
 
 func (s *Server) destroyed() bool {
@@ -1234,6 +1247,7 @@ func (s *Server) addClient(c *client, m *Message, update string) error {
 
 	c.writeMu.Lock()
 	s.clients[c.UUID] = c
+	s.setCCActive(c.UUID, true)
 
 	if update != "" {
 		s.startUpdate(c, update)
@@ -1415,6 +1429,7 @@ func (s *Server) removeClient(c *client) {
 
 	if s.clients[c.uuid] == c {
 		delete(s.clients, c.uuid)
+		s.setCCActive(c.uuid, false)
 	}
 
 	c.shutdown()
@@ -1958,23 +1973,29 @@ func (s *Server) clientReaper() {
 		case <-ticker.C:
 		}
 
-		s.clientLock.Lock()
-		for k, v := range s.clients {
-			// checked in more recently than expiration time
-			active := time.Now().Sub(v.checkin) < s.clientExpiry
+		s.reapClients()
+	}
+}
 
-			if !active {
-				log.Debug("client %v expired", k)
-				// the same as removeClient except we already hold clientLock
-				delete(s.clients, k)
-				v.shutdown()
-			}
+// reapClients removes the clients that did not check in within clientExpiry.
+// It sets cc_active to false for the VMs of these clients and to true for the
+// VMs of all other clients.
+func (s *Server) reapClients() {
+	s.clientLock.Lock()
+	defer s.clientLock.Unlock()
 
-			if vm, ok := s.vms[k]; ok {
-				vm.SetCCActive(active)
-			}
+	for k, v := range s.clients {
+		// checked in more recently than expiration time
+		active := time.Now().Sub(v.checkin) < s.clientExpiry
+
+		if !active {
+			log.Debug("client %v expired", k)
+			// the same as removeClient except we already hold clientLock
+			delete(s.clients, k)
+			v.shutdown()
 		}
-		s.clientLock.Unlock()
+
+		s.setCCActive(k, active)
 	}
 }
 
