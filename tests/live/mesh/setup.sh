@@ -62,14 +62,11 @@ done
 mm mesh list | grep -q "${PEER_HOST}" || die "${PEER_HOST} did not join the mesh"
 mm mesh status || die "mesh status failed"
 
-# The container filesystem is the KVM guest's initramfs, packed as a tarball
-# with a single top-level directory as the tar: prefix requires.
+# Pack the container filesystem that run.sh unpacked from the guest initrd
+# (live/rootfs) as a tarball with a single top-level directory, containerfs.
 log "staging the container filesystem tarball"
-fs_dir="$(mktemp -d)" || die "unable to create a temporary directory"
-mkdir "${fs_dir}/containerfs" || die "unable to create ${fs_dir}/containerfs"
-(cd "${fs_dir}/containerfs" && gzip -dc "${STAGE}/live.initrd" | cpio -idm --quiet) || die "unable to unpack live.initrd"
-tar -C "${fs_dir}" -czf "${STAGE}/containerfs.tar.gz" containerfs || die "unable to pack containerfs.tar.gz"
-rm -rf "${fs_dir}"
+tar -C "${STAGE}" --transform 's,^rootfs,containerfs,' -czf "${STAGE}/containerfs.tar.gz" rootfs \
+    || die "unable to pack containerfs.tar.gz"
 du -h "${STAGE}/containerfs.tar.gz"
 
 export LIVE_PEER_HOST="${PEER_HOST}" LIVE_PEER_FILES="${PEER_BASE}/files"

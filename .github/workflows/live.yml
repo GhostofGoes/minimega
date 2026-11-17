@@ -4,8 +4,9 @@ name: Live Tests
 # boot a 22-VM KVM topology (tests/live/core/topology.mm), and exercise it over the
 # command socket. See tests/live/README.md.
 #
-# One job runs per test group: core, and containers
-# (tests/live/containers/topology.mm), which runs containers next to a KVM VM.
+# One job runs per test group: core, containers
+# (tests/live/containers/topology.mm), which runs containers next to a KVM VM,
+# and mesh (tests/live/mesh), which spans two minimega containers.
 #
 # Called by the Docker workflow: on master with the image it just pushed, on
 # pull requests with no image, so this job builds the checked-out code from
@@ -43,7 +44,7 @@ jobs:
       fail-fast: false
       matrix:
         # one job per test group, a directory under tests/live
-        group: [core, containers]
+        group: [core, containers, mesh]
     env:
       LIVE_GROUP: ${{ matrix.group }}
       IMAGE: ${{ inputs.image || 'minimega:live' }}
