@@ -132,7 +132,7 @@ phases (screenshots, QMP, serial, ...) still run.
 
 | Area | Checks |
 |---|---|
-| Control plane | `version`, `check`, `host`, `namespace`, `ns hosts/queue/queueing`, `vm info`, `vm info summary`, `vlans`, `bridge` + OVS port/VLAN tags, `file list`, `disk info/snapshot` |
+| Control plane | `version`, `check`, `host`, `namespace`, `ns hosts/queue/queueing`, `vm info`, `vm info summary`, `vlans`, `bridge` + OVS port/VLAN tags, `file list`, `-hashfiles` (one hash per copied file, no hash mid-copy, appends, renames, new directories), `disk info/snapshot` |
 | miniweb | every UI page with and without a namespace prefix and the assets they load, `/vms/info.json` and `/vms/top.json` against `vm info`, `hosts`/`vlans`/`namespaces`/`files` JSON, file download, screenshots (PNG, `size`, `base64`), the noVNC page and its websocket's RFB greeting, `POST /vm/<name>/stop` and `start`, the console left disabled, and unknown and cleared namespaces that stay absent |
 | Boot | all 23 VMs `RUNNING`, 22 miniccc clients, every expected address learned from tap snooping |
 | Command and control | `cc exec` (one, all, tag and column filters), `cc exitcode`, `cc send`/`recv`, `cc background`, `cc process list/kill`, `cc responses`, `cc delete`, named pipe ordering (`pipe` and `miniccc -pipe` into a VM reader) |
