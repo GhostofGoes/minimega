@@ -128,7 +128,7 @@ phases (screenshots, QMP, serial, ...) still run.
 |---|---|
 | Control plane | `version`, `check`, `host`, `namespace`, `ns hosts/queue/queueing`, `vm info`, `vm info summary`, `vlans`, `bridge` + OVS port/VLAN tags, `file list`, `-hashfiles` (no hash mid-copy, bounded CPU while copying, appends, renames, new directories), `disk info/snapshot`, miniweb (`/`, `/vms/info.json`) |
 | Boot | all 22 VMs `RUNNING`, 21 miniccc clients, every expected address learned from tap snooping |
-| Command and control | `cc exec` (one, all, tag and column filters), `cc exitcode`, `cc send`/`recv`, `cc background`, `cc process list/kill`, `cc responses`, `cc delete` |
+| Command and control | `cc exec` (one, all, tag and column filters), `cc exitcode`, `cc send`/`recv`, `cc background`, `cc process list/kill`, `cc responses`, `cc delete`, named pipe ordering (`pipe` and `miniccc -pipe` into a VM reader) |
 | Guest view of config | SMBIOS serial from `qemu-append`, VM UUID, disk sizes per interface, snapshot isolation, Q35 vs i440FX, xHCI, SMP, NIC driver and MAC, dual-homed addressing, router addresses on the right NIC despite GRE fallback devices |
 | Networking | same-LAN ping, OSPF routes, cross-router ping and traceroute, no-cc host reachable, DNS, HTTP to protonuke, firewall drop vs control, host tap (both directions), `tap create`/`tap delete` with addresses and a failing address, QoS delay and loss, `capture pcap` |
 | VM operations | `vm screenshot` (std and cirrus), `vm serial`, `vm qmp`, `vm tag` + tag filter, `vm top`, `vm stop/start`, `vm net disconnect/connect`, `vm hotplug add/remove`, `vm save`, VM names that `vm launch` accepts or rejects, `vm kill` + `vm flush` + `vm config clone` + queued relaunch |

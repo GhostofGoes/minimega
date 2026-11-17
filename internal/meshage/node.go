@@ -94,6 +94,16 @@ type Node struct {
 
 	// resolve returns the address to dial for a host. Tests replace it.
 	resolve func(host string) string
+
+	local     [numClasses]*queue  // delivers messages for this node to receive, in arrival order per class
+	relays    map[relayKey]*queue // forwards messages for other nodes, in arrival order per source, next hop and class
+	relayLock sync.Mutex
+}
+
+type relayKey struct {
+	source string // node that sent the message
+	hop    string // client the message is relayed to
+	class  Class
 }
 
 func init() {
@@ -104,6 +114,23 @@ func init() {
 // non-zero, the node will automatically begin broadcasting for connections. A
 // program reads the incoming messages of each class from Messages.
 func NewNode(name string, namespace string, degree uint, broadcastIP net.IP, port int, version string) *Node {
+	n := newNode(name, namespace, degree, broadcastIP, port, version)
+
+	for class := range n.receive {
+		go n.messageHandler(Class(class))
+	}
+
+	go n.connectionListener()
+	go n.broadcastListener()
+	go n.checkDegree()
+	go n.periodicMSA()
+	go n.periodicEffectiveNetwork()
+
+	return n
+}
+
+// newNode returns a node without starting any of its goroutines.
+func newNode(name string, namespace string, degree uint, broadcastIP net.IP, port int, version string) *Node {
 	r := rand.New(rand.NewSource(time.Now().UnixNano()))
 
 	log.Debug("NewNode: %v %v %v %v", name, degree, broadcastIP, port)
@@ -124,6 +151,7 @@ func NewNode(name string, namespace string, degree uint, broadcastIP net.IP, por
 		version:          version,
 		instance:         r.Uint64(),
 		rand:             r,
+		relays:           make(map[relayKey]*queue),
 	}
 	n.resolve = func(host string) string {
 		return net.JoinHostPort(host, strconv.Itoa(n.port))
@@ -132,14 +160,11 @@ func NewNode(name string, namespace string, degree uint, broadcastIP net.IP, por
 	for class := range n.receive {
 		n.receive[class] = make(chan *Message, RECEIVE_BUFFER)
 		n.messagePump[class] = make(chan *Message, RECEIVE_BUFFER)
-		go n.messageHandler(Class(class))
 	}
 
-	go n.connectionListener()
-	go n.broadcastListener()
-	go n.checkDegree()
-	go n.periodicMSA()
-	go n.periodicEffectiveNetwork()
+	for class := range n.local {
+		n.local[class] = newQueue(n.handleMessage)
+	}
 
 	return n
 }
