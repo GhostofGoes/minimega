@@ -39,6 +39,9 @@ type Bridge struct {
 	// captures records the pcap captures on this bridge by ID
 	captures map[int]*capture
 
+	// edgeCaptures records the edge mirrors by output tap
+	edgeCaptures map[string]*edgeCapture
+
 	// captureID is a monotonically increasing counter used to assign unique
 	// IDs to captures. IDs must never be reused, even after captures are
 	// stopped and removed from the captures map or the bridge is recreated.
@@ -143,6 +146,8 @@ type Tap struct {
 	Container bool   // Set when created via CreateContainerTap
 	Bond      string // Bond that the tap belongs to
 	Defunct   bool   // Set when Tap should be reaped
+	Namespace string // Namespace that owns the tap, if known
+	Owner     string // VM that owns the tap, empty for host taps
 
 	portReaped bool // Set when reapTaps removed the OVS port
 	deleteLink bool // Set when reapTaps must destroy the device
