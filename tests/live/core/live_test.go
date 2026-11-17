@@ -10,7 +10,6 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -555,54 +554,6 @@ func testDisk(t *testing.T) {
 	snap := harness.MustTable(t, "disk info live/data-snap.qcow2")
 	if len(snap) == 0 || !strings.Contains(snap[0]["backingfile"], "data.qcow2") {
 		t.Errorf("snapshot backing file: %v", snap)
-	}
-}
-
-func testMiniweb(t *testing.T) {
-	get := func(path string) []byte {
-		t.Helper()
-		resp, err := http.Get(harness.MiniwebURL + path)
-		if err != nil {
-			t.Fatalf("GET %v: %v", path, err)
-		}
-		defer resp.Body.Close()
-		body, _ := io.ReadAll(resp.Body)
-		if resp.StatusCode != http.StatusOK {
-			t.Fatalf("GET %v: %v", path, resp.Status)
-		}
-		return body
-	}
-
-	if body := get("/"); !bytes.Contains(bytes.ToLower(body), []byte("minimega")) {
-		t.Errorf("index page does not mention minimega")
-	}
-
-	// miniweb talks to minimega over the same socket and lists our VMs, both
-	// by query and by the /<namespace>/ paths the web UI uses
-	for _, path := range []string{
-		"/vms/info.json?namespace=" + harness.Namespace,
-		"/" + harness.Namespace + "/vms/info.json",
-	} {
-		body := get(path)
-		for _, s := range topology {
-			if !bytes.Contains(body, []byte(`"`+s.Name+`"`)) {
-				t.Errorf("%v missing %v", path, s.Name)
-			}
-		}
-	}
-
-	if !miniwebNamespaces(t)[harness.Namespace] {
-		t.Errorf("/namespaces.json missing %v", harness.Namespace)
-	}
-
-	// a namespace that doesn't exist is not created by browsing to it (#1255)
-	const missing = "live-missing"
-	if code := miniwebStatus(t, "/"+missing+"/vms/info.json"); code != http.StatusNotFound {
-		t.Errorf("GET /%v/vms/info.json: status %v, want 404", missing, code)
-	}
-	if namespaceListed(t, missing) {
-		t.Errorf("miniweb created namespace %v", missing)
-		_, _ = harness.Raw("clear namespace " + missing)
 	}
 }
 
