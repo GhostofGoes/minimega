@@ -341,6 +341,11 @@ func (n *Namespace) Queue(arg string, vmType VMType, vmConfig VMConfig) ([]strin
 		VMType:   vmType,
 		Names:    names,
 	}
+
+	if vmType == CONTAINER {
+		q.FilesystemTar = tarSource(vmConfig.FilesystemPath)
+	}
+
 	n.queue = append(n.queue, q)
 	n.addToQueueIndex(q)
 
