@@ -94,8 +94,15 @@ type Pipe struct {
 	// set by PipeDelete, so that NewReader does not add to a deleted pipe
 	deleted bool
 
-	writes  []string // values queued by Write, sent in order by drainWrites
+	writes  []queuedWrite // values queued by Write, sent in order by drainWrites
 	writing bool
+}
+
+// queuedWrite is a value that Write queued, and the reader that must not get
+// it.
+type queuedWrite struct {
+	value string
+	skip  int64
 }
 
 type Reader struct {
@@ -127,6 +134,11 @@ type Message struct {
 	Data    map[int64]string
 	Readers []int64
 	Value   string
+
+	// Skip is the ID of a reader that must not get the value of a
+	// MESSAGE_FORWARD or MESSAGE_VIA_WRITE: the reader of whoever wrote it.
+	// 0 means that every reader may get it.
+	Skip int64
 }
 
 type int64Sorter []int64
@@ -190,8 +202,9 @@ func newPlumber(n mesh) *Plumber {
 }
 
 // forward a value written to a pipe on this host to the plumbers on the other
-// hosts, for recipient r as chosen by schedule. No lock may be held.
-func (p *Plumber) forward(pp *Pipe, data string, r int64) error {
+// hosts, for recipient r as chosen by schedule. The reader with ID skip, if
+// any, doesn't get it. No lock may be held.
+func (p *Plumber) forward(pp *Pipe, data string, r, skip int64) error {
 	if p.node == nil {
 		return nil
 	}
@@ -201,6 +214,7 @@ func (p *Plumber) forward(pp *Pipe, data string, r int64) error {
 		Type: MESSAGE_FORWARD,
 		Pipe: pp.name,
 		Data: make(map[int64]string),
+		Skip: skip,
 	}
 
 	pp.lock.Lock()
@@ -230,6 +244,10 @@ func (p *Plumber) forward(pp *Pipe, data string, r int64) error {
 
 		pp.lock.Lock()
 		for _, k := range readers {
+			if k == skip {
+				continue
+			}
+
 			d, err := pp.via(data)
 			if err != nil {
 				pp.lock.Unlock()
@@ -320,11 +338,11 @@ func (p *Plumber) drain(pipe string) {
 
 		switch m.Type {
 		case MESSAGE_FORWARD:
-			p.writeNoForward(m.Pipe, m.Data)
+			p.writeNoForward(m.Pipe, m.Data, m.Skip)
 		case MESSAGE_VIA_WRITE:
 			// wait for the write, to keep the order of the values
 			p.lock.Lock()
-			w, done := p.newWriter(m.Pipe)
+			w, done := p.newWriter(m.Pipe, m.Skip)
 			p.lock.Unlock()
 
 			w <- m.Value
@@ -707,11 +725,22 @@ func (p *Plumber) NewWriterDone(pipe string) (chan<- string, <-chan struct{}) {
 	p.lock.Lock()
 	defer p.lock.Unlock()
 
-	return p.newWriter(pipe)
+	return p.newWriter(pipe, 0)
 }
 
-// assume the lock is held
-func (p *Plumber) newWriter(pipe string) (chan<- string, <-chan struct{}) {
+// NewWriterExcept is like NewWriterDone, for a writer that also reads the pipe
+// with r: nothing sent on the writer is delivered to r. In round-robin and
+// random modes, one of the other readers gets it.
+func (p *Plumber) NewWriterExcept(pipe string, r *Reader) (chan<- string, <-chan struct{}) {
+	p.lock.Lock()
+	defer p.lock.Unlock()
+
+	return p.newWriter(pipe, r.ID)
+}
+
+// assume the lock is held. The reader with ID skip, if any, gets nothing of
+// what is sent on the writer.
+func (p *Plumber) newWriter(pipe string, skip int64) (chan<- string, <-chan struct{}) {
 	log.Debug("newWriter: %v", pipe)
 
 	c := make(chan string)
@@ -732,7 +761,7 @@ func (p *Plumber) newWriter(pipe string) (chan<- string, <-chan struct{}) {
 		defer close(done)
 
 		for v := range c {
-			p.sendValue(pipe, pp, v)
+			p.sendValue(pipe, pp, v, skip)
 		}
 		pp.lock.Lock()
 		pp.numWriters--
@@ -742,9 +771,9 @@ func (p *Plumber) newWriter(pipe string) (chan<- string, <-chan struct{}) {
 	return c, done
 }
 
-// sendValue sends v to the readers of pipe, local and across meshage. No lock
-// may be held.
-func (p *Plumber) sendValue(pipe string, pp *Pipe, v string) {
+// sendValue sends v to the readers of pipe, local and across meshage, except
+// the reader with ID skip. No lock may be held.
+func (p *Plumber) sendValue(pipe string, pp *Pipe, v string, skip int64) {
 	// don't do local writes if the via doesn't belong to
 	// us - post it to the owner instead.
 	if p.node != nil {
@@ -757,6 +786,7 @@ func (p *Plumber) sendValue(pipe string, pp *Pipe, v string) {
 				From:  p.node.Name(),
 				Type:  MESSAGE_VIA_WRITE,
 				Pipe:  pipe,
+				Skip:  skip,
 				Value: v,
 			}
 
@@ -769,24 +799,30 @@ func (p *Plumber) sendValue(pipe string, pp *Pipe, v string) {
 		}
 	}
 
-	r, err := p.schedule(pp)
+	r, err := p.schedule(pp, skip)
 	if err != nil {
 		log.Errorln(err)
 		return
 	}
 
-	err = p.forward(pp, v, r)
+	err = p.forward(pp, v, r, skip)
 	if err != nil {
 		log.Errorln(err)
 		return
 	}
 
-	pp.write(v, r)
+	pp.write(v, r, skip)
 }
 
 // Write queues value for pipe and returns. A single goroutine for each pipe
 // sends the queued values, so that they keep their order.
 func (p *Plumber) Write(pipe string, value string) {
+	p.write(pipe, value, 0)
+}
+
+// write queues a value for a named pipe, like Write. The reader with ID skip,
+// if any, doesn't get it.
+func (p *Plumber) write(pipe string, value string, skip int64) {
 	p.lock.Lock()
 	defer p.lock.Unlock()
 
@@ -801,7 +837,7 @@ func (p *Plumber) Write(pipe string, value string) {
 	pp.lock.Lock()
 	defer pp.lock.Unlock()
 
-	pp.writes = append(pp.writes, value)
+	pp.writes = append(pp.writes, queuedWrite{value, skip})
 
 	if !pp.writing {
 		pp.writing = true
@@ -821,18 +857,19 @@ func (p *Plumber) drainWrites(pipe string, pp *Pipe) {
 			return
 		}
 
-		v := pp.writes[0]
-		pp.writes[0] = ""
+		w := pp.writes[0]
+		pp.writes[0] = queuedWrite{}
 		pp.writes = pp.writes[1:]
 		pp.lock.Unlock()
 
-		p.sendValue(pipe, pp, v)
+		p.sendValue(pipe, pp, w.value, w.skip)
 	}
 }
 
 // Based on the pipe mode, choose a recipient - system wide. This means
-// querying other plumber's state over meshage. No lock may be held.
-func (p *Plumber) schedule(pp *Pipe) (int64, error) {
+// querying other plumber's state over meshage. The reader with ID skip, if
+// any, is never chosen. No lock may be held.
+func (p *Plumber) schedule(pp *Pipe, skip int64) (int64, error) {
 	pp.lock.Lock()
 	mode := pp.mode
 	pp.lock.Unlock()
@@ -841,7 +878,7 @@ func (p *Plumber) schedule(pp *Pipe) (int64, error) {
 		return SCHEDULE_ALL, nil
 	}
 
-	readers, err := p.remoteReaders(pp.name)
+	remote, err := p.remoteReaders(pp.name)
 	if err != nil {
 		return 0, err
 	}
@@ -849,8 +886,17 @@ func (p *Plumber) schedule(pp *Pipe) (int64, error) {
 	pp.lock.Lock()
 	defer pp.lock.Unlock()
 
+	var readers []int64
+
+	for _, k := range remote {
+		if k != skip {
+			readers = append(readers, k)
+		}
+	}
 	for k, _ := range pp.readers {
-		readers = append(readers, k)
+		if k != skip {
+			readers = append(readers, k)
+		}
 	}
 
 	sort.Sort(int64Sorter(readers))
@@ -926,14 +972,14 @@ func (p *Plumber) remoteReaders(pipe string) ([]int64, error) {
 // write to a named pipe without forwarding the message over meshage or
 // scheduling its delivery. The plumber lock is not held during the write,
 // which waits for the pipe's readers.
-func (p *Plumber) writeNoForward(pipe string, data map[int64]string) {
+func (p *Plumber) writeNoForward(pipe string, data map[int64]string, skip int64) {
 	p.lock.Lock()
 	pp, ok := p.pipes[pipe]
 	p.lock.Unlock()
 
 	if ok {
 		for r, v := range data {
-			pp.write(v, r)
+			pp.write(v, r, skip)
 		}
 	}
 }
@@ -1294,7 +1340,10 @@ func (p *Pipe) via(value string) (string, error) {
 }
 
 // don't assume the plumber lock is held
-func (p *Pipe) write(value string, r int64) {
+// write a value to the pipe's readers on this host: to all of them if r is
+// SCHEDULE_ALL, else to the reader with ID r. The reader with ID skip, if
+// any, doesn't get it.
+func (p *Pipe) write(value string, r, skip int64) {
 	// values are sent after the pipe lock is released, so a reader that does
 	// not read cannot block other users of the pipe, such as PipeDelete
 	type delivery struct {
@@ -1323,6 +1372,10 @@ func (p *Pipe) write(value string, r int64) {
 			log.Debug("%s", fmt.Sprintf("pipe %v: %v", p.name, strings.TrimSpace(value)))
 		}
 		for _, c := range p.readers {
+			if c.ID == skip {
+				continue
+			}
+
 			d, err := p.via(value)
 			if err != nil {
 				log.Errorln(err)
@@ -1331,7 +1384,7 @@ func (p *Pipe) write(value string, r int64) {
 			out = append(out, delivery{c, d})
 		}
 	} else {
-		if c, ok := p.readers[r]; ok {
+		if c, ok := p.readers[r]; ok && r != skip {
 			if p.log {
 				log.Debug("%s", fmt.Sprintf("pipe %v: %v", p.name, strings.TrimSpace(value)))
 			}
