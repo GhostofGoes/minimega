@@ -178,6 +178,11 @@ func formatBridgeInfo(info []bridge.BridgeInfo) string {
 	return o.String()
 }
 
+// writeHostTaps updates the host taps state file on disk.
+func writeHostTaps() {
+	mustWrite(filepath.Join(*f_base, "taps"), hostTapInfo())
+}
+
 // hostTapCreate creates a host tap based on the supplied arguments.
 func hostTapCreate(ns, b, tap string, v int) (string, error) {
 	if b == "" {
@@ -200,7 +205,7 @@ func hostTapCreate(ns, b, tap string, v int) (string, error) {
 	tap, err = br.CreateHostTap(tap, v)
 	if err == nil {
 		br.SetTapOwner(tap, ns, "")
-		mustWrite(filepath.Join(*f_base, "taps"), hostTapInfo())
+		writeHostTaps()
 	}
 
 	return tap, err
@@ -256,13 +261,21 @@ func hostTapDelete(ns *Namespace, s string) error {
 	var err error
 
 	if s == Wildcard {
+		defer writeHostTaps()
+
 		for tap := range ns.Taps {
+			if _, err := bridges.FindTap(tap); err != nil {
+				// tap went away with its bridge, nothing left to delete
+				delete(ns.Taps, tap)
+				continue
+			}
+
 			if err = delTap(tap); err != nil {
 				break
 			}
 		}
 	} else if err = delTap(s); err == nil {
-		mustWrite(filepath.Join(*f_base, "taps"), hostTapInfo())
+		writeHostTaps()
 	}
 
 	// remove the deleted taps before the command returns
@@ -392,6 +405,12 @@ func mirrorDelete(ns *Namespace, name string) error {
 
 	if name == Wildcard || name == "" {
 		for mirror := range ns.Mirrors {
+			if _, err := bridges.FindTap(mirror); err != nil {
+				// mirror went away with its bridge, nothing left to delete
+				delete(ns.Mirrors, mirror)
+				continue
+			}
+
 			if err := delMirror(mirror); err != nil {
 				return err
 			}
