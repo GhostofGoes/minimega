@@ -225,8 +225,10 @@ minimega can launch `container` type VMs in the Docker container, on a host
 with cgroup v1 or cgroup v2. On a cgroup v2 host, `start-minimega.sh` moves the
 processes of the Docker container to a child cgroup (`init`) and enables the
 `cpu` and `memory` controllers, because cgroup v2 only gives controllers to the
-children of a cgroup that holds no processes. This needs the writable cgroup
-filesystem that `--privileged` provides.
+children of a cgroup that holds no processes. It then sets `MM_CGROUP` to the
+cgroup of the Docker container, also with `--cgroupns host`, so the cgroups of
+the containers are below it and stop with the Docker container. This needs the
+writable cgroup filesystem that `--privileged` provides.
 
 ## Open vSwitch configuration
 

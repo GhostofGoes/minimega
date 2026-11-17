@@ -249,35 +249,50 @@ the path of the `-cgroup` flag (`/sys/fs/cgroup` by default).
 **cgroup v2**
 
 Current linux distributions mount cgroup v2 (the unified hierarchy) by
-default. minimega creates a `minimega` cgroup in the `-cgroup` path, and one
-cgroup for each container in it. It sets `memory.max` and `cpu.max` from the
-`memory` and `vcpus` of the container, pauses the container with
-`cgroup.freeze`, and attaches an eBPF program to the cgroup that permits the
-same devices as the `devices` subsystem of cgroup v1 does.
+default. minimega creates a `minimega` cgroup, and one cgroup for each
+container in it. It sets `memory.max` and `cpu.max` from the `memory` and
+`vcpus` of the container, pauses the container with `cgroup.freeze`, and
+attaches an eBPF program to the cgroup that permits the same devices as the
+`devices` subsystem of cgroup v1 does.
+
+The `minimega` cgroup is in the cgroup of minimega itself when systemd
+delegated that cgroup to minimega, and in the `-cgroup` path otherwise.
+
+- **systemd.** `misc/daemon/minimega.service`, which the deb and rpm packages
+  install, sets `Delegate=yes`, and systemd 244 or newer marks the cgroup of
+  such a service with the `trusted.delegate` extended attribute. minimega then
+  moves its own processes to a child cgroup `init` and creates the `minimega`
+  cgroup next to it, for example
+  `/sys/fs/cgroup/system.slice/minimega.service/minimega/<vm id>`. The
+  containers are part of the service, and systemd stops them with it, also
+  after minimega crashed (`KillMode=control-group`), as on cgroup v1.
+- **Docker.** The minimega Docker image moves the processes of its Docker
+  container to a child cgroup `init` when it starts and sets `-cgroup` to the
+  cgroup of the Docker container: the root of its cgroup namespace, or its
+  cgroup on the host with `--cgroupns host`. The containers stop with the
+  Docker container.
 
 minimega requires:
 
 - linux 5.2 or newer
-- the `cpu` and `memory` controllers in `cgroup.controllers` of the `-cgroup`
-  path
-- no processes in the cgroup at the `-cgroup` path, unless it is the root
-  cgroup. cgroup v2 does not give controllers to the children of a cgroup that
+- the `cpu` and `memory` controllers in `cgroup.controllers` of the cgroup that
+  holds the `minimega` cgroup
+- no processes in that cgroup, unless it is the root cgroup or delegated to
+  minimega. cgroup v2 does not give controllers to the children of a cgroup that
   holds processes.
 
-minimega runs in the root cgroup namespace when it is started on the host or by
-systemd, so the default `-cgroup` path works. A container engine such as Docker
-gives minimega a cgroup of its own, and the processes in it must first move to
-a child cgroup. The minimega Docker image does this when it starts.
+minimega started on the host outside of a delegated cgroup, for example from a
+shell, uses the `-cgroup` path, and the default works because minimega runs in
+the root cgroup namespace there.
 
 minimega enables the `cpu` and `memory` controllers for the children of the
-`-cgroup` path if they are not enabled there, and does not disable them again.
+cgroup that holds the `minimega` cgroup if they are not enabled there, and does
+not disable them again.
 
-The cgroup of a container is below the `-cgroup` path, not below the cgroup of
-minimega itself. A service manager that stops every process in the cgroup of a
-service, as systemd does, therefore does not stop the containers. minimega
-kills its containers when it exits. After a crash they keep running until the
-`nuke` command kills them, and minimega does not launch a container whose
-cgroup still has processes.
+minimega kills its containers when it exits. In the `-cgroup` path, the cgroup
+of a container is not below the cgroup of minimega, so after a crash the
+containers keep running until the `nuke` command kills them, and minimega does
+not launch a container whose cgroup still has processes.
 
 **cgroup v1**
 

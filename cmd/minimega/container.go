@@ -932,7 +932,7 @@ func (vm *ContainerVM) launch() error {
 		"-base",
 		*f_base,
 		"-cgroup",
-		*f_cgroup,
+		cgroupBase(),
 		CONTAINER_MAGIC,
 		vm.instancePath,
 		fmt.Sprintf("%v", vm.ID),

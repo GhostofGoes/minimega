@@ -57,6 +57,7 @@ is the init program of each container.
 ```
 tests/live/
   run.sh        run one group against a Docker image
+  stop.sh       check that containers stop with minimega (Docker, systemd)
   image/        vmbetter config (live.conf) and overlay for the guest kernel and initramfs
   harness/      package harness: shared helpers (socket client, cc, polling,
                 artifact parsers) and their offline unit tests
@@ -179,6 +180,24 @@ freezer state) and checks the device filter from inside the containers.
 | Networking | ping on a LAN, ping across the router between containers and the KVM VM, HTTP to protonuke in a container |
 | VM operations | `vm top`, `vm stop/start`, `vm kill` + `vm start`, `vm kill` + `vm flush` + `vm config clone` + queued relaunch |
 | Teardown | `clear namespace` removes VMs, processes, OVS ports, overlay mounts, network namespaces, and cgroups |
+
+### Containers stop with minimega
+
+`stop.sh` checks on a cgroup v2 host that the containers of minimega stop when
+minimega stops and when it is killed with `SIGKILL`, and that their cgroups
+are below the cgroup of the Docker container or the systemd service. It
+launches three containers that run `sleep` from a small filesystem copied from
+the host and pauses one of them. The `containers` job runs it after the group
+with the image under test, with a private cgroup namespace and with
+`--cgroupns host`; the DEB Build workflow runs it against the installed
+package and its `minimega.service`.
+
+```bash
+sudo tests/live/stop.sh docker minimega:dev
+sudo tests/live/stop.sh docker-host-cgroupns minimega:dev
+# after installing the deb or rpm package; uses /tmp/minimega-stop as base
+sudo tests/live/stop.sh systemd
+```
 
 ## Mesh group
 

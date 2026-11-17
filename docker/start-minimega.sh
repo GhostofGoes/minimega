@@ -84,36 +84,47 @@ shutdown() {
   cleanup_stale_minimega_state
 }
 
-# Let minimega create cgroups for containers on a cgroup v2 host. Docker starts
-# this script in the root of the container's cgroup namespace, and cgroup v2
-# only gives the CPU and memory controllers to the children of a cgroup that
-# holds no processes. Move every process to a child cgroup and enable the
-# controllers. `docker exec` then puts its processes in that child cgroup too.
+# Let minimega create cgroups for containers on a cgroup v2 host, below the
+# cgroup of this Docker container, so that they stop with it. That cgroup is the
+# root of the container's cgroup namespace, or a cgroup below the root of the
+# host with --cgroupns host. cgroup v2 only gives the CPU and memory controllers
+# to the children of a cgroup that holds no processes. Move every process to a
+# child cgroup, enable the controllers, and point minimega at the cgroup.
+# `docker exec` then puts its processes in that child cgroup too.
 setup_cgroup2() {
-  # Nothing to do on cgroup v1, or in the root cgroup of the host (--cgroupns host).
-  if [[ ! -f "${MM_CGROUP}/cgroup.controllers" || ! -f "${MM_CGROUP}/cgroup.type" ]]; then
+  # Nothing to do on cgroup v1.
+  if [[ ! -f "${MM_CGROUP}/cgroup.controllers" ]]; then
     return 0
   fi
 
-  local pid
+  local cgroup pid
 
-  mkdir -p "${MM_CGROUP}/init" || return 1
+  # the path of this process in the cgroup v2 hierarchy, "/" in a cgroup namespace
+  cgroup="${MM_CGROUP}$(sed -n 's/^0:://p' /proc/self/cgroup)"
+  cgroup="${cgroup%/}"
+  # Nothing to do in the root cgroup of the host, which has no cgroup.type.
+  if [[ ! -f "${cgroup}/cgroup.type" ]]; then
+    return 0
+  fi
+
+  mkdir -p "${cgroup}/init" || return 1
   # A process that starts here during the move, such as a `docker exec`, makes
   # the kernel refuse the controllers, so try a few times.
   for _ in 1 2 3; do
     # Read the whole list first, because it changes as the processes move.
-    for pid in $(<"${MM_CGROUP}/cgroup.procs"); do
+    for pid in $(<"${cgroup}/cgroup.procs"); do
       # A process may exit before it is moved.
-      echo "${pid}" > "${MM_CGROUP}/init/cgroup.procs" 2>/dev/null || true
+      echo "${pid}" > "${cgroup}/init/cgroup.procs" 2>/dev/null || true
     done
 
-    if echo "+cpu +memory" 2>/dev/null > "${MM_CGROUP}/cgroup.subtree_control"; then
+    if echo "+cpu +memory" 2>/dev/null > "${cgroup}/cgroup.subtree_control"; then
+      MM_CGROUP="${cgroup}"
       return 0
     fi
   done
 
   # once more, to report the error
-  echo "+cpu +memory" > "${MM_CGROUP}/cgroup.subtree_control"
+  echo "+cpu +memory" > "${cgroup}/cgroup.subtree_control" && MM_CGROUP="${cgroup}"
 }
 
 trap shutdown EXIT

@@ -132,8 +132,9 @@ module. Each test group is a sub-folder (a `topology.mm` plus its `//go:build
 live` Go tests); `tests/live/harness/` is the shared helper package, and
 `tests/live/core/` is the 22-VM group and `tests/live/containers/` the
 container group; the guest image is built by the
-image's own `vmbetter` from `tests/live/image/live.conf`. See
-[`tests/live/README.md`](tests/live/README.md).
+image's own `vmbetter` from `tests/live/image/live.conf`.
+`tests/live/stop.sh` checks that containers stop with minimega in Docker and
+under systemd. See [`tests/live/README.md`](tests/live/README.md).
 
 ```bash
 sudo LIVE_PULL=0 tests/live/run.sh minimega:dev

@@ -12,6 +12,8 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -156,6 +158,129 @@ func TestCgroupInitUnified(t *testing.T) {
 		}
 		if want := "+cpu +memory"; string(got) != want {
 			t.Errorf("%v: got %q, want %q", name, got, want)
+		}
+	}
+}
+
+func TestCgroupUnifiedPath(t *testing.T) {
+	for _, c := range []struct {
+		in   string
+		path string
+		ok   bool
+	}{
+		{"0::/system.slice/minimega.service\n", "/system.slice/minimega.service", true},
+		{"12:memory:/user.slice\n1:name=systemd:/user.slice/session-1.scope\n0::/user.slice/session-1.scope\n", "/user.slice/session-1.scope", true},
+		{"0::/\n", "/", true},
+		// cgroup v1 only
+		{"4:memory:/\n1:name=systemd:/init.scope\n", "", false},
+	} {
+		path, ok := cgroupUnifiedPath(c.in)
+		if path != c.path || ok != c.ok {
+			t.Errorf("cgroupUnifiedPath(%q): got %q, %v, want %q, %v", c.in, path, ok, c.path, c.ok)
+		}
+	}
+}
+
+// TestCgroupInitUnifiedDelegated runs the cgroup v2 setup in a cgroup that is
+// marked as delegated, as systemd does with Delegate=yes, and holds the test.
+// It needs root and a cgroup v2 mount.
+func TestCgroupInitUnifiedDelegated(t *testing.T) {
+	mount := cgroup2Mount()
+	if os.Geteuid() != 0 || mount == "" {
+		t.Skip("needs root and a cgroup v2 mount")
+	}
+	b, err := os.ReadFile("/proc/self/cgroup")
+	if err != nil {
+		t.Fatal(err)
+	}
+	own, ok := cgroupUnifiedPath(string(b))
+	if !ok {
+		t.Skip("not in a cgroup v2")
+	}
+	setCgroup(t, mount)
+
+	pid := []byte(strconv.Itoa(os.Getpid()))
+	root := filepath.Join(mount, fmt.Sprintf("minimega-test-delegated-%d", os.Getpid()))
+	if err := os.Mkdir(root, 0755); err != nil {
+		t.Skipf("unable to create a cgroup: %v", err)
+	}
+	t.Cleanup(func() {
+		cgroupRoot.Store(nil)
+		if err := os.WriteFile(filepath.Join(mount, own, "cgroup.procs"), pid, 0644); err != nil {
+			t.Errorf("move the test back to %v: %v", own, err)
+		}
+		for _, d := range []string{"minimega", "init", ""} {
+			if err := cgroupRemove(filepath.Join(root, d)); err != nil && !os.IsNotExist(err) {
+				t.Errorf("remove cgroup: %v", err)
+			}
+		}
+	})
+
+	if err := unix.Setxattr(root, "trusted.delegate", []byte("1"), 0); err != nil {
+		t.Skipf("unable to mark the cgroup as delegated: %v", err)
+	}
+	if !cgroupDelegated(root) {
+		t.Fatal("cgroupDelegated: got false for trusted.delegate=1")
+	}
+
+	// the test is not in the delegated cgroup yet
+	if dir, ok := cgroupOwnDelegated(); ok {
+		t.Fatalf("cgroupOwnDelegated outside of %v: got %v", root, dir)
+	}
+
+	if err := os.WriteFile(filepath.Join(root, "cgroup.procs"), pid, 0644); err != nil {
+		t.Fatal(err)
+	}
+	if dir, ok := cgroupOwnDelegated(); !ok || dir != root {
+		t.Fatalf("cgroupOwnDelegated: got %v, %v, want %v, true", dir, ok, root)
+	}
+
+	// a child process of minimega, such as a QEMU, moves too
+	sleep := exec.Command("sleep", "60")
+	if err := sleep.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		sleep.Process.Kill()
+		sleep.Wait()
+	}()
+
+	err = cgroupInitUnified()
+	// the controllers may be bound to cgroup v1 (a hybrid hierarchy)
+	if err != nil && !strings.Contains(err.Error(), "is not available") {
+		t.Fatal(err)
+	}
+
+	if got := cgroupDir("", "3"); got != filepath.Join(root, "minimega", "3") {
+		t.Errorf("cgroupDir: got %v", got)
+	}
+	procs := func(dir string) []string {
+		t.Helper()
+		b, err := os.ReadFile(filepath.Join(dir, "cgroup.procs"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := strings.Fields(string(b))
+		slices.Sort(got)
+		return got
+	}
+	if got := procs(root); len(got) != 0 {
+		t.Errorf("processes left in %v: %v", root, got)
+	}
+	want := []string{string(pid), strconv.Itoa(sleep.Process.Pid)}
+	slices.Sort(want)
+	if got := procs(filepath.Join(root, "init")); !reflect.DeepEqual(got, want) {
+		t.Errorf("processes in init: got %v, want %v", got, want)
+	}
+
+	// init is not delegated
+	if dir, ok := cgroupOwnDelegated(); ok {
+		t.Errorf("cgroupOwnDelegated in init: got %v", dir)
+	}
+
+	if err == nil {
+		if _, err := os.Stat(filepath.Join(root, "minimega", "cgroup.freeze")); err != nil {
+			t.Error(err)
 		}
 	}
 }

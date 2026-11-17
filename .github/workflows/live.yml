@@ -7,6 +7,8 @@ name: Live Tests
 # One job runs per test group: core, containers
 # (tests/live/containers/topology.mm), which runs containers next to a KVM VM,
 # and mesh (tests/live/mesh), which spans two minimega containers.
+# The containers job also checks with tests/live/stop.sh that the containers
+# stop with minimega in Docker; the DEB Build workflow checks it for systemd.
 #
 # Called by the Docker workflow: on master with the image it just pushed, on
 # pull requests with no image, so this job builds the checked-out code from
@@ -113,6 +115,13 @@ jobs:
             LIVE_TEST_BIN="${{ runner.temp }}/live.test" \
             LIVE_ARTIFACTS="${{ github.workspace }}/live-artifacts" \
             tests/live/run.sh "$IMAGE"
+
+      - name: Check that containers stop with minimega
+        if: matrix.group == 'containers'
+        run: |
+          for mode in docker docker-host-cgroupns; do
+            sudo LIVE_ARTIFACTS="${{ github.workspace }}/live-artifacts" tests/live/stop.sh "$mode" "$IMAGE"
+          done
 
       - name: Fix artifact permissions
         if: always()

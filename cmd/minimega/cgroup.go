@@ -13,16 +13,20 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 	"unsafe"
 
+	log "github.com/sandia-minimega/minimega/v2/pkg/minilog"
 	"golang.org/x/sys/unix"
 )
 
 // Containers are confined by cgroups below the -cgroup mount. cgroup v1 has a
 // hierarchy per controller (<cgroup>/<controller>/minimega/<vm id>), cgroup v2
-// a single unified one (<cgroup>/minimega/<vm id>).
+// a single unified one (<cgroup>/minimega/<vm id>). When systemd delegates the
+// cgroup of minimega to it (Delegate=yes), cgroup v2 uses that cgroup instead
+// of -cgroup, so that systemd stops the containers with the service.
 
 // cgroupControllers are the cgroup v1 controllers that containers use.
 var cgroupControllers = []string{"freezer", "memory", "devices", "cpu"}
@@ -30,6 +34,10 @@ var cgroupControllers = []string{"freezer", "memory", "devices", "cpu"}
 // cgroupUnifiedControllers are the cgroup v2 controllers that containers use.
 // The freezer is part of cgroup v2 itself and devices are filtered with eBPF.
 var cgroupUnifiedControllers = []string{"cpu", "memory"}
+
+// cgroupRoot is the cgroup v2 that holds the minimega cgroup, when it is not
+// -cgroup. containerInit sets it.
+var cgroupRoot atomic.Pointer[string]
 
 // cgroupUnified returns true if -cgroup is a cgroup v2 (unified) hierarchy.
 func cgroupUnified() bool {
@@ -41,12 +49,22 @@ func cgroupUnified() bool {
 	return st.Type == unix.CGROUP2_SUPER_MAGIC
 }
 
+// cgroupBase returns the cgroup v2 that holds the minimega cgroup, or the
+// cgroup v1 mount.
+func cgroupBase() string {
+	if root := cgroupRoot.Load(); root != nil {
+		return *root
+	}
+
+	return *f_cgroup
+}
+
 // cgroupDir returns the cgroup of minimega, or of a VM if id is given, for a
 // cgroup v1 controller. cgroup v2 has the same directory for all of them.
 func cgroupDir(controller string, id ...string) string {
 	elem := []string{*f_cgroup, controller, "minimega"}
 	if cgroupUnified() {
-		elem = []string{*f_cgroup, "minimega"}
+		elem = []string{cgroupBase(), "minimega"}
 	}
 
 	return filepath.Join(append(elem, id...)...)
@@ -69,10 +87,20 @@ func cgroupDirs(id ...string) []string {
 // cgroupInitUnified creates the minimega cgroup on cgroup v2 and delegates the
 // controllers that limit containers to it.
 func cgroupInitUnified() error {
+	own, delegated := cgroupOwnDelegated()
+	if delegated {
+		cgroupRoot.Store(&own)
+		log.Info("cgroup %v is delegated to minimega, containers are below it", own)
+	}
+
 	// clean potentially old cgroup noise
 	containerCleanCgroupDirs()
 
-	if err := cgroupDelegate(*f_cgroup); err != nil {
+	if delegated {
+		if err := cgroupVacate(own); err != nil {
+			return err
+		}
+	} else if err := cgroupDelegate(*f_cgroup); err != nil {
 		return err
 	}
 
@@ -108,7 +136,94 @@ func cgroupDelegate(dir string) error {
 	err = os.WriteFile(filepath.Join(dir, "cgroup.subtree_control"), []byte(enable), 0644)
 	if errors.Is(err, syscall.EBUSY) {
 		// only the root cgroup may hold processes and have controllers for its children
-		return fmt.Errorf("%v: move the processes in %v to a child cgroup, or set -cgroup", err, dir)
+		return fmt.Errorf("%w: move the processes in %v to a child cgroup, or set -cgroup", err, dir)
+	}
+
+	return err
+}
+
+// cgroupOwnDelegated returns the cgroup v2 of minimega below -cgroup, and
+// whether it is delegated to minimega. systemd marks the cgroup of a unit with
+// Delegate=yes with an extended attribute.
+func cgroupOwnDelegated() (string, bool) {
+	b, err := os.ReadFile("/proc/self/cgroup")
+	if err != nil {
+		log.Debug("unable to read the cgroup of minimega: %v", err)
+		return "", false
+	}
+
+	path, ok := cgroupUnifiedPath(string(b))
+	if !ok {
+		return "", false
+	}
+
+	dir := filepath.Join(*f_cgroup, path)
+	if !cgroupDelegated(dir) {
+		return dir, false
+	}
+
+	// the path is relative to the cgroup namespace, which -cgroup may not be from
+	procs, err := os.ReadFile(filepath.Join(dir, "cgroup.procs"))
+	if err != nil || !slices.Contains(strings.Fields(string(procs)), strconv.Itoa(os.Getpid())) {
+		log.Warn("cgroup %v is delegated but minimega is not in it, containers are below %v", dir, *f_cgroup)
+		return dir, false
+	}
+
+	return dir, true
+}
+
+// cgroupUnifiedPath returns the cgroup v2 path from /proc/<pid>/cgroup.
+func cgroupUnifiedPath(s string) (string, bool) {
+	for _, line := range strings.Split(s, "\n") {
+		if path, ok := strings.CutPrefix(line, "0::"); ok {
+			return path, true
+		}
+	}
+
+	return "", false
+}
+
+// cgroupDelegated returns true if systemd delegated a cgroup: it sets
+// trusted.delegate (systemd 244) and user.delegate (systemd 251) to 1.
+func cgroupDelegated(dir string) bool {
+	for _, attr := range []string{"trusted.delegate", "user.delegate"} {
+		buf := make([]byte, 1)
+		if n, err := unix.Getxattr(dir, attr, buf); err == nil && n == 1 && buf[0] == '1' {
+			return true
+		}
+	}
+
+	return false
+}
+
+// cgroupVacate moves every process in a cgroup v2 to its child cgroup init and
+// delegates the controllers, which cgroup v2 only allows in a cgroup without
+// processes. A process that starts meanwhile makes that fail, so try again.
+func cgroupVacate(dir string) error {
+	leaf := filepath.Join(dir, "init")
+	if err := os.MkdirAll(leaf, 0755); err != nil {
+		return fmt.Errorf("cgroup mkdir: %v", err)
+	}
+
+	var err error
+	for i := 0; i < 3; i++ {
+		// read the whole list first, because it changes as the processes move
+		var b []byte
+		if b, err = os.ReadFile(filepath.Join(dir, "cgroup.procs")); err != nil {
+			return err
+		}
+
+		for _, pid := range strings.Fields(string(b)) {
+			// a process may exit before it moves
+			err := os.WriteFile(filepath.Join(leaf, "cgroup.procs"), []byte(pid), 0644)
+			if err != nil && !errors.Is(err, syscall.ESRCH) {
+				return fmt.Errorf("move process %v to %v: %v", pid, leaf, err)
+			}
+		}
+
+		if err = cgroupDelegate(dir); !errors.Is(err, syscall.EBUSY) {
+			return err
+		}
 	}
 
 	return err
