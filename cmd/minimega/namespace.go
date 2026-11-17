@@ -257,11 +257,9 @@ func (n *Namespace) Destroy() error {
 	// Stop ron server
 	n.ccServer.Destroy()
 
-	// Delete any Taps associated with the namespace, then destroy them and
-	// the VM taps in one pass of the reaper
-	err := n.destroyTaps()
-	reapTaps()
-	if err != nil {
+	// Delete any Taps associated with the namespace. hostTapDelete destroys
+	// them and the VM taps in one pass of the reaper.
+	if err := hostTapDelete(n, Wildcard); err != nil {
 		return err
 	}
 
@@ -270,27 +268,6 @@ func (n *Namespace) Destroy() error {
 	mustWrite(filepath.Join(*f_base, "vlans"), vlanInfo())
 
 	n.ccServer.Destroy()
-
-	return nil
-}
-
-// destroyTaps marks the host taps of the namespace as defunct.
-func (n *Namespace) destroyTaps() error {
-	for t := range n.Taps {
-		tap, err := bridges.FindTap(t)
-		if err != nil {
-			return err
-		}
-
-		br, err := getBridge(tap.Bridge)
-		if err != nil {
-			return err
-		}
-
-		if err := br.DestroyTap(tap.Name); err != nil {
-			return err
-		}
-	}
 
 	return nil
 }
