@@ -126,7 +126,8 @@ phases (screenshots, QMP, serial, ...) still run.
 
 | Area | Checks |
 |---|---|
-| Control plane | `version`, `check`, `host`, `namespace`, `ns hosts/queue/queueing`, `vm info`, `vm info summary`, `vlans`, `bridge` + OVS port/VLAN tags, `file list`, `disk info/snapshot`, miniweb (`/`, `/vms/info.json`, `/<namespace>/` paths, `/namespaces.json`, cleared namespaces stay cleared) |
+| Control plane | `version`, `check`, `host`, `namespace`, `ns hosts/queue/queueing`, `vm info`, `vm info summary`, `vlans`, `bridge` + OVS port/VLAN tags, `file list`, `disk info/snapshot` |
+| miniweb | every UI page with and without a namespace prefix and the assets they load, `/vms/info.json` and `/vms/top.json` against `vm info`, `hosts`/`vlans`/`namespaces`/`files` JSON, file download, screenshots (PNG, `size`, `base64`), the noVNC page and its websocket's RFB greeting, `POST /vm/<name>/stop` and `start`, the console left disabled, and unknown and cleared namespaces that stay absent |
 | Boot | all 22 VMs `RUNNING`, 21 miniccc clients, every expected address learned from tap snooping |
 | Command and control | `cc exec` (one, all, tag and column filters), `cc exitcode`, `cc send`/`recv`, `cc background`, `cc process list/kill`, `cc responses`, `cc delete`, named pipe ordering (`pipe` and `miniccc -pipe` into a VM reader) |
 | Guest view of config | SMBIOS serial from `qemu-append`, VM UUID, disk sizes per interface, snapshot isolation, Q35 vs i440FX, xHCI, SMP, NIC driver and MAC, dual-homed addressing, router addresses on the right NIC despite GRE fallback devices |
