@@ -760,10 +760,10 @@ func TestClearVLANsBlacklistLaunchCopy(t *testing.T) {
 	ns := &Namespace{
 		Name:  "test",
 		Hosts: map[string]bool{hostname: true},
-		// a queued VM a on another VLAN makes the launch of a fail after the
-		// copy, before it schedules
+		// a queued VM vm-a on another VLAN makes the launch of vm-a fail
+		// after the copy, before it schedules
 		queue: []*QueuedVMs{{
-			Names:    []string{"a"},
+			Names:    []string{"vm-a"},
 			VMConfig: VMConfig{BaseConfig: BaseConfig{Networks: NetConfigs{{VLAN: 200}}}},
 		}},
 	}
@@ -806,7 +806,7 @@ func TestClearVLANsBlacklistLaunchCopy(t *testing.T) {
 	ns.vmConfig.Networks = NetConfigs{{VLAN: 100}}
 	ns.configLock.Unlock()
 
-	if err := cliVMLaunch(ns, minicli.MustCompile("vm launch kvm a"), &minicli.Response{}); err != nil {
+	if err := cliVMLaunch(ns, minicli.MustCompile("vm launch kvm vm-a"), &minicli.Response{}); err != nil {
 		t.Fatal(err)
 	}
 
