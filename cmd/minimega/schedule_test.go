@@ -88,7 +88,7 @@ func TestScheduleParallel(t *testing.T) {
 	n := &Namespace{Name: "test"}
 	n.queue = []*QueuedVMs{{Names: make([]string, 41)}}
 
-	if err := n.schedule(assignment); err != nil {
+	if err := n.schedule(assignment, n.queue); err != nil {
 		t.Fatal(err)
 	}
 
