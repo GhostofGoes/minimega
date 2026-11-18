@@ -142,9 +142,11 @@ func TestClearedNamespaceNotRecreated(t *testing.T) {
 func TestIndexRedirectKeepsNamespace(t *testing.T) {
 	setNamespaceFlag(t, "")
 
-	// a mux of its own that records the namespace that /vms receives
+	// a mux of its own that records the namespace that /vms receives. The
+	// redirect asks the mux whether the namespace name is also a route.
 	oldMux := mux
 	mux = http.NewServeMux()
+	mux.HandleFunc("/", indexHandler)
 	t.Cleanup(func() { mux = oldMux })
 
 	var got string
