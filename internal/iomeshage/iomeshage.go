@@ -87,10 +87,16 @@ func New(base string, node *meshage.Node, head string, hash bool) (*IOMeshage, e
 		return nil, err
 	}
 
+	// a test can run without a mesh node
+	var name string
+	if node != nil {
+		name = node.Name()
+	}
+
 	r := &IOMeshage{
 		base:      base,
 		node:      node,
-		name:      node.Name(),
+		name:      name,
 		Messages:  make(chan *meshage.Message, 1024),
 		TIDs:      make(map[int64]chan *Message),
 		transfers: make(map[string]*Transfer),
