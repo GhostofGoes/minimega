@@ -67,7 +67,7 @@ func newTestBridge(r tapReaper) *Bridge {
 		tunnels:  map[string]bool{},
 		mirrors:  map[string]bool{},
 		bonds:    map[string]map[string]int{},
-		captures: map[int]capture{},
+		captures: map[int]*capture{},
 		config:   map[string]string{},
 		reaper:   r,
 	}

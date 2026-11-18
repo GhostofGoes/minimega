@@ -18,7 +18,10 @@ import (
 )
 
 // for tests
-var openCaptureSource = openSource
+var (
+	openCaptureSource = openSource
+	upCaptureTap      = func(tap string) error { return upInterface(tap, true) }
+)
 
 // disableIPv6 stops the host from sending IPv6 router solicitations and DAD
 // frames on a capture tap.
@@ -54,7 +57,7 @@ func (b *Bridge) createCaptureTap(tap string, tags MirrorTags) error {
 		err = disableIPv6(tap)
 	}
 	if err == nil {
-		err = upInterface(tap, true)
+		err = upCaptureTap(tap)
 	}
 
 	if err != nil {
