@@ -45,6 +45,9 @@ func cliNuke(ns *Namespace, c *minicli.Command, resp *minicli.Response) error {
 	// nuke any state we have
 	DestroyNamespace(Wildcard)
 
+	// destroy the defunct taps that remain on the managed bridges
+	reapTaps()
+
 	// nuke any container related items
 	containerNuke()
 
@@ -57,6 +60,11 @@ func cliNuke(ns *Namespace, c *minicli.Command, resp *minicli.Response) error {
 
 	// allow udev to sync
 	time.Sleep(time.Second * 1)
+
+	// remove mirrors and capture ports that a crashed minimega left
+	if err := bridge.CleanStaleMirrors(); err != nil {
+		log.Error("unable to remove stale capture mirrors: %v", err)
+	}
 
 	// remove bridges that have preExist == false
 	nukeBridges()

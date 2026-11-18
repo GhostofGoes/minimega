@@ -167,11 +167,11 @@ Each call to `vm launch` queues a new VM:
 ```text
 minimega[minimega]$ namespace foo
 minimega[foo]$ ns queueing true
-minimega[foo]$ vm launch kvm a
-minimega[foo]$ vm launch kvm b
+minimega[foo]$ vm launch kvm vm-a
+minimega[foo]$ vm launch kvm vm-b
 minimega[foo]$ vm info
 minimega[foo]$ ns queue
-... displays VM configuration for a and b ...
+... displays VM configuration for vm-a and vm-b ...
 ```
 
 Calling `vm launch` with no additional arguments flushes the queue and invokes
@@ -187,6 +187,10 @@ start               | end                 | state     | launched | failures | to
 The scheduler, described below, distributes the queued VMs to nodes in the
 namespace and starts them. Once the queue is flushed, the VMs become visible in
 `vm info`.
+
+Each node gets the VMs of one `vm launch` command in one launch. A node runs up
+to one launch for each CPU at the same time. In `ns schedule status`,
+`launched` and `failures` are numbers of VMs.
 
 <a id="TOC_2.5."></a>
 
@@ -246,21 +250,21 @@ least loaded scheduler works, quad[0-3] will most likely not be scheduled on the
 same node.
 
 ```text
-minimega$ vm launch kvm a
-minimega$ vm config colocate a
-minimega$ vm launch kvm b
+minimega$ vm launch kvm vm-a
+minimega$ vm config colocate vm-a
+minimega$ vm launch kvm vm-b
 ```
 
-Instructs the scheduler to schedule `b` on the same node as `a`.
+Instructs the scheduler to schedule `vm-b` on the same node as `vm-a`.
 
 ```text
 minimega$ vm config coschedule 1
-minimega$ vm launch kvm a
-minimega$ vm config colocate a
-minimega$ vm launch kvm b
+minimega$ vm launch kvm vm-a
+minimega$ vm config colocate vm-a
+minimega$ vm launch kvm vm-b
 ```
 
-Instructs the scheduler to schedule `b` on the same node as `a` on the same
+Instructs the scheduler to schedule `vm-b` on the same node as `vm-a` on the same
 node with no other VMs.
 
 Note that `vm config schedule` and `vm config colocate` cannot be used for the
@@ -430,3 +434,16 @@ captured on the node that runs the VM and can be retrieved with `file get` when
 the capture completes. Capturing traffic on a bridge (PCAP or netflow) is not
 advised -- it may contain traffic from other experiments. See `help capture`
 for more details.
+
+VM and bridge captures accept options after the file name, such as
+`snaplen=128` or `filter="tcp port 80"`. These options apply to one capture
+only, so you do not have to change the namespace settings around a capture.
+
+To capture all the traffic of a namespace on all its hosts into one file, use
+`capture pcap namespace <filename>`. Each host mirrors the edge ports of the
+namespace, that is, its VM, container and host taps, and sends the frames to
+the node that runs the command. That node merges the frames in timestamp order.
+Each frame is in the file once, also when it crosses a GRE or VXLAN tunnel.
+Keep the clocks of the hosts synchronized with chrony or PTP, because the
+order of frames from different hosts depends on the host clocks. Every mesh
+node must run minimega 3.4.0 or later. See `help capture pcap namespace`.

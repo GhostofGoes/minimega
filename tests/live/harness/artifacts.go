@@ -14,10 +14,13 @@ import (
 	"io"
 	"net"
 	"os"
+	"strconv"
+	"strings"
+	"time"
 
-	"github.com/google/gopacket"
-	"github.com/google/gopacket/layers"
-	"github.com/google/gopacket/pcapgo"
+	"github.com/gopacket/gopacket"
+	"github.com/gopacket/gopacket/layers"
+	"github.com/gopacket/gopacket/pcapgo"
 )
 
 // This file reads the artifacts minimega writes (pcaps, screenshots, VNC recordings).
@@ -102,4 +105,25 @@ func FBChunks(path string) (int, error) {
 		}
 		n++
 	}
+}
+
+// ProcCPU returns the CPU time (user + system) from the contents of a
+// /proc/<pid>/stat file, at the usual 100 clock ticks per second.
+func ProcCPU(stat string) (time.Duration, error) {
+	// the command name is in parentheses and may contain spaces
+	i := strings.LastIndex(stat, ")")
+	if i < 0 {
+		return 0, fmt.Errorf("malformed stat: %q", stat)
+	}
+	// fields after the name start at field 3; utime and stime are 14 and 15
+	f := strings.Fields(stat[i+1:])
+	if len(f) < 13 {
+		return 0, fmt.Errorf("short stat: %q", stat)
+	}
+	utime, err1 := strconv.ParseInt(f[11], 10, 64)
+	stime, err2 := strconv.ParseInt(f[12], 10, 64)
+	if err := errors.Join(err1, err2); err != nil {
+		return 0, err
+	}
+	return time.Duration(utime+stime) * 10 * time.Millisecond, nil
 }

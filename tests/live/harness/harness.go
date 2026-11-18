@@ -340,6 +340,9 @@ func ccRead(id int) (map[string]CCResult, error) {
 }
 
 // CCExec runs a shell command on exactly one VM and returns its result.
+// minimega expands $name and ${name} in every command it gets, from its own
+// environment, so the script cannot use shell variables. $(command) is not
+// changed.
 func CCExec(t testing.TB, vm, script string) CCResult {
 	t.Helper()
 	r, err := ccExecTry(vm, script, 90*time.Second)
@@ -403,6 +406,25 @@ func InContainer(t testing.TB, args ...string) (string, error) {
 	cmd.Stderr = &out
 	err := cmd.Run()
 	return out.String(), err
+}
+
+// MinimegaCPU returns the CPU time the minimega process has used so far.
+func MinimegaCPU(t testing.TB) time.Duration {
+	t.Helper()
+	// the PID file holds minimega's PID inside the container
+	pid, err := os.ReadFile(filepath.Join(mmBase, "minimega.pid"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := InContainer(t, "cat", "/proc/"+strings.TrimSpace(string(pid))+"/stat")
+	if err != nil {
+		t.Fatalf("reading minimega's CPU time: %v: %v", err, out)
+	}
+	d, err := ProcCPU(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return d
 }
 
 // Artifact returns a path for a file worth keeping, creating its directory.

@@ -31,6 +31,7 @@ type Message struct {
 	Hash     string
 	Glob     []string
 	Part     int64
+	Size     int64 // file size in bytes, 0 if unknown
 	TID      int64
 	ACK      bool
 	Data     []byte
@@ -128,7 +129,8 @@ func (this Files) use(path, hash string, local bool) (*Message, bool) {
 	if this.head != "" { // running in -headnode mode
 		for _, msg := range this.msgMap[path] {
 			if msg.From == this.head { // file exists on head node
-				if msg.Hash == hash {
+				// two empty hashes only match if there is a local file at all
+				if msg.Hash == hash && (hash != "" || local) {
 					// This will happen if the local file is the same as the file on the
 					// head node.
 					return nil, true

@@ -39,7 +39,7 @@ info include:
 - namespace* : namespace the VM belongs to
 - type*      : one of (kvm, container, android)
 - uuid*      : QEMU system uuid
-- cc_active* : indicates whether cc is connected
+- cc_active* : true if a miniccc client for the VM is connected (see cc clients)
 - vcpus      : the number of allocated CPUs
 - memory     : allocated memory, in megabytes
 - vlan*      : vlan, as an integer
@@ -66,6 +66,8 @@ Additional fields are available for KVM-based VMs:
 - vnc_port      : port for VNC shim
 - usb-use-xhci  : usb controller (true = xhci; false = ehci)
 - tpm-socket	: path of emulated tpm socket
+- bidirectional-copy-paste : true if VNC clipboard text goes to qemu-vdagent
+- vga           : graphics card that QEMU emulates (for example, std or virtio)
 
 Additional fields are available for container-based VMs:
 
@@ -122,6 +124,13 @@ naming scheme:
 
 Note: VM names cannot be integers or reserved words (e.g. "all").
 
+A VM name usually becomes the host name of the guest, so it must be a valid
+host name (RFC 1123): one or more labels separated by dots, where each label
+has 1 to 63 letters, digits and hyphens and does not start or end with a
+hyphen. The full name has 2 to 253 characters. For example, "web-1", "a.b" and
+"web1.example.com" are valid, and "a", "web_1", "-web" and "web." are not.
+Namespace names are not host names and may also contain underscores.
+
 Users may specify a saved config explicitly rather than use the current one, for
 example:
 
@@ -131,7 +140,9 @@ example:
 
 If queueing is enabled (see "ns"), VMs will be queued for launching until "vm
 launch" is called with no additional arguments. This allows the scheduler to
-better allocate resources across the cluster.
+better allocate resources across the cluster. With queueing, minimega checks
+the names and UUIDs of the queued VMs against the VMs in the namespace when the
+queue launches.
 
 Android VMs use host-side emulator console/ADB port pairs. minimega currently
 uses 64 valid port pairs per host, so each host can run at most 64 Android VMs
@@ -467,6 +478,25 @@ status of in-flight migrations by invoking vm migrate with no arguments.`,
 		Call:    wrapVMTargetCLI(cliVMSave),
 		Suggest: wrapVMSuggest(VM_ANY_STATE, false),
 	},
+	{ // vm shutdown
+		HelpShort: "ask the guest of running VMs to shut down",
+		HelpLong: `
+Ask the guest of one or more running VMs to shut down. See "vm start" for a
+full description of allowable targets.
+
+The command returns immediately. The guest decides when to power off or
+reboot, and it can ignore the request. Use "vm info" to see the VM state.
+
+For KVM VMs, minimega sends the QMP command system_powerdown, which is an ACPI
+power button event.
+
+Other VM types do not support vm shutdown.`,
+		Patterns: []string{
+			"vm shutdown <vm target>",
+		},
+		Call:    wrapVMTargetCLI(cliVMShutdown),
+		Suggest: wrapVMSuggest(VM_RUNNING, true),
+	},
 	{ // vm cdrom
 		HelpShort: "eject or change an active VM's cdrom",
 		HelpLong: `
@@ -778,24 +808,19 @@ func cliVMLaunch(ns *Namespace, c *minicli.Command, resp *minicli.Response) erro
 
 	// adding VM to queue
 	if len(c.StringArgs) > 0 {
-		// create a local copy of the current or specified VMConfig
-		var vmConfig VMConfig
-
-		if name := c.StringArgs["config"]; name != "" {
-			if _, ok := ns.savedVMConfig[name]; !ok {
-				return fmt.Errorf("config %v does not exist", name)
-			}
-			vmConfig = ns.savedVMConfig[name].Copy()
-		} else {
-			vmConfig = ns.vmConfig.Copy()
-		}
-
 		vmType, err := findVMType(c.BoolArgs)
 		if err != nil {
 			return err
 		}
 
+		// create a local copy of the current or specified VMConfig
+		vmConfig, done, err := ns.copyVMConfig(c.StringArgs["config"])
+		if err != nil {
+			return err
+		}
+
 		err = ns.Queue(c.StringArgs["name"], vmType, vmConfig)
+		done()
 
 		if err == nil && !ns.QueueVMs {
 			// no error queueing and user has disabled queueing -- launch now!
@@ -1013,6 +1038,33 @@ func cliVMSave(ns *Namespace, c *minicli.Command, resp *minicli.Response) error 
 	return vm.Migrate(state_name)
 }
 
+// vmShutdown asks the guest of vm to shut down.
+func vmShutdown(vm VM) error {
+	switch vm := vm.(type) {
+	case *KvmVM:
+		return vm.Shutdown()
+	}
+
+	return fmt.Errorf("vm shutdown is not supported for %v VMs", vm.GetType())
+}
+
+func cliVMShutdown(ns *Namespace, c *minicli.Command, resp *minicli.Response) error {
+	return ns.VMs.Apply(c.StringArgs["vm"], func(vm VM, wild bool) (bool, error) {
+		if wild {
+			switch vm.(type) {
+			case *KvmVM:
+			default:
+				return false, nil
+			}
+			if vm.GetState() != VM_RUNNING {
+				return false, nil
+			}
+		}
+
+		return true, vmShutdown(vm)
+	})
+}
+
 func cliVMHotplug(ns *Namespace, c *minicli.Command, resp *minicli.Response) error {
 	target := c.StringArgs["vm"]
 
@@ -1093,6 +1145,12 @@ func cliVMHotplug(ns *Namespace, c *minicli.Command, resp *minicli.Response) err
 }
 
 func cliVMNetMod(ns *Namespace, c *minicli.Command, resp *minicli.Response) error {
+	if c.BoolArgs["add"] || c.BoolArgs["connect"] {
+		// Use the VLAN until the VMs store it, see vlanUseLock
+		done := vlanUseLock.Use()
+		defer done()
+	}
+
 	target := c.StringArgs["vm"]
 
 	var fn vmApplyFunc

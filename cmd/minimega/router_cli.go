@@ -51,9 +51,37 @@ router takes a number of subcommands:
 	router vm foo dhcp 10.0.0.0 static 00:11:22:33:44:55 10.0.0.10
 	router vm foo dhcp 10.0.0.0 static 00:11:22:33:44:56 10.0.0.11
 
+  The router can instead relay DHCP requests that arrive on one of its
+  addresses to one or more DHCP servers elsewhere in the experiment. Relaying
+  takes precedence over serving DHCP on the same address. For example, to
+  relay requests arriving on 10.0.1.1 to a DHCP server at 10.0.0.1:
+
+	router foo dhcp 10.0.1.1 relay 10.0.0.1
+
+  The server needs a route back to the relay address. A minirouter serving a
+  relayed subnet it has no interface on cannot infer the subnet's netmask, so
+  set it explicitly (dnsmasq otherwise assumes the classful netmask):
+
+	router bar dhcp 10.0.1.1 range 10.0.1.100 10.0.1.200
+	router bar dhcp 10.0.1.1 netmask 255.255.255.0
+	router bar dhcp 10.0.1.1 router 10.0.1.1
+
 - 'dns': Set DNS records for IPv4 or IPv6 hosts.
 
 - 'upstream': Set upstream server for DNS.
+
+- 'dnsmasq': Append a raw line to the router's dnsmasq config, for options
+  the other subcommands do not cover. Lines are written after the generated
+  config, in the order they were added. Quote lines that contain a '#'. For
+  example, to answer every *.test.com query with 1.0.0.1, forward test2.com to
+  another DNS server, and add a CNAME:
+
+	router foo dnsmasq address=/test.com/1.0.0.1
+	router foo dnsmasq server=/test2.com/3.0.0.1
+	router foo dnsmasq cname=www.test.com,test.com
+
+  The router VM's minirouter must include 'dnsmasq custom' support; older
+  minirouter builds stop applying the config at the first custom line.
 
 - 'gw': Set default gateway which will be used if there is no matching route.
 
@@ -139,8 +167,11 @@ router takes a number of subcommands:
 			"router <vm> <dhcp,> <listen address> <router,> <router address>",
 			"router <vm> <dhcp,> <listen address> <dns,> <address>",
 			"router <vm> <dhcp,> <listen address> <static,> <mac> <ip>",
+			"router <vm> <dhcp,> <listen address> <netmask,> <mask>",
+			"router <vm> <dhcp,> <listen address> <relay,> <server address>",
 			"router <vm> <dns,> <ip> <hostname>",
 			"router <vm> <upstream,> <ip>",
+			"router <vm> <dnsmasq,> <config line>...",
 			"router <vm> <gw,> <gw>",
 			"router <vm> <ra,> <subnet>",
 			"router <vm> <route,> <static,> <network> <next-hop> [staticroutename]",
@@ -179,9 +210,13 @@ router takes a number of subcommands:
 			"clear router <vm> <dhcp,> <listen address> <dns,>",
 			"clear router <vm> <dhcp,> <listen address> <static,>",
 			"clear router <vm> <dhcp,> <listen address> <static,> <mac>",
+			"clear router <vm> <dhcp,> <listen address> <netmask,>",
+			"clear router <vm> <dhcp,> <listen address> <relay,>",
+			"clear router <vm> <dhcp,> <listen address> <relay,> <server address>",
 			"clear router <vm> <dns,>",
 			"clear router <vm> <dns,> <ip>",
 			"clear router <vm> <upstream,>",
+			"clear router <vm> <dnsmasq,> [config line]...",
 			"clear router <vm> <gw,>",
 			"clear router <vm> <ra,>",
 			"clear router <vm> <ra,> <subnet>",
@@ -261,6 +296,10 @@ func cliRouter(ns *Namespace, c *minicli.Command, resp *minicli.Response) error 
 			mac := c.StringArgs["mac"]
 			ip := c.StringArgs["ip"]
 			return rtr.DHCPAddStatic(addr, mac, ip)
+		} else if c.BoolArgs["netmask"] {
+			return rtr.DHCPAddNetmask(addr, c.StringArgs["mask"])
+		} else if c.BoolArgs["relay"] {
+			return rtr.DHCPAddRelay(addr, c.StringArgs["server"])
 		}
 	} else if c.BoolArgs["dns"] {
 		ip := c.StringArgs["ip"]
@@ -271,6 +310,8 @@ func cliRouter(ns *Namespace, c *minicli.Command, resp *minicli.Response) error 
 		ip := c.StringArgs["ip"]
 		rtr.Upstream(ip)
 		return nil
+	} else if c.BoolArgs["dnsmasq"] {
+		return rtr.DnsmasqAdd(strings.Join(c.ListArgs["config"], " "))
 	} else if c.BoolArgs["gw"] {
 		rtr.Gateway(c.StringArgs["gw"])
 		return nil
@@ -521,6 +562,10 @@ func cliClearRouter(ns *Namespace, c *minicli.Command, resp *minicli.Response) e
 			d.router = ""
 		} else if c.BoolArgs["dns"] {
 			d.dns = ""
+		} else if c.BoolArgs["netmask"] {
+			d.netmask = ""
+		} else if c.BoolArgs["relay"] {
+			return rtr.DHCPDelRelay(addr, c.StringArgs["server"])
 		} else if c.BoolArgs["static"] {
 			mac := c.StringArgs["mac"]
 			if mac == "" {
@@ -540,6 +585,8 @@ func cliClearRouter(ns *Namespace, c *minicli.Command, resp *minicli.Response) e
 		return rtr.DNSDel(ip)
 	} else if c.BoolArgs["upstream"] {
 		return rtr.UpstreamDel()
+	} else if c.BoolArgs["dnsmasq"] {
+		return rtr.DnsmasqDel(strings.Join(c.ListArgs["config"], " "))
 	} else if c.BoolArgs["gw"] {
 		return rtr.GatewayDel()
 	} else if c.BoolArgs["ra"] {
@@ -606,6 +653,7 @@ func cliClearRouter(ns *Namespace, c *minicli.Command, resp *minicli.Response) e
 			return err
 		}
 		rtr.DNSDel("")
+		rtr.DnsmasqDel("")
 		rtr.RADDel("")
 		rtr.RouteStaticDel("")
 		rtr.NamedRouteStaticDel("", "")

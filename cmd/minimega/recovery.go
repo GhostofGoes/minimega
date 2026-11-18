@@ -96,6 +96,7 @@ func recover() error {
 					}
 
 					br.RecoverTap(c.Tap, c.MAC, c.VLAN, false)
+					br.SetTapOwner(c.Tap, namespace, name)
 				}
 			}
 
@@ -145,6 +146,7 @@ func recover() error {
 
 			// add VM to namespace
 			ns.VMs.m[kvm.ID] = kvm
+			ns.VMs.hookExit(kvm)
 
 			state, err := VMStateFromString(vm.State)
 			if err != nil {

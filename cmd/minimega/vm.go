@@ -78,6 +78,10 @@ type VM interface {
 	// when we create a VM but before adding it to the list of VMs.
 	Conflicts(VM) error
 
+	// conflictsNoLock is Conflicts without the lock of the VM. Use it only for
+	// a VM that is launching: the launch holds the lock.
+	conflictsNoLock(VM) error
+
 	SetCCActive(bool)
 	HasCC() bool
 	Connect(*ron.Server, bool) error
@@ -146,7 +150,7 @@ var vmInfo = []string{
 	// kvm fields
 	"vcpus", "disks", "snapshot", "initrd", "kernel", "cdrom", "save",
 	"append", "serial-ports", "virtio-ports", "vnc_port", "usb-use-xhci",
-	"tpm-socket", "bidirectional-copy-paste",
+	"tpm-socket", "bidirectional-copy-paste", "vga",
 	// android fields
 	"android_avd", "android_console_port", "android_adb_port", "android_serial",
 	"android_grpc_port",
@@ -408,6 +412,8 @@ func (vm *BaseVM) addBond(bond *BondConfig) error {
 	if bond.QinQ {
 		br.SetTapQinQ(bond.Name, bond.VLAN)
 	}
+
+	bond.Created = true
 
 	return nil
 }
@@ -693,6 +699,17 @@ func (vm *BaseVM) SetCCActive(active bool) {
 	vm.ActiveCC = active
 }
 
+// CCPolicy returns the cc policy of the VM: the configured cc-policy, or the
+// default of the VM type. The ron server reads it without the VM lock, so it
+// must not take it.
+func (vm *BaseVM) CCPolicy() string {
+	if vm.BaseConfig.CCPolicy != "" {
+		return vm.BaseConfig.CCPolicy
+	}
+
+	return ron.CCPolicyLegacy
+}
+
 func (vm *BaseVM) HasCC() bool {
 	vm.lock.Lock()
 	defer vm.lock.Unlock()
@@ -750,6 +767,8 @@ func (vm *BaseVM) networkConnect(pos, vlan int, bridge string) error {
 	if err := dst.AddTap(nic.Tap, nic.MAC, vlan, false); err != nil {
 		return err
 	}
+
+	dst.SetTapOwner(nic.Tap, vm.Namespace, vm.Name)
 
 	// Record updates to the VM config
 	nic.Alias = ""

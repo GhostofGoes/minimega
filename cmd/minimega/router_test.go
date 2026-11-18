@@ -1,10 +1,13 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"fmt"
 	"strings"
 	"testing"
+
+	"github.com/sandia-minimega/minimega/v2/pkg/minicli"
 )
 
 func TestGenerateConfig(t *testing.T) {
@@ -249,3 +252,178 @@ BGP Export Networks or Routes:
 Firewall Rules:
   Default Action: accept
 `
+
+func TestDnsmasqCustom(t *testing.T) {
+	r := NewRouter(1)
+	for _, line := range []string{
+		"address=/test.com/1.0.0.1",
+		"  server=/test2.com/3.0.0.1  ",
+		"address=/test.com/1.0.0.1", // duplicate, ignored
+		`txt-record=a.live,"x # y \ z"`,
+	} {
+		if err := r.DnsmasqAdd(line); err != nil {
+			t.Fatalf("DnsmasqAdd(%q): %v", line, err)
+		}
+	}
+	for _, line := range []string{"", "   ", "a=1\nb=2", "a=1\r", "a\x00"} {
+		if err := r.DnsmasqAdd(line); err == nil {
+			t.Errorf("DnsmasqAdd(%q) should fail", line)
+		}
+	}
+
+	want := []string{"address=/test.com/1.0.0.1", "server=/test2.com/3.0.0.1", `txt-record=a.live,"x # y \ z"`}
+	if strings.Join(r.dnsmasq, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("got %q, want %q", r.dnsmasq, want)
+	}
+
+	var b bytes.Buffer
+	r.writeConfig(&b)
+	for _, line := range []string{
+		`dnsmasq custom "address=/test.com/1.0.0.1"`,
+		`dnsmasq custom "server=/test2.com/3.0.0.1"`,
+		`dnsmasq custom "txt-record=a.live,\"x # y \\ z\""`,
+	} {
+		if !strings.Contains(b.String(), line+"\n") {
+			t.Errorf("config missing %q:\n%s", line, b.String())
+		}
+	}
+	// custom lines must reach minirouter before dnsmasq is restarted
+	if strings.Index(b.String(), "dnsmasq custom") > strings.Index(b.String(), "dnsmasq commit") {
+		t.Errorf("custom lines written after commit:\n%s", b.String())
+	}
+
+	if !strings.Contains(r.String(), "Custom dnsmasq config:\naddress=/test.com/1.0.0.1\n") {
+		t.Errorf("String() missing custom config:\n%s", r.String())
+	}
+
+	if err := r.DnsmasqDel("server=/test2.com/3.0.0.1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.DnsmasqDel("server=/test2.com/3.0.0.1"); err == nil {
+		t.Error("deleting a missing line should fail")
+	}
+	if len(r.dnsmasq) != 2 || r.dnsmasq[0] != "address=/test.com/1.0.0.1" {
+		t.Errorf("unexpected lines after delete: %q", r.dnsmasq)
+	}
+	if err := r.DnsmasqDel(""); err != nil || len(r.dnsmasq) != 0 {
+		t.Errorf("clearing all lines: err=%v, left %q", err, r.dnsmasq)
+	}
+	b.Reset()
+	r.writeConfig(&b)
+	if strings.Contains(b.String(), "dnsmasq custom") {
+		t.Errorf("cleared lines still written:\n%s", b.String())
+	}
+}
+
+func TestClearRouterDnsmasq(t *testing.T) {
+	vm := &KvmVM{BaseVM: &BaseVM{ID: 1, Name: "rtr", BaseConfig: BaseConfig{Tags: map[string]string{}}}}
+	ns := &Namespace{Name: "test", VMs: VMs{m: map[int]VM{1: vm}}, routers: map[int]*Router{}}
+
+	run := func(fn func(*Namespace, *minicli.Command, *minicli.Response) error, input string) {
+		t.Helper()
+		if err := fn(ns, minicli.MustCompile(input), &minicli.Response{}); err != nil {
+			t.Fatalf("%v: %v", input, err)
+		}
+	}
+
+	run(cliRouter, "router rtr dnsmasq address=/test.com/1.0.0.1")
+	run(cliRouter, "router rtr dnsmasq server=/test2.com/3.0.0.1")
+	run(cliClearRouter, "clear router rtr dnsmasq server=/test2.com/3.0.0.1")
+	if got := ns.routers[1].dnsmasq; len(got) != 1 || got[0] != "address=/test.com/1.0.0.1" {
+		t.Fatalf("after clearing one line: %q", got)
+	}
+
+	// clearing the whole router must drop custom lines too
+	run(cliClearRouter, "clear router rtr")
+	if got := ns.routers[1].dnsmasq; len(got) != 0 {
+		t.Fatalf("clear router left custom lines: %q", got)
+	}
+}
+
+func TestDnsmasqAddTooLong(t *testing.T) {
+	r := NewRouter(0)
+	max := bufio.MaxScanTokenSize - 1 - len(dnsmasqCustomCmd(""))
+	if err := r.DnsmasqAdd(strings.Repeat("a", max)); err != nil {
+		t.Errorf("line at the limit rejected: %v", err)
+	}
+	if err := r.DnsmasqAdd(strings.Repeat("b", max+1)); err == nil {
+		t.Error("line over the limit accepted")
+	}
+	// quoting escapes count toward the limit
+	if err := r.DnsmasqAdd(strings.Repeat(`"`, max/2+1)); err == nil {
+		t.Error("escaped line over the limit accepted")
+	}
+}
+
+func TestDHCPRelay(t *testing.T) {
+	r := NewRouter(2)
+	r.InterfaceAdd(0, "10.0.0.1/24", false)
+	r.InterfaceAdd(1, "10.0.1.1/24", false)
+
+	for _, server := range []string{"10.0.0.2", "10.0.0.3", "10.0.0.2"} {
+		if err := r.DHCPAddRelay("10.0.1.1", server); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := r.DHCPAddNetmask("10.0.2.1", "255.255.255.0"); err != nil {
+		t.Fatal(err)
+	}
+	r.DHCPAddRange("10.0.2.1", "10.0.2.100", "10.0.2.200")
+
+	if got := r.dhcp["10.0.1.1"].relay; len(got) != 2 {
+		t.Errorf("relay servers = %v, want 2 without duplicates", got)
+	}
+
+	var b bytes.Buffer
+	r.writeConfig(&b)
+	for _, want := range []string{
+		"dnsmasq dhcp relay 10.0.1.1 10.0.0.2",
+		"dnsmasq dhcp relay 10.0.1.1 10.0.0.3",
+		"dnsmasq dhcp range 10.0.2.1 10.0.2.100 10.0.2.200",
+		"dnsmasq dhcp netmask 10.0.2.1 255.255.255.0",
+	} {
+		if !strings.Contains(b.String(), want+"\n") {
+			t.Errorf("config missing %q:\n%s", want, b.String())
+		}
+	}
+
+	if s := r.String(); !strings.Contains(s, "10.0.0.2, 10.0.0.3") || !strings.Contains(s, "255.255.255.0") {
+		t.Errorf("router info missing relay or netmask:\n%s", s)
+	}
+
+	if err := r.DHCPDelRelay("10.0.1.1", "10.0.0.2"); err != nil {
+		t.Fatal(err)
+	}
+	if got := r.dhcp["10.0.1.1"].relay; len(got) != 1 || got[0] != "10.0.0.3" {
+		t.Errorf("relay servers after delete = %v", got)
+	}
+	if err := r.DHCPDelRelay("10.0.1.1", "10.0.0.9"); err == nil {
+		t.Error("expected error deleting unknown relay server")
+	}
+	if err := r.DHCPDelRelay("10.0.1.1", ""); err != nil || len(r.dhcp["10.0.1.1"].relay) != 0 {
+		t.Errorf("clear all relay servers: %v, %v", err, r.dhcp["10.0.1.1"].relay)
+	}
+	if err := r.DHCPDelRelay("10.9.9.9", ""); err == nil {
+		t.Error("expected error for unknown listen address")
+	}
+}
+
+func TestDHCPRelayInvalid(t *testing.T) {
+	r := NewRouter(1)
+	for _, c := range [][2]string{{"10.0.1.1", "dhcp.example"}, {"bogus", "10.0.0.2"}, {"10.0.1.1", "2001:db8::2"}, {"2001:db8:1::1", "10.0.0.2"}} {
+		if err := r.DHCPAddRelay(c[0], c[1]); err == nil {
+			t.Errorf("DHCPAddRelay(%q, %q) succeeded", c[0], c[1])
+		}
+	}
+	for _, mask := range []string{"24", "255.0.255.0", "foo", "::"} {
+		if err := r.DHCPAddNetmask("10.0.1.1", mask); err == nil {
+			t.Errorf("DHCPAddNetmask(%q) succeeded", mask)
+		}
+	}
+	if len(r.dhcp) != 0 {
+		t.Errorf("invalid input created DHCP entries: %v", r.dhcp)
+	}
+	if err := r.DHCPAddRelay("2001:db8:1::1", "2001:db8::2"); err != nil {
+		t.Errorf("IPv6 relay: %v", err)
+	}
+}

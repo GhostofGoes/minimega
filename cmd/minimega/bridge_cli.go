@@ -44,6 +44,9 @@ ip/netmask:
 
 	tap create 5 dhcp
 
+If the address cannot be configured, the tap is removed and the error is
+returned.
+
 Tap mirror mirrors packets that traverse the source tap to the destination tap.
 Both taps should already exist. You can use taps for VMs from "vm info" or host
 taps. For example, to mirror traffic that traverse mega_tapX to mega_tapY on
@@ -146,9 +149,19 @@ example, to create a vxlan tunnel to another bridge with IP 10.0.0.1:
 
 	bridge tunnel vxlan mega_bridge 10.0.0.1
 
+To list the Open vSwitch mirrors on the bridges of this host, use 'bridge
+mirrors'. The list includes mirrors that minimega did not make, with the kind
+external. Open vSwitch applies at most 32 mirrors on a bridge. Tap mirrors and
+captures use the same 32 mirrors. The kinds are tap-mirror, capture-bridge,
+capture-namespace and external, or a kind that another tool sets:
+
+	bridge mirrors
+	bridge mirrors mega_bridge
+
 Note: bridge is not a namespace-aware command.`,
 		Patterns: []string{
 			"bridge",
+			"bridge <mirrors,> [bridge]",
 			"bridge <config,> <bridge> <config>",
 			"bridge <trunk,> <bridge> <interface>",
 			"bridge <notrunk,> <bridge> <interface>",
@@ -183,6 +196,10 @@ func cliTap(ns *Namespace, c *minicli.Command, resp *minicli.Response) error {
 }
 
 func cliTapCreate(ns *Namespace, c *minicli.Command, resp *minicli.Response) error {
+	// Use the VLAN until the bridge stores the tap, see vlanUseLock
+	done := vlanUseLock.Use()
+	defer done()
+
 	b := c.StringArgs["bridge"]
 
 	vlan, err := lookupVLAN(ns.Name, c.StringArgs["vlan"])
@@ -190,10 +207,13 @@ func cliTapCreate(ns *Namespace, c *minicli.Command, resp *minicli.Response) err
 		return err
 	}
 
-	tap, err := hostTapCreate(b, c.StringArgs["tap"], vlan)
+	tap, err := hostTapCreate(ns.Name, b, c.StringArgs["tap"], vlan)
 	if err != nil {
 		return err
 	}
+
+	// The bridge lists the tap in HostTaps now, so do not wait for dhclient
+	done()
 
 	if c.BoolArgs["dhcp"] {
 		log.Debug("obtaining dhcp on tap %v", tap)
@@ -217,14 +237,17 @@ func cliTapCreate(ns *Namespace, c *minicli.Command, resp *minicli.Response) err
 
 	if err != nil {
 		// One of the above cases failed, try to clean up the tap
-		br, err := getBridge(b)
-		if err == nil {
-			err = br.DestroyTap(tap)
+		br, err2 := getBridge(b)
+		if err2 == nil {
+			err2 = br.DestroyTap(tap)
 		}
-		if err != nil {
+		if err2 != nil {
 			// Welp, we're boned
-			log.Error("zombie host tap -- %v %v", tap, err)
+			log.Error("zombie host tap -- %v %v", tap, err2)
 		}
+		writeHostTaps()
+
+		// report why the tap was removed, not the result of the cleanup
 		return err
 	}
 
@@ -245,7 +268,7 @@ func cliTapMirror(ns *Namespace, c *minicli.Command, resp *minicli.Response) err
 	src := c.StringArgs["src"]
 	dst := c.StringArgs["dst"]
 
-	if err := br.CreateMirror(src, dst); err != nil {
+	if err := br.CreateMirror(src, dst, ns.Name); err != nil {
 		return err
 	}
 
@@ -297,7 +320,7 @@ func cliTapMirrorVM(ns *Namespace, c *minicli.Command, resp *minicli.Response) e
 		return err
 	}
 
-	if err := br.CreateMirror(n1.Tap, n2.Tap); err != nil {
+	if err := br.CreateMirror(n1.Tap, n2.Tap, ns.Name); err != nil {
 		return err
 	}
 
@@ -343,6 +366,22 @@ func cliTapClearMirrorVM(ns *Namespace, c *minicli.Command, resp *minicli.Respon
 func cliBridge(ns *Namespace, c *minicli.Command, resp *minicli.Response) error {
 	iface := c.StringArgs["interface"]
 	remoteIP := c.StringArgs["remote"]
+
+	if c.BoolArgs["mirrors"] {
+		mirrors, err := bridge.ListMirrors(c.StringArgs["bridge"])
+		if err != nil {
+			return err
+		}
+
+		resp.Header = []string{"bridge", "mirror", "output", "namespace", "kind"}
+		resp.Tabular = [][]string{}
+
+		for _, m := range mirrors {
+			resp.Tabular = append(resp.Tabular, []string{m.Bridge, m.Mirror, m.Output, m.Namespace, m.Kind})
+		}
+
+		return nil
+	}
 
 	// Get the specified bridge. If we're listing the bridges, we'll get the
 	// default bridge which should be fine.

@@ -61,6 +61,9 @@ type AndroidVM struct {
 // Ensure that AndroidVM implements the VM interface.
 var _ VM = (*AndroidVM)(nil)
 
+// errAndroidVNCPort rejects vnc-port, since the emulator has no minimega VNC shim.
+var errAndroidVNCPort = errors.New("android VMs do not support vnc-port; clear vm config vnc-port")
+
 var (
 	androidPortMu       sync.Mutex
 	androidReservedPort = map[int]bool{}
@@ -92,6 +95,10 @@ func NewAndroid(name, namespace string, config VMConfig) (*AndroidVM, error) {
 
 	if vm.AVDName == "" {
 		return nil, errors.New("unable to create android VM without a configured android-avd")
+	}
+
+	if vm.VNCListenPort != 0 {
+		return nil, errAndroidVNCPort
 	}
 
 	return vm, nil
@@ -275,13 +282,17 @@ func (vm *AndroidVM) Info(field string) (string, error) {
 }
 
 func (vm *AndroidVM) Conflicts(vm2 VM) error {
+	vm.lock.Lock()
+	defer vm.lock.Unlock()
+
+	return vm.conflictsNoLock(vm2)
+}
+
+func (vm *AndroidVM) conflictsNoLock(vm2 VM) error {
 	switch vm2 := vm2.(type) {
 	case *AndroidVM:
 		return vm.conflictsAndroid(vm2)
 	case *KvmVM:
-		vm.lock.Lock()
-		defer vm.lock.Unlock()
-
 		if err := vm.conflictsKVMDisks(vm2.KVMConfig.Disks, vm2.Snapshot); err != nil {
 			return err
 		}
@@ -294,9 +305,6 @@ func (vm *AndroidVM) Conflicts(vm2 VM) error {
 }
 
 func (vm *AndroidVM) conflictsAndroid(vm2 *AndroidVM) error {
-	vm.lock.Lock()
-	defer vm.lock.Unlock()
-
 	if err := vm.conflictsKVMDisks(vm2.KVMConfig.Disks, vm2.Snapshot); err != nil {
 		return err
 	}
@@ -771,6 +779,8 @@ func (vm *AndroidVM) addTap(name, bridge, mac string, vlan int, qinq bool) (stri
 		return tap, err
 	}
 
+	br.SetTapOwner(tap, vm.Namespace, vm.Name)
+
 	if qinq {
 		if err := br.SetTapQinQ(tap, vlan); err != nil {
 			return tap, err
@@ -809,15 +819,13 @@ func (vm *AndroidVM) createBonds() error {
 	for i := range vm.Bonds {
 		bond := &vm.Bonds[i]
 
-		if bond.created {
+		if bond.Created {
 			continue
 		}
 
 		if err := vm.addBond(bond); err != nil {
 			return vm.setErrorf("unable to create android bond %v: %v", i, err)
 		}
-
-		bond.created = true
 	}
 
 	if len(vm.Bonds) > 0 {

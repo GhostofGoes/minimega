@@ -10,16 +10,19 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"os"
+	"path/filepath"
+	"reflect"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/sandia-minimega/minimega/v2/tests/live/harness"
+	"github.com/twmb/murmur3"
 )
 
 func TestMain(m *testing.M) {
@@ -58,12 +61,15 @@ func TestLive(t *testing.T) {
 		p("VLANs", testVLANs, inv),
 		p("Bridge", testBridge, inv),
 		p("FileList", testFileList, inv),
+		p("FileHash", testFileHash, version),
 		p("Disk", testDisk, inv),
 		p("Miniweb", testMiniweb, inv),
+		p("Pipes", testPipes, version),
 
 		// guests come up
 		p("CCClients", testCCClients, inv),
 		p("DHCP", testDHCP, inv),
+		p("DHCPRelay", testDHCPRelay, cc),
 
 		// command and control
 		p("CCExec", testCCExec, cc),
@@ -72,6 +78,8 @@ func TestLive(t *testing.T) {
 		p("CCSendRecv", testCCSendRecv, cc),
 		p("CCBackgroundProcess", testCCBackgroundProcess, cc),
 		p("CCResponses", testCCResponses, cc),
+		p("CCPipeOrder", testCCPipeOrder, cc),
+		p("CCPipes", testCCPipes, cc),
 
 		// what the guest sees of its VM configuration
 		p("GuestQemuAppend", testGuestQemuAppend, cc),
@@ -80,6 +88,7 @@ func TestLive(t *testing.T) {
 		p("GuestSMP", testGuestSMP, cc),
 		p("GuestNICDrivers", testGuestNICDrivers, cc),
 		p("GuestDualHomed", testGuestDualHomed, network),
+		p("RouterInterfaces", testRouterInterfaces, cc),
 
 		// networking
 		p("PingSameLAN", testPingSameLAN, network),
@@ -87,9 +96,11 @@ func TestLive(t *testing.T) {
 		p("PingAcrossRouters", testPingAcrossRouters, network),
 		p("NoBackchannelHostReachable", testNoBackchannelHost, network),
 		p("DNS", testDNS, network),
+		p("DNSCustom", testDNSCustom, network),
 		p("HTTPProtonuke", testHTTPProtonuke, network),
 		p("Firewall", testFirewall, network),
 		p("HostTap", testHostTap, network),
+		p("HostTapCreate", testHostTapCreate, inv),
 		p("QoS", testQoS, network),
 		p("CapturePcap", testCapturePcap, network),
 
@@ -97,14 +108,27 @@ func TestLive(t *testing.T) {
 		p("Screenshot", testScreenshot, inv),
 		p("Serial", testSerial, inv),
 		p("QMP", testQMP, inv),
-		p("VNCRecord", testVNCRecord, inv),
+		p("VNCShim", testVNCShim, inv),
+		p("VNCRecordFB", testVNCRecordFB, inv),
+		p("VNCKeyboard", testVNCKeyboard, cc),
+		p("VNCType", testVNCType, cc),
+		p("VNCInjectLoadFile", testVNCInjectLoadFile, cc),
+		p("VNCKill", testVNCKill, inv),
 		p("Tags", testTags, cc),
 		p("Top", testTop, inv),
 		p("StopStart", testStopStart, cc),
 		p("NetDisconnectConnect", testNetDisconnectConnect, network),
 		p("Hotplug", testHotplug, cc),
 		p("Save", testSave, cc),
+		p("VMNameRules", testVMNameRules, inv),
 		p("KillFlushRelaunch", testKillFlushRelaunch, cc),
+		p("VNCFixedPort", testVNCFixedPort, inv),
+
+		// tools shipped in the image
+		p("Passwordify", testPasswordify, cc),
+
+		// a second mesh node pulling files with iomeshage
+		p("FileTransfer", testFileTransfer, version),
 
 		// teardown
 		p("ClearNamespace", testClearNamespace, version),
@@ -261,6 +285,7 @@ func testVMConfig(t *testing.T) {
 	check("host-c2", "disks", "writeback")
 	check("host-c5", "usb-use-xhci", "true")
 	check("host-d5", "uuid", d5UUID)
+	check("host-d3", "vnc_port", d3VNCPort)
 	for i := 1; i <= 5; i++ {
 		check("host-b"+itoa(i), "mac", "00:1f:53:00:02:1"+itoa(i))
 	}
@@ -293,7 +318,7 @@ func testVLANs(t *testing.T) {
 		t.Errorf("lan-a = %q, want 1001 (vlans add)", got["lan-a"])
 	}
 	seen := map[string]string{}
-	for _, alias := range []string{"lan-a", "lan-b", "lan-c", "lan-d"} {
+	for _, alias := range []string{"lan-a", "lan-b", "lan-c", "lan-d", "lan-e"} {
 		v, ok := got[alias]
 		if !ok {
 			t.Errorf("alias %v missing: %v", alias, got)
@@ -373,6 +398,152 @@ func testFileList(t *testing.T) {
 	}
 }
 
+// fileHash returns the "file list" hash column for a file under live/, and
+// whether the file is listed at all.
+func fileHash(t *testing.T, name string) (string, bool) {
+	t.Helper()
+	for _, r := range harness.MustTable(t, "file list live") {
+		if strings.TrimPrefix(r["name"], "/") == "live/"+name {
+			if _, ok := r["hash"]; !ok {
+				t.Fatalf("file list has no hash column: minimega must run with -hashfiles (tests/live/run.sh)")
+			}
+			return r["hash"], true
+		}
+	}
+	return "", false
+}
+
+// waitFileHash waits for a file under live/ to be listed with the wanted hash.
+func waitFileHash(t *testing.T, name, want string) {
+	t.Helper()
+	harness.Eventually(t, time.Minute, 500*time.Millisecond, func() error {
+		if got, ok := fileHash(t, name); !ok || got != want {
+			return fmt.Errorf("%v: hash %q (listed: %v), want %q", name, got, ok, want)
+		}
+		return nil
+	})
+}
+
+func murmurHex(b []byte) string {
+	h := murmur3.New64()
+	h.Write(b)
+	return fmt.Sprintf("%x", h.Sum(nil))
+}
+
+// testFileHash checks -hashfiles on files copied into the files directory:
+// a file is hashed once it stops changing, not on every write to it
+// (sandia-minimega/minimega#1677), and the hash follows changes, renames and
+// removals.
+func testFileHash(t *testing.T) {
+	dir := harness.MMFiles + "/live/"
+	names := []string{"hash-copy.img", "hash-moved.img", "hash-dir/sub/nested.img", "hash-dir"}
+	defer func() {
+		for _, n := range names {
+			os.RemoveAll(dir + n)
+		}
+	}()
+
+	// files staged before minimega started are hashed at startup
+	initrd, err := os.ReadFile(dir + "live.initrd")
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitFileHash(t, "live.initrd", murmurHex(initrd))
+
+	// what minimega uses when no file is being copied
+	const window = 8 * time.Second
+	idle := harness.MinimegaCPU(t)
+	time.Sleep(window)
+	idle = harness.MinimegaCPU(t) - idle
+
+	// Copy 256 MiB the way a copy from another file system or over the
+	// network arrives: thousands of small writes spread over several seconds.
+	const (
+		chunks = 2048
+		size   = 128 << 10
+	)
+	chunk := make([]byte, size)
+	for i := range chunk {
+		chunk[i] = byte(i * 7)
+	}
+	f, err := os.Create(dir + "hash-copy.img")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+
+	sum := murmur3.New64()
+	before, start := harness.MinimegaCPU(t), time.Now()
+	for i := 0; i < chunks; i++ {
+		chunk[0] = byte(i)
+		if _, err := f.Write(chunk); err != nil {
+			t.Fatal(err)
+		}
+		sum.Write(chunk)
+		if i == chunks/2 {
+			// a half-written file must not be served with a hash
+			if got, ok := fileHash(t, "hash-copy.img"); !ok || got != "" {
+				t.Errorf("mid-copy: hash %q (listed: %v), want listed with no hash", got, ok)
+			}
+		}
+		// pace the copy over the same window the idle sample covered
+		if wait := time.Duration(i+1)*window/chunks - time.Since(start); wait > 0 {
+			time.Sleep(wait)
+		}
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	want := fmt.Sprintf("%x", sum.Sum(nil))
+	waitFileHash(t, "hash-copy.img", want)
+	used := harness.MinimegaCPU(t) - before
+	t.Logf("minimega CPU: %v idle, %v during a %v copy of %d MiB", idle, used, time.Since(start).Round(time.Second), chunks*size>>20)
+
+	// Hashing the file once takes well under a second. Rehashing it on every
+	// write kept every core busy for the whole copy.
+	if used > idle+4*time.Second {
+		t.Errorf("minimega used %v of CPU during the copy (%v when idle): is it hashing on every write?", used, idle)
+	}
+
+	// appending changes the hash
+	a, err := os.OpenFile(dir+"hash-copy.img", os.O_WRONLY|os.O_APPEND, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sum.Write([]byte("more"))
+	if _, err := a.Write([]byte("more")); err != nil {
+		t.Fatal(err)
+	}
+	a.Close()
+	appended := fmt.Sprintf("%x", sum.Sum(nil))
+	waitFileHash(t, "hash-copy.img", appended)
+
+	// a rename moves the hash to the new name
+	if err := os.Rename(dir+"hash-copy.img", dir+"hash-moved.img"); err != nil {
+		t.Fatal(err)
+	}
+	waitFileHash(t, "hash-moved.img", appended)
+	if _, ok := fileHash(t, "hash-copy.img"); ok {
+		t.Errorf("renamed file is still listed under its old name")
+	}
+
+	// a file written into directories created a moment earlier is hashed too
+	if err := os.MkdirAll(dir+"hash-dir/sub", 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(dir+"hash-dir/sub/nested.img", []byte("nested"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	harness.Eventually(t, time.Minute, 500*time.Millisecond, func() error {
+		for _, r := range harness.MustTable(t, "file list live/hash-dir/sub") {
+			if strings.HasSuffix(r["name"], "nested.img") && r["hash"] == murmurHex([]byte("nested")) {
+				return nil
+			}
+		}
+		return fmt.Errorf("live/hash-dir/sub/nested.img has no hash yet")
+	})
+}
+
 func testDisk(t *testing.T) {
 	rows := harness.MustTable(t, "disk info live/data.qcow2")
 	if len(rows) != 1 {
@@ -397,32 +568,47 @@ func testDisk(t *testing.T) {
 	}
 }
 
-func testMiniweb(t *testing.T) {
-	get := func(path string) []byte {
-		t.Helper()
-		resp, err := http.Get(harness.MiniwebURL + path)
-		if err != nil {
-			t.Fatalf("GET %v: %v", path, err)
-		}
-		defer resp.Body.Close()
-		body, _ := io.ReadAll(resp.Body)
-		if resp.StatusCode != http.StatusOK {
-			t.Fatalf("GET %v: %v", path, resp.Status)
-		}
-		return body
+// miniwebStatus returns the status code miniweb answers path with.
+func miniwebStatus(t *testing.T, path string) int {
+	t.Helper()
+	resp, err := http.Get(harness.MiniwebURL + path)
+	if err != nil {
+		t.Fatalf("GET %v: %v", path, err)
+	}
+	_ = resp.Body.Close()
+	return resp.StatusCode
+}
+
+// miniwebNamespaces returns the namespaces miniweb lists.
+func miniwebNamespaces(t *testing.T) map[string]bool {
+	t.Helper()
+	resp, err := http.Get(harness.MiniwebURL + "/namespaces.json")
+	if err != nil {
+		t.Fatalf("GET /namespaces.json: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	var rows []map[string]string
+	if err := json.NewDecoder(resp.Body).Decode(&rows); err != nil {
+		t.Fatalf("decode /namespaces.json: %v", err)
 	}
 
-	if body := get("/"); !bytes.Contains(bytes.ToLower(body), []byte("minimega")) {
-		t.Errorf("index page does not mention minimega")
+	res := map[string]bool{}
+	for _, r := range rows {
+		res[r["namespace"]] = true
 	}
+	return res
+}
 
-	// miniweb talks to minimega over the same socket and lists our VMs
-	body := get("/vms/info.json?namespace=" + harness.Namespace)
-	for _, s := range topology {
-		if !bytes.Contains(body, []byte(`"`+s.Name+`"`)) {
-			t.Errorf("/vms/info.json missing %v", s.Name)
+// namespaceListed reports whether minimega lists the namespace.
+func namespaceListed(t *testing.T, name string) bool {
+	t.Helper()
+	for _, r := range toRowsMust(t, "namespace") {
+		if r["namespace"] == name {
+			return true
 		}
 	}
+	return false
 }
 
 // --- guests come up ----------------------------------------------------------
@@ -465,6 +651,9 @@ func testDHCP(t *testing.T) {
 		vms := harness.VMInfo(t)
 		var bad []string
 		for _, s := range topology {
+			if s.Relay {
+				continue
+			}
 			ips := harness.List(vms[s.Name]["ip"])
 			for i, want := range s.IPs {
 				got := ""
@@ -498,6 +687,37 @@ func testDHCP(t *testing.T) {
 }
 
 // --- command and control -----------------------------------------------------
+
+// testDHCPRelay checks host-e1's lease: rtr-cd relays lan-e's DHCP requests
+// to the server on rtr-ab, which has no interface on lan-e.
+func testDHCPRelay(t *testing.T) {
+	harness.Eventually(t, harness.SettleTimeout, 5*time.Second, func() error {
+		if ips := harness.List(harness.VMInfo(t)["host-e1"]["ip"]); len(ips) == 0 || ips[0] != "10.10.5.11" {
+			return fmt.Errorf("host-e1 ip = %v, want 10.10.5.11", ips)
+		}
+		return nil
+	})
+
+	if out := harness.CCOK(t, "rtr-cd", "grep -E '^[[:space:]]*dhcp-(relay|range)' /etc/dnsmasq.conf"); !strings.Contains(out, "dhcp-relay=10.10.5.1,10.10.2.1") || strings.Contains(out, "set:10.10.5.1") {
+		t.Errorf("rtr-cd dnsmasq.conf should relay 10.10.5.1 and not serve it:\n%s", out)
+	}
+	if out := harness.CCOK(t, "rtr-ab", "grep -E '^[[:space:]]*dhcp-range=set:10.10.5.1' /etc/dnsmasq.conf"); !strings.Contains(out, "255.255.255.0") {
+		t.Errorf("rtr-ab dnsmasq.conf range for 10.10.5.1 lacks the netmask:\n%s", out)
+	}
+	harness.CCEventually(t, "rtr-ab", "grep -qi 00:1f:53:00:05:11 /var/lib/misc/dnsmasq.leases", time.Minute)
+
+	// the relayed lease carries the netmask, gateway, and DNS server from rtr-ab
+	if out := harness.CCOK(t, "host-e1", "ip -4 -o addr show dev eth0"); !strings.Contains(out, "10.10.5.11/24") {
+		t.Errorf("host-e1 address is not 10.10.5.11/24:\n%s", out)
+	}
+	if out := harness.CCOK(t, "host-e1", "ip route show default"); !strings.Contains(out, "via 10.10.5.1") {
+		t.Errorf("host-e1 default route is not via 10.10.5.1:\n%s", out)
+	}
+	if out := harness.CCOK(t, "host-e1", "cat /etc/resolv.conf"); !strings.Contains(out, "10.10.5.1") {
+		t.Errorf("host-e1 resolv.conf does not use 10.10.5.1:\n%s", out)
+	}
+	harness.CCEventually(t, "host-e1", "ping -c 3 -W 2 10.10.1.1", 2*time.Minute)
+}
 
 func testCCExec(t *testing.T) {
 	out := harness.CCOK(t, "host-b1", "hostname; uname -s")
@@ -619,6 +839,419 @@ func testCCResponses(t *testing.T) {
 	harness.MustRun(t, fmt.Sprintf("cc delete response %d", id))
 }
 
+// testCCPipeOrder writes numbered lines to a named pipe, first from minimega
+// and then from another VM through miniccc, and checks that a reader in a VM
+// receives them in order.
+func testCCPipeOrder(t *testing.T) {
+	const (
+		pipe   = "live-order"
+		reader = "host-c4"
+		writer = "host-d3"
+		count  = 300
+		out    = "/tmp/pipe-order" // .in and .txt files
+	)
+
+	// A FIFO held open on stdin keeps the reader's "miniccc -pipe" from
+	// exiting on EOF. tee writes each line to the file without a buffer, head
+	// exits once it has every line, and timeout bounds the reader if it never
+	// does. minimega expands $VAR in commands, so these scripts cannot use
+	// shell variables.
+	harness.CCRun(t, "name="+reader, fmt.Sprintf(`background sh -c "rm -f %[1]v.in; mkfifo %[1]v.in; exec 3<>%[1]v.in; timeout 180 miniccc -pipe %[2]v <&3 | tee %[1]v.txt | head -n %[3]d > /dev/null"`, out, pipe, 2*count), 1, time.Minute)
+	defer func() {
+		// more values hit head's closed stdin, so tee and then the reader
+		// exit, and the reader closes its end of the pipe
+		harness.Eventually(t, 4*time.Minute, 3*time.Second, func() error {
+			if _, err := harness.Run("pipe " + pipe + " done"); err != nil {
+				return err
+			}
+			_, err := harness.Run("clear pipe " + pipe)
+			return err
+		})
+	}()
+
+	harness.Eventually(t, time.Minute, 2*time.Second, func() error {
+		for _, r := range harness.MustTable(t, "pipe") {
+			if r["name"] == harness.Namespace+"//"+pipe && r["readers"] != "0" {
+				return nil
+			}
+		}
+		return fmt.Errorf("no reader on pipe %v", pipe)
+	})
+
+	for i := 1; i <= count; i++ {
+		harness.MustRun(t, fmt.Sprintf("pipe %v %d", pipe, i))
+	}
+	// "pipe" returns once a value is queued, and the two writers are not
+	// ordered against each other: let these reach the guest first
+	harness.CCEventually(t, reader, fmt.Sprintf("test $(wc -l < %v.txt) -ge %d", out, count), time.Minute)
+	harness.CCOK(t, writer, fmt.Sprintf("seq %d %d | miniccc -pipe %v > /dev/null", count+1, 2*count, pipe))
+
+	harness.CCEventually(t, reader, fmt.Sprintf("test $(wc -l < %v.txt) -ge %d", out, 2*count), 2*time.Minute)
+	got := strings.Fields(harness.CCOK(t, reader, "cat "+out+".txt"))
+	if len(got) != 2*count {
+		t.Fatalf("reader received %d lines, want %d", len(got), 2*count)
+	}
+	for i, v := range got {
+		if v != strconv.Itoa(i+1) {
+			t.Fatalf("line %d is %q, want %d (first %d lines: %v)", i+1, v, i+1, min(len(got), 20), got[:min(len(got), 20)])
+		}
+	}
+
+	for _, r := range harness.MustTable(t, "pipe") {
+		if r["name"] == harness.Namespace+"//"+pipe && r["previous"] != strconv.Itoa(2*count) {
+			t.Errorf("pipe %v previous = %q, want %d", pipe, r["previous"], 2*count)
+		}
+	}
+}
+
+// --- pipes -------------------------------------------------------------------
+
+// pipeName returns a name for a pipe that no earlier run against the same
+// minimega has used: pipes outlive the clients that used them.
+func pipeName(what string) string {
+	return fmt.Sprintf("live-%v-%d", what, time.Now().UnixNano())
+}
+
+// attachPipe attaches a client to a pipe, like `minimega -pipe`, and waits
+// until minimega lists it as a reader.
+func attachPipe(t *testing.T, pipe string) *harness.PipeClient {
+	t.Helper()
+
+	readers := func() int {
+		n, _ := strconv.Atoi(harness.PipeInfo(t, pipe)["readers"])
+		return n
+	}
+	before := readers()
+
+	p, err := harness.AttachPipe(pipe)
+	if err != nil {
+		t.Fatal(err)
+	}
+	harness.Eventually(t, time.Minute, 200*time.Millisecond, func() error {
+		if got := readers(); got != before+1 {
+			return fmt.Errorf("pipe %v has %d readers, want %d", pipe, got, before+1)
+		}
+		return nil
+	})
+
+	return p
+}
+
+// expectLines waits until a pipe client has read exactly want.
+func expectLines(t *testing.T, p *harness.PipeClient, want ...string) {
+	t.Helper()
+
+	harness.Eventually(t, time.Minute, 200*time.Millisecond, func() error {
+		if got := p.Lines(); !reflect.DeepEqual(got, want) {
+			return fmt.Errorf("pipe client read %q, want %q", got, want)
+		}
+		return nil
+	})
+}
+
+// closePipe ends a pipe client's session, which must not fail.
+func closePipe(t *testing.T, p *harness.PipeClient) {
+	t.Helper()
+
+	if err := p.Close(); err != nil {
+		t.Errorf("pipe client: %v", err)
+	}
+}
+
+// commandSocketErrors counts the errors minimega has logged for its command
+// socket.
+func commandSocketErrors(t *testing.T) int {
+	t.Helper()
+
+	// grep exits 1 when it counts no lines
+	out, err := harness.InContainer(t, "sh", "-c", `grep -cE '(ERROR|FATAL) command_socket\.go' "$MM_LOGFILE"`)
+	n, perr := strconv.Atoi(strings.TrimSpace(out))
+	if perr != nil {
+		t.Fatalf("count command socket errors in the minimega log: %v: %s", err, out)
+	}
+	return n
+}
+
+// pipeClientCLI runs a shell script in the minimega container that uses
+// `minimega -pipe`, and returns what it printed.
+func pipeClientCLI(t *testing.T, script string) string {
+	t.Helper()
+
+	out, err := harness.InContainer(t, "sh", "-c", script)
+	if err != nil {
+		t.Fatalf("`%v` failed: %v\n%s", script, err, out)
+	}
+	return out
+}
+
+func testPipes(t *testing.T) {
+	ns := harness.Namespace
+	errorsBefore := commandSocketErrors(t)
+
+	// echo hello | minimega -pipe foo: the client must exit 0, without
+	// minimega logging an error for its connection, and its line must be in
+	// the pipe when it exits (sandia-minimega/minimega#905).
+	t.Run("WriteAndExit", func(t *testing.T) {
+		pipe := pipeName("write")
+
+		// the client is a reader of the pipe too, but it doesn't get its own
+		// lines back, so it prints nothing
+		out := pipeClientCLI(t, fmt.Sprintf(
+			`for i in $(seq 1 50); do echo "hello $i" | minimega -pipe %v//%v || exit 1; done`, ns, pipe))
+		if out != "" {
+			t.Errorf("minimega -pipe printed %q, want nothing", out)
+		}
+
+		// no waiting here: the last client has exited
+		info := harness.PipeInfo(t, pipe)
+		if info["count"] != "50" || info["previous"] != "hello 50" {
+			t.Errorf("pipe has count %q and previous %q, want 50 and hello 50", info["count"], info["previous"])
+		}
+		if info["readers"] != "0" || info["writers"] != "0" {
+			t.Errorf("pipe has %v readers and %v writers after its clients exited, want none", info["readers"], info["writers"])
+		}
+	})
+
+	// one reader, written to from the CLI, from minimega -pipe, and from a
+	// second client over the socket
+	t.Run("ReadersAndWriters", func(t *testing.T) {
+		pipe := pipeName("rw")
+
+		a := attachPipe(t, pipe)
+		if info := harness.PipeInfo(t, pipe); info["mode"] != "all" || info["writers"] != "1" {
+			t.Errorf("pipe has mode %q and %v writers, want all and 1", info["mode"], info["writers"])
+		}
+
+		harness.MustRun(t, fmt.Sprintf("pipe %v %q", pipe, "from the cli"))
+		expectLines(t, a, "from the cli\n")
+
+		pipeClientCLI(t, fmt.Sprintf(`echo "from minimega -pipe" | minimega -pipe %v//%v`, ns, pipe))
+		expectLines(t, a, "from the cli\n", "from minimega -pipe\n")
+
+		b := attachPipe(t, pipe)
+		if err := a.Write("from a"); err != nil {
+			t.Fatal(err)
+		}
+		expectLines(t, b, "from a\n")
+
+		if err := b.Write("from b"); err != nil {
+			t.Fatal(err)
+		}
+		expectLines(t, a, "from the cli\n", "from minimega -pipe\n", "from b\n")
+
+		// b's session ends once its line is in the pipe. Each client read
+		// the other's line, and not its own.
+		closePipe(t, b)
+		if got, want := b.Lines(), []string{"from a\n"}; !reflect.DeepEqual(got, want) {
+			t.Errorf("b read %q, want %q", got, want)
+		}
+
+		closePipe(t, a)
+		if got, want := a.Lines(), []string{"from the cli\n", "from minimega -pipe\n", "from b\n"}; !reflect.DeepEqual(got, want) {
+			t.Errorf("a read %q, want %q", got, want)
+		}
+		if info := harness.PipeInfo(t, pipe); info["readers"] != "0" || info["writers"] != "0" || info["count"] != "4" {
+			t.Errorf("pipe has %v readers, %v writers and count %v, want 0, 0 and 4", info["readers"], info["writers"], info["count"])
+		}
+
+		// a pipe without writers can be deleted
+		harness.MustRun(t, "clear pipe "+pipe)
+		if info := harness.PipeInfo(t, pipe); info != nil {
+			t.Errorf("pipe still listed after clear: %v", info)
+		}
+	})
+
+	t.Run("RoundRobin", func(t *testing.T) {
+		pipe := pipeName("rr")
+
+		a := attachPipe(t, pipe)
+		b := attachPipe(t, pipe)
+		defer closePipe(t, a)
+		defer closePipe(t, b)
+
+		harness.MustRun(t, fmt.Sprintf("pipe %v mode round-robin", pipe))
+		if info := harness.PipeInfo(t, pipe); info["mode"] != "round-robin" {
+			t.Errorf("mode = %q, want round-robin", info["mode"])
+		}
+
+		for i := 0; i < 6; i++ {
+			harness.MustRun(t, fmt.Sprintf("pipe %v message-%d", pipe, i))
+		}
+
+		// each message goes to one reader, and the readers take turns
+		harness.Eventually(t, time.Minute, 200*time.Millisecond, func() error {
+			if na, nb := len(a.Lines()), len(b.Lines()); na != 3 || nb != 3 {
+				return fmt.Errorf("readers got %d and %d messages, want 3 each", na, nb)
+			}
+			return nil
+		})
+
+		// what a client writes itself goes to one of the other readers,
+		// never back to the client
+		if err := a.Write("from-a-0", "from-a-1", "from-a-2", "from-a-3"); err != nil {
+			t.Fatal(err)
+		}
+		harness.Eventually(t, time.Minute, 200*time.Millisecond, func() error {
+			if na, nb := len(a.Lines()), len(b.Lines()); na != 3 || nb != 7 {
+				return fmt.Errorf("readers got %d and %d messages, want 3 and 7", na, nb)
+			}
+			return nil
+		})
+
+		harness.MustRun(t, fmt.Sprintf("clear pipe %v mode", pipe))
+		if info := harness.PipeInfo(t, pipe); info["mode"] != "all" {
+			t.Errorf("mode = %q after clear, want all", info["mode"])
+		}
+	})
+
+	t.Run("Via", func(t *testing.T) {
+		pipe := pipeName("via")
+
+		a := attachPipe(t, pipe)
+		defer closePipe(t, a)
+
+		harness.MustRun(t, fmt.Sprintf("pipe %v via tr a-z A-Z", pipe))
+		if info := harness.PipeInfo(t, pipe); info["via"] != "tr a-z A-Z" {
+			t.Errorf("via = %q", info["via"])
+		}
+
+		harness.MustRun(t, fmt.Sprintf("pipe %v hello", pipe))
+		expectLines(t, a, "HELLO\n")
+
+		harness.MustRun(t, fmt.Sprintf("clear pipe %v via", pipe))
+		harness.MustRun(t, fmt.Sprintf("pipe %v hello", pipe))
+		expectLines(t, a, "HELLO\n", "hello\n")
+	})
+
+	// plumb in "sed -u s/foo/moo/" out, as in the plumb help
+	t.Run("Pipeline", func(t *testing.T) {
+		in, out := pipeName("in"), pipeName("out")
+		pipeline := fmt.Sprintf("%v//%v sed -u s/foo/moo/ %v//%v", ns, in, ns, out)
+
+		listed := func() bool {
+			for _, r := range harness.MustTable(t, "plumb") {
+				if r["pipeline"] == pipeline {
+					return true
+				}
+			}
+			return false
+		}
+
+		harness.MustRun(t, fmt.Sprintf(`plumb %v "sed -u s/foo/moo/" %v`, in, out))
+		if !listed() {
+			t.Fatalf("pipeline %q not listed", pipeline)
+		}
+
+		a := attachPipe(t, out)
+		defer closePipe(t, a)
+
+		// the pipeline reads the first pipe once it has started
+		harness.Eventually(t, time.Minute, 200*time.Millisecond, func() error {
+			if info := harness.PipeInfo(t, in); info["readers"] != "1" {
+				return fmt.Errorf("pipe %v has %q readers, want 1", in, info["readers"])
+			}
+			return nil
+		})
+
+		harness.MustRun(t, fmt.Sprintf("pipe %v %q", in, "the cow says foo"))
+		expectLines(t, a, "the cow says moo\n")
+
+		// Closing the first pipe shuts the pipeline down. The pipe can be
+		// deleted once the writer of the message above is gone.
+		harness.Eventually(t, time.Minute, 200*time.Millisecond, func() error {
+			_, err := harness.Run("clear pipe " + in)
+			return err
+		})
+		harness.Eventually(t, time.Minute, 200*time.Millisecond, func() error {
+			if listed() {
+				return fmt.Errorf("pipeline %q still listed", pipeline)
+			}
+			return nil
+		})
+
+		// sed is gone, also as a zombie, and nothing more was written
+		// downstream. grep lists the processes named sed, and fails when
+		// there are none.
+		if out, _ := harness.InContainer(t, "sh", "-c", "grep -lx sed /proc/[0-9]*/comm 2>/dev/null"); strings.TrimSpace(out) != "" {
+			t.Errorf("sed left behind by the pipeline: %s", out)
+		}
+		harness.Eventually(t, time.Minute, 200*time.Millisecond, func() error {
+			if info := harness.PipeInfo(t, out); info["writers"] != "1" {
+				return fmt.Errorf("pipe %v has %q writers, want only the client", out, info["writers"])
+			}
+			return nil
+		})
+		if info := harness.PipeInfo(t, out); info["count"] != "1" {
+			t.Errorf("%v messages written to %v, want 1", info["count"], out)
+		}
+		expectLines(t, a, "the cow says moo\n")
+	})
+
+	if got := commandSocketErrors(t); got != errorsBefore {
+		out, _ := harness.InContainer(t, "sh", "-c", `grep -E '(ERROR|FATAL) command_socket\.go' "$MM_LOGFILE" | tail -20`)
+		t.Errorf("minimega logged %d command socket errors while pipes were used:\n%s", got-errorsBefore, out)
+	}
+}
+
+// testCCPipes uses pipes from guests: miniccc -pipe, and the standard streams
+// of processes that miniccc starts.
+func testCCPipes(t *testing.T) {
+	const vm = "host-b3"
+
+	// what miniccc has logged as errors in the guest
+	guestErrors := func() string {
+		return harness.CCOK(t, vm, "grep ERROR /var/log/miniccc.log || true")
+	}
+	errorsBefore := guestErrors()
+
+	// guest to host: echo ... | miniccc -pipe, one client after the other
+	up := pipeName("up")
+	a := attachPipe(t, up)
+	defer closePipe(t, a)
+
+	var writes, want []string
+	for i := 1; i <= 5; i++ {
+		writes = append(writes, fmt.Sprintf("echo guest-%d | miniccc -pipe %v", i, up))
+		want = append(want, fmt.Sprintf("guest-%d\n", i))
+	}
+	harness.CCOK(t, vm, strings.Join(writes, " && "))
+	expectLines(t, a, want...)
+
+	// guest to host: the standard output of a command
+	harness.CCRun(t, "name="+vm, fmt.Sprintf("exec stdout=%v echo from-cc-exec", up), 1, time.Minute)
+	expectLines(t, a, append(want, "from-cc-exec\n")...)
+
+	// host to guest: a miniccc -pipe that keeps reading while its input is
+	// open. Its input ends, and so does the client, when the hold file is gone.
+	down := pipeName("down")
+	hold := fmt.Sprintf("/tmp/%v.hold", down)
+	harness.CCOK(t, vm, "touch "+hold)
+	harness.CCRun(t, "name="+vm, fmt.Sprintf("background sh -c %q",
+		fmt.Sprintf("while [ -e %v ]; do sleep 1; done | miniccc -pipe %v > /tmp/%v.out", hold, down, down)), 1, time.Minute)
+	defer harness.CCOK(t, vm, "rm -f "+hold)
+
+	harness.Eventually(t, time.Minute, time.Second, func() error {
+		if info := harness.PipeInfo(t, down); info["readers"] != "1" {
+			return fmt.Errorf("pipe %v has %q readers, want the guest", down, info["readers"])
+		}
+		return nil
+	})
+
+	// miniccc logs a command that fails as an error, so look at the file with
+	// a command that doesn't fail while the line is on its way
+	harness.MustRun(t, fmt.Sprintf("pipe %v from-the-host", down))
+	harness.Eventually(t, time.Minute, 3*time.Second, func() error {
+		if out := harness.CCOK(t, vm, fmt.Sprintf("cat /tmp/%v.out", down)); out != "from-the-host\n" {
+			return fmt.Errorf("guest read %q from pipe %v, want the line from the host", out, down)
+		}
+		return nil
+	})
+
+	if got := guestErrors(); got != errorsBefore {
+		t.Errorf("miniccc logged errors in the guest while pipes were used:\nbefore:\n%s\nafter:\n%s", errorsBefore, got)
+	}
+}
+
 // --- guest view of VM configuration ----------------------------------------
 
 func testGuestQemuAppend(t *testing.T) {
@@ -735,6 +1368,24 @@ func testGuestDualHomed(t *testing.T) {
 	harness.CCOK(t, "host-d5", "ping -c 2 -W 2 10.10.3.13 && ping -c 2 -W 2 10.10.4.12")
 }
 
+// testRouterInterfaces checks that "router <vm> interface <n>" lands on eth<n> even
+// though routers load ip_gre, whose gre0/gretap0/erspan0 sort among the NICs (#1387).
+func testRouterInterfaces(t *testing.T) {
+	for _, s := range topology {
+		if !s.Router {
+			continue
+		}
+		// guard against the guest image silently dropping ip_gre
+		harness.CCOK(t, s.Name, "test -e /sys/class/net/gretap0")
+		for i, ip := range s.IPs {
+			harness.CCEventually(t, s.Name, fmt.Sprintf("ip -4 -o addr show dev eth%d | grep -q ' %s/'", i, ip), harness.SettleTimeout)
+		}
+		if out := harness.CCOK(t, s.Name, "ip -4 -o addr"); strings.Contains(out, "gre") || strings.Contains(out, "erspan") {
+			t.Errorf("%v put an address on a fallback tunnel device:\n%s", s.Name, out)
+		}
+	}
+}
+
 // --- networking --------------------------------------------------------------
 
 func ipOf(t *testing.T, vm string) string {
@@ -787,6 +1438,33 @@ func testDNS(t *testing.T) {
 	}
 }
 
+func testDNSCustom(t *testing.T) {
+	// lines from "router rtr-ab dnsmasq" in topology.mm
+	harness.CCEventually(t, "host-a1", "nslookup any.wild.live 2>&1 | grep -q 10.10.3.11", time.Minute)
+	harness.CCEventually(t, "host-a2", "nslookup www.web.live 2>&1 | grep -q 10.10.3.11", time.Minute)
+
+	conf := harness.CCOK(t, "rtr-ab", "cat /etc/dnsmasq.conf")
+	for _, line := range []string{"address=/wild.live/10.10.3.11", "cname=www.web.live,web.live", "# live custom dnsmasq"} {
+		if !strings.Contains(conf, "\n"+line+"\n") {
+			t.Errorf("rtr-ab dnsmasq.conf missing %q:\n%s", line, conf)
+		}
+	}
+
+	// clear and re-add one line without a commit, so the guest is untouched
+	cname := "cname=www.web.live,web.live"
+	if out := harness.MustText(t, "router rtr-ab"); !strings.Contains(out, cname) {
+		t.Fatalf("router rtr-ab missing %q:\n%s", cname, out)
+	}
+	harness.MustRun(t, "clear router rtr-ab dnsmasq "+cname)
+	if out := harness.MustText(t, "router rtr-ab"); strings.Contains(out, cname) {
+		t.Errorf("clear router dnsmasq left %q:\n%s", cname, out)
+	}
+	harness.MustRun(t, "router rtr-ab dnsmasq "+cname)
+	if _, err := harness.Run("router rtr-ab dnsmasq \"a=1\\nb=2\""); err == nil {
+		t.Errorf("multi-line dnsmasq config was accepted")
+	}
+}
+
 func testHTTPProtonuke(t *testing.T) {
 	// protonuke was started on host-c1 by topology.mm
 	harness.CCEventually(t, "host-a2", "timeout 10 wget -q -O /tmp/index.html http://web.live/ && test -s /tmp/index.html", 2*time.Minute)
@@ -836,6 +1514,106 @@ func testHostTap(t *testing.T) {
 		}
 		return nil
 	})
+}
+
+// hostTaps returns the host taps listed in the test namespace, by name.
+func hostTaps(t *testing.T) map[string]harness.Row {
+	t.Helper()
+	taps := map[string]harness.Row{}
+	for _, r := range harness.MustTable(t, "tap") {
+		taps[r["tap"]] = r
+	}
+	return taps
+}
+
+// ovsPorts returns the ports on mega_bridge.
+func ovsPorts(t *testing.T) []string {
+	t.Helper()
+	out, err := harness.InContainer(t, "ovs-vsctl", "list-ports", "mega_bridge")
+	if err != nil {
+		t.Fatalf("ovs-vsctl: %v: %s", err, out)
+	}
+	return strings.Fields(out)
+}
+
+// testHostTapCreate creates host taps back to back, as in
+// sandia-minimega/minimega#1270, and checks that a tap whose address cannot
+// be set is reported and removed rather than silently deleted.
+func testHostTapCreate(t *testing.T) {
+	taps := []struct{ name, vlan, ip string }{
+		{"live-tap-a", "tap-a", "192.0.2.1/24"},
+		{"live-tap-b", "tap-b", "198.51.100.1/24"},
+	}
+	defer func() {
+		for _, tap := range taps {
+			harness.Run("tap delete " + tap.name)
+		}
+	}()
+
+	for _, tap := range taps {
+		got := harness.MustText(t, fmt.Sprintf("tap create %v ip %v %v", tap.vlan, tap.ip, tap.name))
+		if got != tap.name {
+			t.Errorf("tap create returned %q, want %q", got, tap.name)
+		}
+	}
+
+	listed := hostTaps(t)
+	ports := ovsPorts(t)
+	for _, tap := range taps {
+		if r, ok := listed[tap.name]; !ok || !strings.HasPrefix(r["vlan"], tap.vlan+" ") {
+			t.Errorf("tap %v on VLAN %v not listed: %v", tap.name, tap.vlan, listed)
+		}
+		if !slices.Contains(ports, tap.name) {
+			t.Errorf("tap %v is not a port on mega_bridge: %v", tap.name, ports)
+		}
+		out, err := harness.InContainer(t, "ip", "-o", "-4", "addr", "show", "dev", tap.name)
+		if err != nil || !strings.Contains(out, tap.ip) {
+			t.Errorf("tap %v does not have address %v: %v: %s", tap.name, tap.ip, err, out)
+		}
+	}
+
+	// an address that cannot be set fails the command and leaves no tap behind
+	if _, err := harness.Run("tap create tap-a ip not-an-address live-tap-bad"); err == nil {
+		t.Errorf("tap create with an invalid address reported success")
+	} else if !strings.Contains(err.Error(), "ip error") {
+		t.Errorf("tap create with an invalid address: unexpected error: %v", err)
+	}
+	if _, ok := hostTaps(t)["live-tap-bad"]; ok {
+		t.Errorf("tap live-tap-bad listed after it failed to create")
+	}
+	harness.Eventually(t, 30*time.Second, time.Second, func() error {
+		if slices.Contains(ovsPorts(t), "live-tap-bad") {
+			return fmt.Errorf("port live-tap-bad still on mega_bridge")
+		}
+		return nil
+	})
+
+	// the name is taken until the tap is deleted
+	if _, err := harness.Run("tap create tap-a name " + taps[0].name); err == nil {
+		t.Errorf("creating tap %v twice reported success", taps[0].name)
+	}
+
+	for _, tap := range taps {
+		harness.MustRun(t, "tap delete "+tap.name)
+	}
+	listed = hostTaps(t)
+	for _, tap := range taps {
+		if _, ok := listed[tap.name]; ok {
+			t.Errorf("tap %v listed after delete", tap.name)
+		}
+	}
+	harness.Eventually(t, 30*time.Second, time.Second, func() error {
+		ports := ovsPorts(t)
+		for _, tap := range taps {
+			if slices.Contains(ports, tap.name) {
+				return fmt.Errorf("port %v still on mega_bridge", tap.name)
+			}
+		}
+		return nil
+	})
+	if _, ok := hostTaps(t)["live-mgmt"]; !ok {
+		t.Errorf("tap live-mgmt gone after deleting other taps")
+	}
 }
 
 var rttRe = regexp.MustCompile(`= [\d.]+/([\d.]+)/`)
@@ -949,29 +1727,6 @@ func testQMP(t *testing.T) {
 	}
 }
 
-func testVNCRecord(t *testing.T) {
-	host, path := harness.Artifact(t, "host-a1.fb")
-	harness.MustRun(t, "vnc record fb host-a1 "+path)
-	time.Sleep(5 * time.Second)
-	listed := false
-	for _, r := range harness.MustTable(t, "vnc") {
-		if r["name"] == "host-a1" && strings.Contains(r["filename"], "host-a1.fb") {
-			listed = true
-		}
-	}
-	if !listed {
-		t.Errorf("vnc does not list the recording: %v", harness.MustTable(t, "vnc"))
-	}
-	harness.MustRun(t, "vnc stop fb host-a1")
-	// the recorder flushes its gzip stream as it shuts down
-	harness.Eventually(t, 10*time.Second, time.Second, func() error {
-		if n, err := harness.FBChunks(host); err != nil || n == 0 {
-			return fmt.Errorf("framebuffer recording has %d chunks: %v", n, err)
-		}
-		return nil
-	})
-}
-
 func testTags(t *testing.T) {
 	harness.MustRun(t, "vm tag host-b5 stage tested")
 	rows := harness.MustTable(t, "vm tag host-b5 stage")
@@ -1040,14 +1795,22 @@ func testHotplug(t *testing.T) {
 
 func testSave(t *testing.T) {
 	harness.MustRun(t, "vm save host-c2 live/saved-c2")
-	harness.Eventually(t, 3*time.Minute, 3*time.Second, func() error {
+	// poll quickly so the listing also sees the setup states QEMU reports before RAM progress
+	seen := map[string]bool{}
+	harness.Eventually(t, 3*time.Minute, 200*time.Millisecond, func() error {
 		for _, r := range harness.MustTable(t, "vm save") {
-			if r["name"] == "host-c2" && r["status"] != "completed" {
+			if r["name"] != "host-c2" {
+				continue
+			}
+			seen[r["status"]] = true
+			if r["status"] != "completed" {
 				return fmt.Errorf("save status: %v", r)
 			}
+			return nil
 		}
-		return nil
+		return fmt.Errorf("host-c2 missing from vm save")
 	})
+	t.Logf("save states seen: %v", seen)
 	for _, ext := range []string{".state", ".hdd"} {
 		harness.Eventually(t, time.Minute, 2*time.Second, func() error {
 			fi, err := os.Stat(fmt.Sprintf("%v/live/saved-c2%v", harness.MMFiles, ext))
@@ -1065,6 +1828,68 @@ func testSave(t *testing.T) {
 		harness.MustRun(t, "vm start host-c2")
 	}
 	harness.CCEventually(t, "host-c2", "true", time.Minute)
+}
+
+func testVMNameRules(t *testing.T) {
+	// clone needs a launched VM; without NICs the test VMs get no taps
+	harness.MustRun(t, "vm config clone host-a4")
+	harness.MustRun(t, "clear vm config net")
+	defer harness.Run("clear vm config")
+
+	label63 := strings.Repeat("a", 63)
+	cases := []struct {
+		desc  string
+		name  string // "vm launch kvm" argument
+		valid bool
+	}{
+		{"Underscore", "web_1", false},
+		{"OneCharacter", "a", false},
+		{"LeadingHyphen", "-web", false},
+		{"TrailingHyphen", "web-", false},
+		{"LeadingDot", ".web", false},
+		{"TrailingDot", "web.", false},
+		{"EmptyLabel", "web..lan", false},
+		{"Slash", "web/1", false},
+		{"Backslash", `web\\1`, false}, // minimega reads `\\` as one backslash
+		{"Label64", label63 + "a", false},
+		{"ListWithBadName", "ok,bad_name", false},
+		{"TwoCharacters", "ab", true},
+		{"OneCharacterLabels", "a.b", true},
+		{"Dotted", "Name-Rules.live.test", true},
+		{"Label63", label63, true},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.desc, func(t *testing.T) {
+			_, err := harness.Run("vm launch kvm " + tc.name)
+			if !tc.valid {
+				if err == nil || !strings.Contains(err.Error(), "valid host name") {
+					t.Errorf("err = %v, want a host name error", err)
+				}
+				if q := strings.TrimSpace(harness.MustText(t, "ns queue")); q != "" {
+					harness.Run("ns flush")
+					t.Errorf("rejected name was queued: %q", q)
+				}
+				return
+			}
+
+			if err != nil {
+				t.Fatalf("valid name rejected: %v", err)
+			}
+			harness.MustRun(t, "vm launch")
+			defer harness.Run("vm flush")
+			if s := harness.VMInfo(t)[tc.name]["state"]; s != "BUILDING" {
+				t.Errorf("state = %q, want BUILDING", s)
+			}
+			harness.MustRun(t, "vm kill "+tc.name)
+			harness.Eventually(t, 30*time.Second, 2*time.Second, func() error {
+				if s := harness.VMInfo(t)[tc.name]["state"]; s != "QUIT" {
+					return fmt.Errorf("state = %v", s)
+				}
+				return nil
+			})
+		})
+	}
 }
 
 func testKillFlushRelaunch(t *testing.T) {
@@ -1113,6 +1938,177 @@ func testKillFlushRelaunch(t *testing.T) {
 	}
 }
 
+// --- tools -------------------------------------------------------------------
+
+// testPasswordify boots a VM from a passwordified copy of the guest initrd and
+// checks that root's new password authenticates in the guest (issue #1213).
+func testPasswordify(t *testing.T) {
+	const password = "live-passw0rd"
+	const authKey = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEtc2QDYSXnUzZkRBTh7gjLWuGmQYDPfAxV+CbH7LJ6v live-test"
+
+	// passwordify chroots into the guest image, so it needs the guest's architecture
+	hostArch, err := harness.InContainer(t, "uname", "-m")
+	if err != nil {
+		t.Fatalf("uname: %v: %s", err, hostArch)
+	}
+	if guestArch := harness.CCOK(t, "host-a4", "uname -m"); strings.TrimSpace(guestArch) != strings.TrimSpace(hostArch) {
+		t.Skipf("container is %v but the guest is %v; passwordify cannot run guest binaries", strings.TrimSpace(hostArch), strings.TrimSpace(guestArch))
+	}
+
+	dir := filepath.Join(harness.MMFiles, "live")
+	keys := filepath.Join(dir, "passwordify.keys")
+	if err := os.WriteFile(keys, []byte(authKey+"\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// The guest has no sshd, so add the legacy config that broke ssh logins (#1213),
+	// quoted as sshd allows, then run passwordify with relative paths, the
+	// password on stdin, and both key options.
+	script := fmt.Sprintf(`set -e
+cd %v
+rm -rf pwroot && mkdir pwroot && cd pwroot
+zcat ../live.initrd | cpio -id --quiet
+mkdir -p etc/ssh && printf 'PasswordAuthentication yes\nPermitEmptyPasswords "yes"\n' > etc/ssh/sshd_config
+find . | cpio -o -H newc --quiet | gzip > ../live-ssh.initrd
+cd .. && rm -rf pwroot
+echo %v | passwordify -keys passwordify.keys live-ssh.initrd live-pw.initrd`, dir, password)
+	if out, err := harness.InContainer(t, "sh", "-c", script); err != nil {
+		t.Fatalf("passwordify: %v\n%s", err, out)
+	}
+
+	harness.MustRun(t, "vm config clone host-a4")
+	harness.MustRun(t, "vm config initrd live/live-pw.initrd")
+	harness.MustRun(t, "vm config append live.role=host live.hostname=host-pw")
+	harness.MustRun(t, "vm launch kvm host-pw")
+	harness.MustRun(t, "vm launch")
+	harness.MustRun(t, "clear vm config")
+	t.Cleanup(func() {
+		harness.Run("vm kill host-pw")
+		harness.Run("vm flush")
+	})
+	harness.MustRun(t, "vm start host-pw")
+	harness.CCEventually(t, "host-pw", "true", 3*time.Minute)
+
+	// su reads the password from stdin when it is not a terminal; as root it would not ask
+	su := func(vm, pw string) harness.CCResult {
+		return harness.CCExec(t, vm, fmt.Sprintf("echo %v | su nobody -s /bin/sh -c 'su -c true root'", pw))
+	}
+	if r := su("host-pw", password); r.ExitCode != 0 {
+		t.Errorf("root password rejected on host-pw: exit %d: %s%s", r.ExitCode, r.Stdout, r.Stderr)
+	}
+	if r := su("host-pw", "wrong-"+password); r.ExitCode == 0 {
+		t.Errorf("wrong root password accepted on host-pw")
+	}
+	// the stock image has no root password, so the change came from passwordify
+	if r := su("host-a4", password); r.ExitCode == 0 {
+		t.Errorf("root password accepted on host-a4, which runs the stock initrd")
+	}
+
+	ak := harness.CCOK(t, "host-pw", "cat /root/.ssh/authorized_keys")
+	pub := harness.CCOK(t, "host-pw", "cat /root/.ssh/id_rsa.pub")
+	if !strings.Contains(ak, authKey) || !strings.Contains(ak, strings.TrimSpace(pub)) || !strings.HasPrefix(pub, "ssh-rsa ") {
+		t.Errorf("authorized_keys lacks the -keys key or the generated id_rsa.pub:\n%s\nid_rsa.pub: %s", ak, pub)
+	}
+	if cfg := harness.CCOK(t, "host-pw", "cat /etc/ssh/sshd_config"); !strings.Contains(cfg, "PermitEmptyPasswords no") || strings.Contains(cfg, "yes\"") {
+		t.Errorf("sshd_config still allows empty passwords:\n%s", cfg)
+	}
+	if mode := strings.TrimSpace(harness.CCOK(t, "host-pw", "stat -c %a /")); mode != "755" {
+		t.Errorf("/ has mode %v, want 755", mode)
+	}
+}
+
+// testVNCFixedPort checks "vm config vnc-port": the shim listens on the
+// configured port, conflicting launches (Android, other namespaces) are
+// refused, and a restart rebinds it.
+func testVNCFixedPort(t *testing.T) {
+	banner := func() error {
+		out, err := harness.InContainer(t, "bash", "-c",
+			"exec 3<>/dev/tcp/127.0.0.1/"+d3VNCPort+" && timeout 5 head -c 12 <&3")
+		if err != nil || !strings.HasPrefix(out, "RFB ") {
+			return fmt.Errorf("no RFB banner on port %v: %q %v", d3VNCPort, out, err)
+		}
+		return nil
+	}
+
+	if got := harness.VMInfo(t)["host-d3"]["vnc_port"]; got != d3VNCPort {
+		t.Fatalf("host-d3 vnc_port = %q, want %v", got, d3VNCPort)
+	}
+	harness.Eventually(t, 30*time.Second, 2*time.Second, banner)
+
+	defer harness.MustRun(t, "clear vm config")
+	harness.MustRun(t, "vm config restore live-base")
+	harness.MustRun(t, "vm config vnc-port "+d3VNCPort)
+	if got := harness.MustText(t, "vm config vnc-port"); got != d3VNCPort {
+		t.Errorf("vm config vnc-port = %q, want %v", got, d3VNCPort)
+	}
+
+	// a range cannot share one port
+	if _, err := harness.Raw("namespace " + harness.Namespace + " vm launch kvm vnc-dup[1-2]"); err == nil || !strings.Contains(err.Error(), "VNC port") {
+		t.Errorf("range launch with vnc-port: err = %v, want a VNC port error", err)
+	}
+
+	// Android VMs have no VNC shim, so they refuse a fixed port up front
+	if _, err := harness.Raw("namespace " + harness.Namespace + " vm launch android vnc-droid"); err == nil || !strings.Contains(err.Error(), "android VMs do not support vnc-port") {
+		t.Errorf("android launch with vnc-port: err = %v, want an android error", err)
+	}
+
+	// a second VM with the same port is refused on this host, in this namespace
+	// or another; the scheduler only logs and counts launch errors
+	const otherNS = "live-vnc"
+	defer harness.Raw("clear namespace " + otherNS)
+	for _, ns := range []string{harness.Namespace, otherNS} {
+		run := func(cmd string) {
+			t.Helper()
+			if _, err := harness.Raw("namespace " + ns + " " + cmd); err != nil {
+				t.Fatalf("%v: %v", ns, err)
+			}
+		}
+		if ns == otherNS {
+			run("vm config kernel live/live.kernel")
+			run("vm config initrd live/live.initrd")
+			run("vm config memory 352")
+			run("vm config vnc-port " + d3VNCPort)
+		}
+		run("vm launch kvm vnc-dup")
+		if ns == harness.Namespace {
+			run("vm launch")
+		}
+
+		resps, err := harness.Raw("namespace " + ns + " ns schedule status")
+		if rows := harness.ToRows(resps); err != nil || len(rows) == 0 || rows[len(rows)-1]["failures"] != "1" {
+			t.Errorf("%v: duplicate vnc-port launch was not counted as a failure: %v %v", ns, rows, err)
+		}
+		resps, _ = harness.Raw("namespace " + ns + " vm info")
+		for _, r := range harness.ToRows(resps) {
+			if r["name"] == "vnc-dup" {
+				t.Errorf("%v: vnc-dup was created despite the port conflict", ns)
+			}
+		}
+	}
+	out, _ := harness.InContainer(t, "grep", "-c", "vnc port "+d3VNCPort+" already reserved by vm host-d3 in namespace "+harness.Namespace, "/var/log/minimega/minimega.log")
+	if n, _ := strconv.Atoi(strings.TrimSpace(out)); n < 2 {
+		t.Errorf("minimega log has %q reservation errors, want one per namespace", strings.TrimSpace(out))
+	}
+
+	// a restarted VM gets the same port back
+	harness.MustRun(t, "vm kill host-d3")
+	harness.Eventually(t, 30*time.Second, 2*time.Second, func() error {
+		if s := harness.VMInfo(t)["host-d3"]["state"]; s != "QUIT" {
+			return fmt.Errorf("state = %v", s)
+		}
+		return nil
+	})
+	harness.MustRun(t, "vm start host-d3")
+	harness.Eventually(t, 30*time.Second, 2*time.Second, func() error {
+		r := harness.VMInfo(t)["host-d3"]
+		if r["state"] != "RUNNING" || r["vnc_port"] != d3VNCPort {
+			return fmt.Errorf("state = %v vnc_port = %v", r["state"], r["vnc_port"])
+		}
+		return nil
+	})
+	harness.Eventually(t, 30*time.Second, 2*time.Second, banner)
+}
+
 // --- teardown ----------------------------------------------------------------
 
 func testClearNamespace(t *testing.T) {
@@ -1120,10 +2116,17 @@ func testClearNamespace(t *testing.T) {
 		t.Fatalf("clear namespace: %v", err)
 	}
 
-	for _, r := range toRowsMust(t, "namespace") {
-		if r["namespace"] == harness.Namespace {
-			t.Errorf("namespace %v still exists", harness.Namespace)
-		}
+	if namespaceListed(t, harness.Namespace) {
+		t.Errorf("namespace %v still exists", harness.Namespace)
+	}
+
+	// a miniweb page left open on the cleared namespace keeps polling it; that
+	// must neither succeed nor recreate the namespace (#1255)
+	if code := miniwebStatus(t, "/"+harness.Namespace+"/vms/info.json"); code != http.StatusNotFound {
+		t.Errorf("miniweb /%v/vms/info.json after clear: status %v, want 404", harness.Namespace, code)
+	}
+	if miniwebNamespaces(t)[harness.Namespace] || namespaceListed(t, harness.Namespace) {
+		t.Errorf("namespace %v recreated by miniweb", harness.Namespace)
 	}
 
 	harness.Eventually(t, time.Minute, 3*time.Second, func() error {
@@ -1137,6 +2140,14 @@ func testClearNamespace(t *testing.T) {
 		}
 		return nil
 	})
+
+	// the default namespace stays listed even after it is cleared
+	if _, err := harness.Raw("clear namespace minimega"); err != nil {
+		t.Errorf("clear namespace minimega: %v", err)
+	}
+	if !namespaceListed(t, "minimega") || !miniwebNamespaces(t)["minimega"] {
+		t.Errorf("default namespace not listed after clearing it")
+	}
 }
 
 func toRowsMust(t *testing.T, cmd string) []harness.Row {

@@ -14,12 +14,15 @@ import (
 
 	log "github.com/sandia-minimega/minimega/v2/pkg/minilog"
 
-	"github.com/google/gopacket/pcap"
+	"github.com/gopacket/gopacket/pcap"
 )
 
 // Bridges manages a collection of `Bridge` structs.
 type Bridges struct {
 	Default string // Default bridge name when one isn't specified
+
+	// NoSnoop disables learning tap IPs from ARP and NDP on new bridges
+	NoSnoop bool
 
 	tapChan  chan string
 	bondChan chan string
@@ -104,17 +107,19 @@ func (b Bridges) newBridge(name string) error {
 	}
 
 	br := &Bridge{
-		Name:      name,
-		taps:      make(map[string]*Tap),
-		trunks:    make(map[string]bool),
-		tunnels:   make(map[string]bool),
-		mirrors:   make(map[string]bool),
-		bonds:     make(map[string]map[string]int),
-		captures:  make(map[int]capture),
-		captureID: captureID,
-		tapChan:   b.tapChan,
-		bondChan:  b.bondChan,
-		config:    make(map[string]string),
+		Name:         name,
+		reaper:       systemReaper{},
+		taps:         make(map[string]*Tap),
+		trunks:       make(map[string]bool),
+		tunnels:      make(map[string]bool),
+		mirrors:      make(map[string]bool),
+		bonds:        make(map[string]map[string]int),
+		captures:     make(map[int]*capture),
+		edgeCaptures: make(map[string]*edgeCapture),
+		captureID:    captureID,
+		tapChan:      b.tapChan,
+		bondChan:     b.bondChan,
+		config:       make(map[string]string),
 	}
 
 	// Create the bridge
@@ -136,15 +141,17 @@ func (b Bridges) newBridge(name string) error {
 		}
 	}
 
-	if br.handle, err = pcap.OpenLive(br.Name, 1600, true, time.Second); err != nil {
-		goto cleanup
-	}
+	if !b.NoSnoop {
+		if br.handle, err = pcap.OpenLive(br.Name, 1600, true, time.Second); err != nil {
+			goto cleanup
+		}
 
-	if err = br.handle.SetBPFFilter(snoopBPF); err != nil {
-		goto cleanup
-	}
+		if err = br.handle.SetBPFFilter(snoopBPF); err != nil {
+			goto cleanup
+		}
 
-	go br.snooper()
+		go br.snooper()
+	}
 
 	// No errors... bridge ready for use
 	b.bridges[br.Name] = br
@@ -341,18 +348,32 @@ func (b Bridges) DestroyBridge(name string) error {
 	return nil
 }
 
-// ReapTaps calls `Bridge.ReapTaps` on each bridge, returning the first error.
+// ReapTaps calls `Bridge.ReapTaps` on each bridge, returning the joined errors.
+// It also finishes bridges that a failed destroy left and forgets them when
+// nothing is left to clean up.
 func (b Bridges) ReapTaps() error {
 	bridgeLock.Lock()
 	defer bridgeLock.Unlock()
 
-	for _, br := range b.bridges {
+	var errs []error
+
+	for name, br := range b.bridges {
+		if br.destroyed() {
+			if err := br.finishDestroy(); err != nil {
+				errs = append(errs, err)
+			} else {
+				delete(b.bridges, name)
+			}
+
+			continue
+		}
+
 		if err := br.reapTaps(); err != nil {
-			return err
+			errs = append(errs, err)
 		}
 	}
 
-	return nil
+	return errors.Join(errs...)
 }
 
 // FindTap finds a non-defunct Tap with the specified name. This is

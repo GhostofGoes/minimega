@@ -157,6 +157,26 @@ All of these DHCP options can be used together in a single DHCP specification,
 and multiple DHCP servers can be specified on a single `minirouter` instance
 (for serving DHCP on multiple interfaces/networks).
 
+`minirouter` can also act as a DHCP relay, forwarding requests that arrive on
+one of its addresses to one or more DHCP servers elsewhere in the experiment.
+Relaying takes precedence over serving DHCP on the same address. To relay
+requests arriving on `10.0.1.1` to a DHCP server at `10.0.0.1`:
+
+```text
+minimega$ router foo dhcp 10.0.1.1 relay 10.0.0.1
+```
+
+The DHCP server needs a route back to the relay address. When the server is
+another `minirouter` with no interface on the relayed subnet, set the subnet's
+netmask explicitly, since dnsmasq otherwise assumes the classful netmask (for
+example, `/8` for `10.0.0.0`):
+
+```text
+minimega$ router bar dhcp 10.0.1.1 range 10.0.1.100 10.0.1.200
+minimega$ router bar dhcp 10.0.1.1 netmask 255.255.255.0
+minimega$ router bar dhcp 10.0.1.1 router 10.0.1.1
+```
+
 <a id="TOC_5.2."></a>
 
 ### IPv6 Router Advertisements
@@ -181,6 +201,29 @@ the record:
 
 ```text
 minimega$ router foo dns 1.2.3.4 foo.com
+```
+
+### Custom dnsmasq options
+
+For dnsmasq options that the other subcommands do not cover, append raw lines
+to the generated `dnsmasq.conf` with `router <vm> dnsmasq`. Lines are written
+in the order they were added, after the generated config, and take effect on
+the next `router <vm> commit`. Quote a line that contains a `#`.
+
+```text
+minimega$ router foo dnsmasq address=/test.com/1.0.0.1
+minimega$ router foo dnsmasq server=/test2.com/3.0.0.1
+minimega$ router foo dnsmasq cname=www.test.com,test.com
+```
+
+The router VM needs a `minirouter` built with this feature; older builds stop
+applying the config at the first custom line.
+
+Remove one line, or all of them:
+
+```text
+minimega$ clear router foo dnsmasq cname=www.test.com,test.com
+minimega$ clear router foo dnsmasq
 ```
 
 <a id="TOC_6."></a>

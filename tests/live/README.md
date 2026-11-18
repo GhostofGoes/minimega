@@ -22,7 +22,7 @@ flowchart LR
   R -->|4. mm read topology.mm| C
   R -->|5. go test -tags live| T["Go tests (one group)<br/>pkg/miniclient over /tmp/minimega/minimega"]
   T --> C
-  C --> V["22 KVM VMs · 4 VLANs"]
+  C --> V["23 KVM VMs · 5 VLANs"]
 ```
 
 1. **Image** — on master, CI tests the exact image the Docker workflow just
@@ -39,7 +39,7 @@ flowchart LR
    (`default.conf` makes a 360 MB initrd that needs ~3 GB per VM). The boot
    scripts are in `image/overlay/`. The unpacked rootfs is ~100 MiB and an
    initramfs lives in RAM (it may use about half of it), so the guests get
-   352–448 MB each: 22 VMs take ~8.5 GB of a standard runner's 16 GB.
+   352–448 MB each: 23 VMs take ~8.9 GB of a standard runner's 16 GB.
 3. **Deployment** — the container starts with the flags from
    `docker/README.md` (privileged, `/dev`, `/lib/modules`, `/tmp/minimega`).
 4. **Topology** — the group's `topology.mm` is loaded with `mm read`, exercising the CLI
@@ -53,9 +53,11 @@ flowchart LR
 tests/live/
   run.sh        run one group against a Docker image
   image/        vmbetter config (live.conf) and overlay for the guest kernel and initramfs
-  harness/      package harness: shared helpers (socket client, cc, polling,
-                artifact parsers) and their offline unit tests
-  core/         the 22-VM test group: topology.mm, topology_test.go, live_test.go
+  harness/      package harness: shared helpers (socket client, cc, pipes,
+                polling, artifact parsers) and their offline unit tests
+  core/         the 23-VM test group: topology.mm, topology_test.go, live_test.go,
+                vnc_test.go
+  mesh/         two-node mesh group: setup.sh (peer container), topology.mm, mesh_test.go
 ```
 
 Each test group is a sub-folder holding its `topology.mm` and the Go tests
@@ -94,23 +96,28 @@ flowchart TB
     d3[host-d3]
     d4[host-d4 no cc]
   end
+  subgraph E["lan-e · 10.10.5.0/24 (DHCP relayed to rtr-ab)"]
+    e1[host-e1]
+  end
   rab{{"rtr-ab<br/>DHCP · DNS · OSPF"}}
-  rcd{{"rtr-cd<br/>DHCP · DNS · OSPF · firewall"}}
+  rcd{{"rtr-cd<br/>DHCP · DHCP relay · DNS · OSPF · firewall"}}
   d5[host-d5 dual-homed]
   A --- rab --- B --- rcd
   rcd --- C
   rcd --- D
+  rcd --- E
   d5 --- C
   d5 --- D
 ```
 
 | Group | VMs | What it exercises |
 |---|---|---|
-| Routers | `rtr-ab`, `rtr-cd` | minirouter: interfaces, DHCP ranges and static leases, DNS records, OSPF (bird), `fw` (iptables), `rid`, `schedule` |
+| Routers | `rtr-ab`, `rtr-cd` | minirouter: interfaces (with `ip_gre` fallback devices present), DHCP ranges and static leases, DHCP relay, DNS records, custom `dnsmasq` lines, OSPF (bird), `fw` (iptables), `rid`, `schedule` |
 | lan-a | `host-a1..a5` | dynamic leases, range launch (`host-a[2-5]`), `serial-ports`, `virtio-ports`, `colocate`, host tap |
 | lan-b | `host-b1..b5` | static MACs, `e1000` vs `virtio-net-pci`, `vcpus`/`cores` |
 | lan-c | `host-c1..c5` | `disk create`, virtio/IDE disks, cache mode, snapshot isolation, `qemu-append`, `machine q35`, `usb-use-xhci`, `vga cirrus` |
-| lan-d | `host-d1..d5` | firewall target, `backchannel false`, dual-homed NICs, fixed `uuid` |
+| lan-d | `host-d1..d5` | firewall target, fixed `vnc-port`, `backchannel false`, dual-homed NICs, fixed `uuid` |
+| lan-e | `host-e1` | static lease from rtr-ab relayed by rtr-cd (`router dhcp ... relay`, `netmask`) |
 
 Every VM shares one saved configuration (`vm config save live-base`), launches
 through the namespace queue (`ns queueing true` + `vm launch`), and is started
@@ -125,15 +132,35 @@ phases (screenshots, QMP, serial, ...) still run.
 
 | Area | Checks |
 |---|---|
-| Control plane | `version`, `check`, `host`, `namespace`, `ns hosts/queue/queueing`, `vm info`, `vm info summary`, `vlans`, `bridge` + OVS port/VLAN tags, `file list`, `disk info/snapshot`, miniweb (`/`, `/vms/info.json`) |
-| Boot | all 22 VMs `RUNNING`, 21 miniccc clients, every expected address learned from tap snooping |
-| Command and control | `cc exec` (one, all, tag and column filters), `cc exitcode`, `cc send`/`recv`, `cc background`, `cc process list/kill`, `cc responses`, `cc delete` |
-| Guest view of config | SMBIOS serial from `qemu-append`, VM UUID, disk sizes per interface, snapshot isolation, Q35 vs i440FX, xHCI, SMP, NIC driver and MAC, dual-homed addressing |
-| Networking | same-LAN ping, OSPF routes, cross-router ping and traceroute, no-cc host reachable, DNS, HTTP to protonuke, firewall drop vs control, host tap (both directions), QoS delay and loss, `capture pcap` |
-| VM operations | `vm screenshot` (std and cirrus), `vm serial`, `vm qmp`, `vnc record`, `vm tag` + tag filter, `vm top`, `vm stop/start`, `vm net disconnect/connect`, `vm hotplug add/remove`, `vm save`, `vm kill` + `vm flush` + `vm config clone` + queued relaunch |
-| Teardown | `clear namespace` removes VMs, QEMU processes, and OVS ports |
+| Control plane | `version`, `check`, `host`, `namespace`, `ns hosts/queue/queueing`, `vm info`, `vm info summary`, `vlans`, `bridge` + OVS port/VLAN tags, `file list`, `-hashfiles` (one hash per copied file, no hash mid-copy, appends, renames, new directories), `disk info/snapshot` |
+| miniweb | every UI page with and without a namespace prefix and the assets they load, `/vms/info.json` and `/vms/top.json` against `vm info`, `hosts`/`vlans`/`namespaces`/`files` JSON, file download, screenshots (PNG, `size`, `base64`), the noVNC page and its websocket's RFB greeting, `POST /vm/<name>/stop` and `start`, the console left disabled, and unknown and cleared namespaces that stay absent |
+| Pipes | `minimega -pipe` (exits 0 with its lines in the pipe, no command socket errors in the minimega log), `pipe` writes, modes and vias, clients attached over the socket (each reads what the others write, not its own lines), `plumb` through a process and its teardown |
+| Boot | all 23 VMs `RUNNING`, 22 miniccc clients, every expected address learned from tap snooping |
+| Command and control | `cc exec` (one, all, tag and column filters), `cc exitcode`, `cc send`/`recv`, `cc background`, `cc process list/kill`, `cc responses`, `cc delete`, named pipe ordering (`pipe` and `miniccc -pipe` into a VM reader), pipes from a guest (`miniccc -pipe` both ways, `cc exec stdout=<pipe>`) |
+| Guest view of config | SMBIOS serial from `qemu-append`, VM UUID, disk sizes per interface, snapshot isolation, Q35 vs i440FX, xHCI, SMP, NIC driver and MAC, dual-homed addressing, router addresses on the right NIC despite GRE fallback devices |
+| Networking | DHCP relay (lease, netmask, gateway, DNS, reachability), same-LAN ping, OSPF routes, cross-router ping and traceroute, no-cc host reachable, DNS, custom dnsmasq lines (wildcard `address=`, `cname=`, `clear router dnsmasq`), HTTP to protonuke, firewall drop vs control, host tap (both directions), `tap create`/`tap delete` with addresses and a failing address, QoS delay and loss, `capture pcap` |
+| VM operations | `vm screenshot` (std and cirrus), `vm serial`, `vm qmp`, `vm tag` + tag filter, `vm top`, `vm stop/start`, `vm net disconnect/connect`, `vm hotplug add/remove`, `vm save`, VM names that `vm launch` accepts or rejects, `vm kill` + `vm flush` + `vm config clone` + queued relaunch, `vnc-port` (RFB banner, range, Android, and same- and cross-namespace duplicate rejection, rebind after restart) |
+| VNC | the RFB handshake and a frame through miniweb and the VNC shim, `vnc record fb` decoded, keys typed on the `host-d3` console with QEMU extended key events, `vnc record kb` + `vnc play`, paste as keys, `vnc type`, `vnc inject` (key and `LoadFile`, with and without a playback), `vm kill` while recording and playing (entries stop, files close) |
+| Tools | `passwordify` on the guest initrd: a VM booted from it accepts the new root password and has the installed keys |
+| Teardown | `clear namespace` removes VMs, QEMU processes, and OVS ports; miniweb does not recreate the cleared namespace; the default namespace stays listed after `clear namespace minimega` |
+| File transfer | a second minimega node in its own network namespace joins the mesh: `vm launch` pulls the guest kernel and initrd over iomeshage, `mesh send <peer> file get` of a file that fits once but not twice arrives intact, and one larger than the disk fails with a no space error and leaves nothing behind |
 
-Out of scope: containers, Android, bare-metal VMs, and multi-node meshes.
+Out of scope: containers, Android, bare-metal VMs, and multi-node meshes
+(beyond the two-node mesh in the file transfer phase).
+
+## Mesh group
+
+`LIVE_GROUP=mesh` covers a namespace that spans two minimega nodes. Its
+`setup.sh`, which `run.sh` sources once minimega is up, starts a second
+container from the same image (`minimega-peer`, with its own base directory
+`${LIVE_MM_BASE}/peer`), joins it to the mesh, and packs the guest initramfs
+into `live/containerfs.tar.gz` on the first node only. `topology.mm` then
+launches four containers with `vm config filesystem tar:live/containerfs.tar.gz`,
+two scheduled on each node, and `mesh_test.go` checks the mesh, the placement,
+that the peer fetched and extracted the tarball itself, and that every
+container runs. The group launches no KVM VMs, but `run.sh` still builds the
+guest image (the containers' filesystem comes from its initramfs), and the host
+must support minimega containers.
 
 ## Running locally
 
@@ -186,6 +213,9 @@ slower.
   `harness.CCOK`/`harness.CCEventually` for guest commands and
   `harness.Eventually` for anything asynchronous.
 - If you change `core/topology.mm`, update `core/topology_test.go` to match.
+- A group that needs more than the one container can add a `setup.sh`, which
+  `run.sh` sources (with its variables and helpers) before loading
+  `topology.mm`; define `group_cleanup` there to remove what it started.
 - Add a group by creating `tests/live/<name>/` with a `topology.mm` and
   `//go:build live` tests in `package <name>` that import
   `github.com/sandia-minimega/minimega/v2/tests/live/harness`. Call
