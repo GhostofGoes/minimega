@@ -5,7 +5,9 @@
 package bridge
 
 import (
+	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -35,6 +37,7 @@ func fakeTools(t *testing.T) func() string {
 	t.Setenv("PATH", dir)
 	t.Setenv("FAKE_TOOLS_LOG", log)
 	t.Setenv("FAKE_TOOLS_FAIL", "")
+	t.Cleanup(SetUpInterface(ipUpInterface))
 
 	return func() string {
 		t.Helper()
@@ -47,10 +50,26 @@ func fakeTools(t *testing.T) func() string {
 	}
 }
 
+// ipUpInterface activates an interface with the ip command, which the tests
+// replace with a stand-in, instead of netlink.
+func ipUpInterface(name string, promisc bool) error {
+	args := []string{"link", "set", name, "up"}
+	if promisc {
+		args = append(args, "promisc", "on")
+	}
+
+	if out, err := exec.Command("ip", args...).CombinedOutput(); err != nil {
+		return fmt.Errorf("up interface failed: %v: %s", err, out)
+	}
+
+	return nil
+}
+
 // newTestBridges returns Bridges holding one bridge that was never set up in Open vSwitch.
 func newTestBridges() (Bridges, *Bridge) {
 	br := &Bridge{
 		Name:    "mmtest_bridge",
+		reaper:  systemReaper{},
 		taps:    make(map[string]*Tap),
 		mirrors: make(map[string]bool),
 		bonds:   make(map[string]map[string]int),
@@ -161,7 +180,7 @@ func TestCreateHostTapUpFailure(t *testing.T) {
 	if err := bridges.ReapTaps(); err != nil {
 		t.Fatal(err)
 	}
-	if want := "ovs-vsctl -- del-port mmtest_bridge mmtest_tap\n"; !strings.Contains(calls(), want) {
+	if want := "ovs-vsctl -- --if-exists del-port mmtest_bridge mmtest_tap\n"; !strings.Contains(calls(), want) {
 		t.Errorf("missing call %q in:\n%s", want, calls())
 	}
 }
@@ -194,7 +213,7 @@ func TestDestroyTapIsReaped(t *testing.T) {
 	if err := br.ReapTaps(); err != nil {
 		t.Fatal(err)
 	}
-	if want := "ovs-vsctl -- del-port mmtest_bridge mmtest_tap0\n"; !strings.Contains(calls(), want) {
+	if want := "ovs-vsctl -- --if-exists del-port mmtest_bridge mmtest_tap0\n"; !strings.Contains(calls(), want) {
 		t.Errorf("missing call %q in:\n%s", want, calls())
 	}
 	if strings.Contains(calls(), "del-port mmtest_bridge mmtest_tap1") {

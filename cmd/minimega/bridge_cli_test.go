@@ -5,7 +5,9 @@
 package main
 
 import (
+	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -40,6 +42,7 @@ func fakeHostTaps(t *testing.T) func() string {
 	t.Setenv("PATH", dir)
 	t.Setenv("FAKE_TOOLS_LOG", log)
 	t.Setenv("FAKE_TOOLS_FAIL", "")
+	t.Cleanup(bridge.SetUpInterface(ipUpInterface))
 
 	var (
 		originalBridges = bridges
@@ -58,6 +61,11 @@ func fakeHostTaps(t *testing.T) func() string {
 	vlans.Default = vlans.NewVLANs()
 	*f_base = t.TempDir()
 
+	// a delayed write of the bridges file must not run after f_base is restored
+	noop := func() error { return nil }
+	bridgesFile.reset(noop)
+	t.Cleanup(func() { bridgesFile.reset(noop) })
+
 	return func() string {
 		t.Helper()
 
@@ -67,6 +75,21 @@ func fakeHostTaps(t *testing.T) func() string {
 		}
 		return string(data)
 	}
+}
+
+// ipUpInterface activates an interface with the ip command, which the tests
+// replace with a stand-in, instead of netlink.
+func ipUpInterface(name string, promisc bool) error {
+	args := []string{"link", "set", name, "up"}
+	if promisc {
+		args = append(args, "promisc", "on")
+	}
+
+	if out, err := exec.Command("ip", args...).CombinedOutput(); err != nil {
+		return fmt.Errorf("up interface failed: %v: %s", err, out)
+	}
+
+	return nil
 }
 
 func testTapNamespace() *Namespace {

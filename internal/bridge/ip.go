@@ -21,10 +21,23 @@ const tapFlags = unix.IFF_TAP | unix.IFF_NO_PI | unix.IFF_TUN_EXCL
 // reapGroup is the link group that minimega reserves to delete taps in one batch.
 const reapGroup = 0x6d6d7470
 
-// upInterface activates an interface through netlink. promisc controls
-// whether the interface is brought up in promiscuous mode or not. Tests replace
-// it.
-var upInterface = func(name string, promisc bool) error {
+// upInterface activates an interface. promisc controls whether the interface
+// is brought up in promiscuous mode or not. Tests replace it with
+// SetUpInterface.
+var upInterface = netlinkUpInterface
+
+// SetUpInterface replaces the function that activates interfaces, for tests
+// that run without the privileges for netlink. It returns a function that
+// restores the original.
+func SetUpInterface(f func(name string, promisc bool) error) (restore func()) {
+	old := upInterface
+	upInterface = f
+
+	return func() { upInterface = old }
+}
+
+// netlinkUpInterface activates an interface through netlink.
+func netlinkUpInterface(name string, promisc bool) error {
 	log.Info("up interface: %v", name)
 
 	link, err := netlink.LinkByName(name)
