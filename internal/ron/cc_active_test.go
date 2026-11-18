@@ -54,9 +54,11 @@ func newCCTestServer(vms ...VM) *Server {
 		commands:     map[int]*Command{},
 		clients:      map[string]*client{},
 		vms:          map[string]VM{},
-		responses:    make(chan *Client, 1024),
+		uploads:      map[string]*uploadWindow{},
+		responses:    make(chan queuedClient, 1024),
 		clientExpiry: CLIENT_EXPIRED * time.Second,
 	}
+	s.queueCond = sync.NewCond(&s.queueLock)
 
 	for _, vm := range vms {
 		s.RegisterVM(vm)
