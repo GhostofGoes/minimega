@@ -215,6 +215,26 @@ func TestQemuVersion(t *testing.T) {
 	}
 }
 
+func TestPCIIDs(t *testing.T) {
+	out := "/sys/bus/pci/devices/0000:00:02.0/vendor:0x1b36\n" +
+		"/sys/bus/pci/devices/0000:00:00.0/vendor:0x8086\n" +
+		"/sys/bus/pci/devices/0000:00:00.0/device:0x1237\n" +
+		"/sys/bus/pci/devices/0000:00:02.0/device:0x0100\n"
+	ids, err := PCIIDs(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"0x8086:0x1237", "0x1b36:0x0100"}; fmt.Sprint(ids) != fmt.Sprint(want) {
+		t.Errorf("PCIIDs = %v, want %v", ids, want)
+	}
+	if _, err := PCIIDs("/sys/bus/pci/devices/0000:00:02.0/vendor:0x1b36\n"); err == nil {
+		t.Errorf("a vendor without a device is not an error")
+	}
+	if _, err := PCIIDs("garbage"); err == nil {
+		t.Errorf("a line without a colon is not an error")
+	}
+}
+
 // armBootObjcopy is "objcopy -O binary" of the GNU as source in the
 // armBootCode comments, so a mistyped word fails here and not only on KVM.
 const armBootObjcopy = "0120a1d222608052223000b96301001064144038a4000034251840b9e5ff2f37" +

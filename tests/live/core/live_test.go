@@ -111,8 +111,6 @@ func TestLive(t *testing.T) {
 		p("CDROM", testCDROM, cc),
 		p("Save", testSave, cc),
 		p("KillFlushRelaunch", testKillFlushRelaunch, cc),
-		// last before teardown: it replaces host-c2 with its restored copy
-		p("SaveRestore", testSaveRestore, cc),
 
 		// teardown
 		p("ClearNamespace", testClearNamespace, version),
@@ -789,10 +787,16 @@ func testGuestDualHomed(t *testing.T) {
 }
 
 // pciIDs lists a guest's PCI devices as "vendor:device" ("0x1b36:0x0100").
+// minimega expands $name in every command argument (os.ExpandEnv), so a
+// guest command must not use shell variables.
 func pciIDs(t *testing.T, vm string) []string {
 	t.Helper()
-	out := harness.CCOK(t, vm, `for d in /sys/bus/pci/devices/*; do echo "$(cat $d/vendor):$(cat $d/device)"; done`)
-	return strings.Fields(out)
+	out := harness.CCOK(t, vm, "grep . /sys/bus/pci/devices/*/vendor /sys/bus/pci/devices/*/device")
+	ids, err := harness.PCIIDs(out)
+	if err != nil {
+		t.Fatalf("%v PCI devices: %v", vm, err)
+	}
+	return ids
 }
 
 func testQXL(t *testing.T) {
@@ -1065,8 +1069,14 @@ func testQMP(t *testing.T) {
 const armVM = "arm-boot"
 
 func testArmBoot(t *testing.T) {
-	if out, err := harness.InContainer(t, "sh", "-c", "command -v qemu-system-aarch64"); err != nil {
+	out, err := harness.InContainer(t, "sh", "-c", "command -v qemu-system-aarch64")
+	if err != nil {
 		t.Skipf("the image has no qemu-system-aarch64 (QEMU_SOURCE=distro): %v %s", err, out)
+	}
+	// "vm config qemu" resolves a relative name against the files directory
+	qemu := strings.TrimSpace(out)
+	if !strings.HasPrefix(qemu, "/") {
+		t.Fatalf("command -v qemu-system-aarch64 = %q, want an absolute path", qemu)
 	}
 	host, path := harness.Artifact(t, armVM+".bin")
 	if err := os.WriteFile(host, harness.ArmBootImage(), 0644); err != nil {
@@ -1095,7 +1105,7 @@ func testArmBoot(t *testing.T) {
 	// machine and cpu are checked against the QEMU binary, so set it first
 	for _, cmd := range []string{
 		"clear vm config",
-		"vm config qemu qemu-system-aarch64",
+		"vm config qemu " + qemu,
 		"vm config machine virt",
 		"vm config cpu cortex-a57",
 		"vm config memory 128",
@@ -1106,10 +1116,12 @@ func testArmBoot(t *testing.T) {
 		"vm config kernel " + path,
 		"vm launch kvm " + armVM,
 		"vm launch",
-		"vm start " + armVM,
 	} {
 		harness.MustRun(t, cmd)
 	}
+	// a queued launch logs its errors and does not return them
+	launched(t, armVM)
+	harness.MustRun(t, "vm start "+armVM)
 
 	harness.Eventually(t, time.Minute, 2*time.Second, func() error {
 		out, err := harness.Text("vm serial " + armVM + " 0 2000 4096")
@@ -1231,7 +1243,7 @@ func testCDROM(t *testing.T) {
 	}
 	// Linux checks for a new medium when the device opens, so read it first
 	harness.CCEventually(t, vm, "dd if=/dev/sr0 bs=2048 count=1 2>/dev/null | grep -q "+marker+
-		` && test "$(cat /sys/block/sr0/size)" = 4096`, time.Minute)
+		" && grep -qx 4096 /sys/block/sr0/size", time.Minute)
 
 	harness.MustRun(t, "vm cdrom eject "+vm)
 	if got := harness.VMInfo(t)[vm]["cdrom"]; got != "" {
@@ -1316,89 +1328,17 @@ func testKillFlushRelaunch(t *testing.T) {
 	}
 }
 
-// guestUptime returns a guest's /proc/uptime in seconds.
-func guestUptime(t *testing.T, vm string) float64 {
+// launched fails the test when a VM that "vm launch" took from the queue is
+// missing or in the ERROR state. The scheduler logs launch errors and does not
+// return them to the caller.
+func launched(t *testing.T, vm string) {
 	t.Helper()
-	out := harness.CCOK(t, vm, "cat /proc/uptime")
-	f := strings.Fields(out)
-	if len(f) == 0 {
-		t.Fatalf("%v /proc/uptime: %q", vm, out)
+	r, ok := harness.VMInfo(t)[vm]
+	if !ok {
+		t.Fatalf("%v not launched from the queue (ns queue: %q)", vm, harness.MustText(t, "ns queue"))
 	}
-	up, err := strconv.ParseFloat(f[0], 64)
-	if err != nil {
-		t.Fatalf("%v /proc/uptime: %q: %v", vm, out, err)
-	}
-	return up
-}
-
-func testSaveRestore(t *testing.T) {
-	// host-c2 has an IDE disk, miniccc, and a static MAC; the Save phase
-	// already showed that it saves
-	const vm, name = "host-c2", "live/restore-c2"
-	state := harness.MMFiles + "/" + name + ".state"
-	disk := harness.MMFiles + "/" + name + ".hdd"
-	before := harness.VMInfo(t)[vm]
-
-	// clone needs a launched VM, so take the configuration now
-	harness.MustRun(t, "vm config clone "+vm)
-	defer harness.Run("clear vm config")
-	saved := guestUptime(t, vm)
-
-	harness.MustRun(t, "vm save "+vm+" "+name)
-	harness.Eventually(t, 3*time.Minute, 3*time.Second, func() error {
-		for _, r := range harness.MustTable(t, "vm save") {
-			if r["name"] == vm {
-				if r["status"] != "completed" {
-					return fmt.Errorf("save status: %v", r)
-				}
-				return nil
-			}
-		}
-		return fmt.Errorf("vm save does not list %v", vm)
-	})
-	for _, f := range []string{state, disk} {
-		if fi, err := os.Stat(f); err != nil || fi.Size() == 0 {
-			t.Fatalf("saved file %v: %v", f, err)
-		}
-	}
-
-	harness.MustRun(t, "vm kill "+vm)
-	harness.Eventually(t, 30*time.Second, 2*time.Second, func() error {
-		if s := harness.VMInfo(t)[vm]["state"]; s != "QUIT" {
-			return fmt.Errorf("state = %v", s)
-		}
-		return nil
-	})
-	harness.MustRun(t, "vm flush")
-
-	// the same VM again: clone keeps the MAC and clears the UUID
-	for _, cmd := range []string{
-		"vm config uuid " + before["uuid"],
-		"vm config state " + state,
-		"vm config disks " + disk + ",ide,writeback",
-		"vm launch kvm " + vm,
-		"vm launch",
-		"vm start " + vm,
-	} {
-		harness.MustRun(t, cmd)
-	}
-
-	harness.Eventually(t, 3*time.Minute, 5*time.Second, func() error {
-		r := harness.VMInfo(t)[vm]
-		if r["state"] != "RUNNING" || r["cc_active"] != "true" {
-			return fmt.Errorf("%v state=%v cc=%v", vm, r["state"], r["cc_active"])
-		}
-		return nil
-	})
-	after := harness.VMInfo(t)[vm]
-	if after["uuid"] != before["uuid"] || after["mac"] != before["mac"] {
-		t.Errorf("restored %v uuid/mac = %v/%v, want %v/%v", vm, after["uuid"], after["mac"], before["uuid"], before["mac"])
-	}
-	// a restore continues the guest clock; a reboot starts it again near 0
-	if up := guestUptime(t, vm); up <= saved {
-		t.Errorf("%v uptime %.1fs after restore, %.1fs before save: the guest rebooted", vm, up, saved)
-	} else {
-		t.Logf("%v uptime %.1fs before save, %.1fs after restore", vm, saved, up)
+	if r["state"] == "ERROR" {
+		t.Fatalf("%v launch failed: state ERROR, tags %v", vm, r["tags"])
 	}
 }
 

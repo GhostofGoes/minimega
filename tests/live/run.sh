@@ -37,7 +37,7 @@
 #                         to use instead of building them in the image (e.g.
 #                         x86 guests on an arm64 host)
 #   LIVE_QEMU, LIVE_CPU   "vm config qemu" and "vm config cpu" for every VM
-#                         (e.g. qemu-system-x86_64 and qemu64 to run
+#                         (e.g. /usr/local/bin/qemu-system-x86_64 and qemu64 to run
 #                         x86 guests without KVM)
 #   LIVE_QEMU_VERSION     QEMU version (e.g. 11.1.3) that "kvm -version" and
 #                         the running VMs must report; unset only logs it
