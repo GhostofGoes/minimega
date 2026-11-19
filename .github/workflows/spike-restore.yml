@@ -1,0 +1,89 @@
+# SPIKE ONLY: not for merge
+name: "Spike: restore old state on new QEMU"
+
+# Saves a KVM VM with "vm save" on QEMU 6.2 (the published master image) and
+# restores it with "vm config state" on QEMU 11.1.3 (this fork's spike image),
+# with and without "vm config machine pc-i440fx-6.2". See
+# tests/live/spike-restore.sh. The RESULT lines are in the job summary.
+
+on:
+  push:
+    branches:
+      - "spike-**"
+    paths:
+      - tests/live/spike-restore.sh
+      - .github/workflows/spike-restore.yml
+
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  restore:
+    name: Restore QEMU 6.2 state on QEMU 11.1.3
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      OLD_IMAGE: ghcr.io/sandia-minimega/minimega:master
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Free disk space
+        run: |
+          # two images, the guest build, and the state files need room; drop
+          # preinstalled toolchains we do not use
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup || true
+          df -h /
+
+      - name: Check host support (KVM, Open vSwitch)
+        run: |
+          # GitHub-hosted Linux runners expose /dev/kvm; make it usable and
+          # load the Open vSwitch datapath the container's ovs-ctl needs.
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          ls -l /dev/kvm
+          sudo modprobe openvswitch
+          lsmod | grep -E '^(kvm|openvswitch)'
+          nproc; free -h
+
+      # The spike image can be private.
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # sudo uses root's Docker credentials, so pull as the runner user, which
+      # has the login, and run the script with SPIKE_PULL=0.
+      - name: Pull images
+        env:
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          new_image="ghcr.io/${OWNER,,}/minimega:spike-qemu-11-1-3"
+          echo "NEW_IMAGE=${new_image}" >> "$GITHUB_ENV"
+          docker pull -q "${OLD_IMAGE}"
+          docker pull -q "${new_image}"
+
+      - name: Run the restore experiment
+        run: |
+          sudo --preserve-env=GITHUB_STEP_SUMMARY SPIKE_PULL=0 \
+            tests/live/spike-restore.sh "${OLD_IMAGE}" "${NEW_IMAGE}" "${GITHUB_WORKSPACE}/spike-artifacts"
+
+      - name: Fix artifact permissions
+        if: always()
+        run: sudo chown -R "$(id -u):$(id -g)" spike-artifacts || true
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: spike-restore-artifacts
+          path: spike-artifacts
+          retention-days: 14
+          if-no-files-found: warn
