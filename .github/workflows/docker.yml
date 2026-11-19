@@ -74,6 +74,28 @@ jobs:
             exit 1
           fi
           echo "image=ghcr.io/${OWNER,,}/qemu-build:${version}-noble-${revision}" >> "$GITHUB_OUTPUT"
+      # A push to master that changes docker/qemu/ also starts the workflow
+      # that publishes the new qemu-build tag, so wait for that tag there.
+      - name: Wait for the QEMU image
+        env:
+          QEMU_IMAGE: ${{ steps.qemu.outputs.image }}
+          REF: ${{ github.ref }}
+        run: |
+          tries=1
+          if [ "${REF}" = refs/heads/master ]; then
+            tries=40
+          fi
+          for i in $(seq "${tries}"); do
+            if docker manifest inspect "${QEMU_IMAGE}" > /dev/null 2>&1; then
+              echo "found ${QEMU_IMAGE}"
+              exit 0
+            fi
+            if [ "${i}" -lt "${tries}" ]; then
+              sleep 30
+            fi
+          done
+          echo "::error::${QEMU_IMAGE} does not exist. Run the workflow that publishes the qemu-build image for this branch, then run this job again."
+          exit 1
       - name: Build container image
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
