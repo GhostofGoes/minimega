@@ -5,7 +5,7 @@ ARG GO_IMAGE="golang:1.24.13"
 ARG PYTHON_IMAGE="python:3.13-slim"
 # QEMU_SOURCE="upstream" copies QEMU from QEMU_IMAGE (built by docker/qemu/Dockerfile);
 # QEMU_SOURCE="distro" installs the Ubuntu QEMU packages instead.
-ARG QEMU_IMAGE="ghcr.io/sandia-minimega/qemu-build:11.1.3-noble-1"
+ARG QEMU_IMAGE="ghcr.io/sandia-minimega/qemu-build:11.1.3-noble-2"
 ARG QEMU_SOURCE="upstream"
 ARG QEMU_VERSION="11.1.3"
 
