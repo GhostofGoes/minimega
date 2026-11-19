@@ -93,30 +93,33 @@ oneline() { printf '%s' "$1" | tr '\n\r\t"' "   '" | tr -s ' ' | sed 's/^ //; s/
 
 # --- minimega commands ------------------------------------------------------
 
-mm() { timeout "${MM_TIMEOUT:-120}" docker exec "${CONTAINER}" minimega -e "$1"; }
+# The client reads MM_LOGLEVEL and MM_LOGFILE from the container, so set its
+# level and log file explicitly: stdout keeps only the response.
+mm() { timeout "${MM_TIMEOUT:-120}" docker exec "${CONTAINER}" minimega -level=error -logfile= -e "$1"; }
 
-# mmrun runs one minimega command line, prints its stdout and stderr, logs both,
-# and fails when minimega reports an error. MM_QUIET=1 keeps it out of the console.
+# mmrun runs one minimega command line, prints the response, and logs stdout
+# and stderr. It fails on a non-zero exit or on minimega's "Error (<host>):"
+# lines, and then also prints stderr. MM_QUIET=1 keeps it out of the console.
 mmrun() {
     local out errf err rc=0
     errf="$(mktemp)"
     out="$(mm "$1" 2>"${errf}")" || rc=$?
     err="$(cat "${errf}")"
     rm -f "${errf}"
-    if [[ -n "${err}" ]]; then
+    if (( rc == 0 )) && grep -q '^Error (' <<<"${err}"; then
         rc=1
     fi
     {
-        echo "mm[${NS}]> $1"
+        echo "mm[${NS}]> $1 (exit ${rc})"
         if [[ -n "${out}" ]]; then printf '%s\n' "${out}"; fi
-        if [[ -n "${err}" ]]; then printf 'stderr: %s\n' "${err}"; fi
+        if [[ -n "${err}" ]]; then printf '%s\n' "${err}" | sed 's/^/stderr: /'; fi
     } >> "${ART}/commands.log"
     if [[ "${MM_QUIET:-0}" != "1" ]]; then
         echo "  mm> $1" >&2
         if [[ -n "${out}${err}" ]]; then printf '%s\n' "${out}" "${err}" | sed '/^$/d; s/^/      /' >&2; fi
     fi
     if [[ -n "${out}" ]]; then printf '%s\n' "${out}"; fi
-    if [[ -n "${err}" ]]; then printf '%s\n' "${err}"; fi
+    if (( rc != 0 )) && [[ -n "${err}" ]]; then printf '%s\n' "${err}"; fi
     return "${rc}"
 }
 
@@ -125,20 +128,25 @@ mmv() { mmrun "namespace ${NS} .csv true .headers false .annotate false $1"; }
 
 ns_run() { mmrun "namespace ${NS} $1"; }
 
-vm_state() { oneline "$(MM_QUIET=1 mmv ".columns state .filter name=${VM} vm info" || true)"; }
+# Parsers accept only the expected shape, so any other line reads as no value.
+vm_state() {
+    local out
+    out="$(MM_QUIET=1 mmv ".columns state .filter name=${VM} vm info" || true)"
+    grep -E '^[A-Z_]+$' <<<"${out}" | head -n 1 || true
+}
 
 qmp() { mmrun "namespace ${NS} .annotate false vm qmp ${VM} '$1'"; }
 
 qmp_status() {
     local out
     out="$(MM_QUIET=1 qmp "${QMP_STATUS}" || true)"
-    sed -n 's/.*"status": *"\([a-z-]*\)".*/\1/p' <<<"${out}" | head -n 1
+    sed -n 's/^[[:space:]]*{.*"return".*"status": *"\([a-z-]*\)".*/\1/p' <<<"${out}" | head -n 1 || true
 }
 
 qmp_machine() {
     local out
     out="$(qmp "${QMP_TYPE}" || true)"
-    sed -n 's/.*"return": *"\([^"]*\)".*/\1/p' <<<"${out}" | head -n 1
+    sed -n 's/^[[:space:]]*{.*"return": *"\([^"]*\)".*/\1/p' <<<"${out}" | head -n 1 || true
 }
 
 # --- containers ---------------------------------------------------------------
@@ -265,7 +273,7 @@ wait_cc() {
     local limit=$1 start=${SECONDS} out
     while (( SECONDS - start < limit )); do
         out="$(MM_QUIET=1 mmv ".columns uuid cc clients" || true)"
-        if grep -qiF "${UUID}" <<<"${out}"; then
+        if grep -qixF "${UUID}" <<<"${out}"; then
             WAITED=$(( SECONDS - start ))
             return 0
         fi
@@ -291,7 +299,7 @@ cc_exec() {
     start=${SECONDS}
     while :; do
         row="$(MM_QUIET=1 mmv ".columns id,responses .filter prefix=${prefix} cc commands" || true)"
-        row="$(head -n 1 <<<"${row}")"
+        row="$(grep -E '^[0-9]+,[0-9]+$' <<<"${row}" | head -n 1 || true)"
         id="${row%%,*}"
         n="${row##*,}"
         if [[ "${id}" =~ ^[0-9]+$ && "${n}" =~ ^[0-9]+$ ]] && (( n >= 1 )); then
@@ -376,7 +384,8 @@ save_guest() {
     fi
     start=${SECONDS}
     while :; do
-        status="$(oneline "$(MM_QUIET=1 mmv ".columns status .filter name=${VM} vm save" || true)")"
+        status="$(MM_QUIET=1 mmv ".columns status .filter name=${VM} vm save" || true)"
+        status="$(grep -E '^[a-z-]+$' <<<"${status}" | head -n 1 || true)"
         if [[ -n "${status}" && " ${seen} " != *" ${status} "* ]]; then
             log "vm save status: ${status}"
             seen+=" ${status}"
