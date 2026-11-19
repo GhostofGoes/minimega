@@ -96,6 +96,8 @@ variables still affect discovery and execution of external helpers.
 The image runs `docker/start-minimega.sh` as its default command. The script
 starts Open vSwitch, waits for it, starts miniweb, then runs minimega with
 `-nostdin` and generated flags. `docker/README.md` covers deployment.
+The image ships QEMU 11.1.3 from `docker/qemu`; the build argument
+`QEMU_SOURCE=distro` builds it with the Ubuntu QEMU packages instead.
 
 - `MM_BASE`, `MM_FILEPATH`, `MM_BROADCAST`, `MM_VLANRANGE`, `MM_PORT`,
   `MM_DEGREE`, `MM_CONTEXT`, `MM_LOGLEVEL`, `MM_LOGFILE`, `MM_FORCE`,

@@ -201,6 +201,64 @@ func TestFBChunks(t *testing.T) {
 	}
 }
 
+func TestQemuVersion(t *testing.T) {
+	for in, want := range map[string]string{
+		"QEMU emulator version 11.1.3\nCopyright (c) 2003-2026":    "11.1.3",
+		"QEMU emulator version 8.2.2 (Debian 1:8.2.2+ds-0ubuntu1)": "8.2.2",
+		"v11.1.3": "11.1.3",
+		"11.1":    "",
+		"":        "",
+	} {
+		if got := QemuVersion(in); got != want {
+			t.Errorf("QemuVersion(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestPCIIDs(t *testing.T) {
+	out := "/sys/bus/pci/devices/0000:00:02.0/vendor:0x1b36\n" +
+		"/sys/bus/pci/devices/0000:00:00.0/vendor:0x8086\n" +
+		"/sys/bus/pci/devices/0000:00:00.0/device:0x1237\n" +
+		"/sys/bus/pci/devices/0000:00:02.0/device:0x0100\n"
+	ids, err := PCIIDs(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"0x8086:0x1237", "0x1b36:0x0100"}; fmt.Sprint(ids) != fmt.Sprint(want) {
+		t.Errorf("PCIIDs = %v, want %v", ids, want)
+	}
+	if _, err := PCIIDs("/sys/bus/pci/devices/0000:00:02.0/vendor:0x1b36\n"); err == nil {
+		t.Errorf("a vendor without a device is not an error")
+	}
+	if _, err := PCIIDs("garbage"); err == nil {
+		t.Errorf("a line without a colon is not an error")
+	}
+}
+
+// armBootObjcopy is "objcopy -O binary" of the GNU as source in the
+// armBootCode comments, so a mistyped word fails here and not only on KVM.
+const armBootObjcopy = "0120a1d222608052223000b96301001064144038a4000034251840b9e5ff2f37" +
+	"240000b9fbffff170602a0d2c60400f1e1ffff54f6ffff17" +
+	"4d494e494d4547412d41524d2d4f4b0a00"
+
+func TestArmBootImage(t *testing.T) {
+	img := ArmBootImage()
+	if got := fmt.Sprintf("%x", img); got != armBootObjcopy {
+		t.Errorf("image = %v, want %v", got, armBootObjcopy)
+	}
+
+	// "adr x3, msg" at 0x0c must point at the message after the code
+	adr := armBootCode[3]
+	imm := int32(adr>>5&0x7ffff)<<2 | int32(adr>>29&0x3)
+	imm = imm << 11 >> 11 // sign-extend 21 bits
+	if msg := 0x0c + int(imm); msg != 4*len(armBootCode) {
+		t.Errorf("adr points at 0x%x, message is at 0x%x", msg, 4*len(armBootCode))
+	}
+	if !bytes.HasSuffix(img, append([]byte(ArmBootMessage), 0)) {
+		t.Errorf("image does not end with the NUL-terminated message")
+	}
+}
+
 func TestExecResult(t *testing.T) {
 	res := map[string]CCResult{
 		"ok":   {ExitCode: 0},

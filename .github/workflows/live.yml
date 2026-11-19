@@ -10,6 +10,10 @@ name: Live Tests
 # Tests > Run workflow, or `gh workflow run live.yml --ref <branch>`), it
 # builds the dispatched branch the same way, so it works on a fork without a
 # pull request. Set "image" to test an existing image instead.
+#
+# The image build copies QEMU from the published qemu-build image. When a pull
+# request changes docker/qemu/ (or "build_qemu" is set on a manual run), the
+# job first builds docker/qemu/Dockerfile and uses that local image instead.
 
 on:
   workflow_call:
@@ -35,10 +39,15 @@ on:
           - upstream
           - distro
       expected_qemu:
-        description: Expected QEMU version (empty uses ARG QEMU_VERSION in docker/qemu/Dockerfile)
+        description: Expected QEMU version (empty uses ARG QEMU_VERSION in docker/qemu/Dockerfile; with distro, empty skips the comparison)
         required: false
         default: ""
         type: string
+      build_qemu:
+        description: Build docker/qemu/Dockerfile in this job instead of using the published qemu-build image
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -48,7 +57,8 @@ jobs:
   live:
     name: Live tests (KVM)
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    # a local QEMU build (see build_qemu) adds about 20 minutes
+    timeout-minutes: 90
     env:
       IMAGE: ${{ inputs.image || 'minimega:live' }}
       BUILD: ${{ inputs.image == '' }}
@@ -91,6 +101,7 @@ jobs:
         env:
           OWNER: ${{ github.repository_owner }}
           EXPECTED_QEMU: ${{ inputs.expected_qemu }}
+          QEMU_SOURCE: ${{ inputs.qemu_source || 'upstream' }}
         run: |
           version="$(sed -n 's/^ARG QEMU_VERSION="\([^"]*\)"$/\1/p' docker/qemu/Dockerfile)"
           revision="$(sed -n 's/^ARG QEMU_BUILD_REVISION="\([^"]*\)"$/\1/p' docker/qemu/Dockerfile)"
@@ -99,7 +110,43 @@ jobs:
             exit 1
           fi
           echo "image=ghcr.io/${OWNER,,}/qemu-build:${version}-noble-${revision}" >> "$GITHUB_OUTPUT"
+          # the Ubuntu packages have their own version
+          if [ "${QEMU_SOURCE}" = distro ]; then
+            version=""
+          fi
           echo "version=${EXPECTED_QEMU:-${version}}" >> "$GITHUB_OUTPUT"
+
+      # The published qemu-build tag does not contain a change to the recipe.
+      - name: Check for QEMU recipe changes
+        id: recipe
+        if: env.BUILD == 'true'
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          BUILD_QEMU: ${{ inputs.build_qemu }}
+          QEMU_SOURCE: ${{ inputs.qemu_source || 'upstream' }}
+        run: |
+          build=false
+          if [ "${QEMU_SOURCE}" = distro ]; then
+            echo "QEMU_SOURCE=distro does not use the qemu-build image"
+          elif [ "${BUILD_QEMU}" = true ]; then
+            echo "build_qemu is set"
+            build=true
+          elif [ "${EVENT}" = pull_request ]; then
+            # HEAD is the merge commit of the pull request
+            if git diff --quiet "${BASE_SHA}" HEAD -- docker/qemu/; then
+              echo "docker/qemu/ is the same as in ${BASE_SHA}"
+            else
+              status=$?
+              if [ "${status}" -ne 1 ]; then
+                echo "::error::cannot compare docker/qemu/ with ${BASE_SHA}"
+                exit 1
+              fi
+              echo "the pull request changes docker/qemu/"
+              build=true
+            fi
+          fi
+          echo "build=${build}" >> "$GITHUB_OUTPUT"
 
       # The image build pulls the qemu-build image, which can be private.
       - name: Log in to GitHub Container Registry
@@ -110,6 +157,18 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # The job uses the default builder (Docker driver), so the next build
+      # resolves "FROM qemu-build:local" from the local image store.
+      - name: Build QEMU image
+        if: steps.recipe.outputs.build == 'true'
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: docker/qemu
+          file: docker/qemu/Dockerfile
+          push: false
+          load: true
+          tags: qemu-build:local
+
       - name: Build container image
         if: env.BUILD == 'true'
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
@@ -117,7 +176,7 @@ jobs:
           context: .
           file: docker/Dockerfile
           build-args: |
-            QEMU_IMAGE=${{ steps.qemu.outputs.image }}
+            QEMU_IMAGE=${{ steps.recipe.outputs.build == 'true' && 'qemu-build:local' || steps.qemu.outputs.image }}
             QEMU_SOURCE=${{ inputs.qemu_source || 'upstream' }}
           push: false
           load: true

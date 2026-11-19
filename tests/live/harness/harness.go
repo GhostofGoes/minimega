@@ -44,6 +44,9 @@ var (
 	artifactDir = envOr("LIVE_ARTIFACTS", filepath.Join(os.TempDir(), "minimega-live-artifacts"))
 	// how long to wait for the topology to settle (boot, DHCP, OSPF)
 	SettleTimeout = envDuration("LIVE_SETTLE_TIMEOUT", 6*time.Minute)
+	// QEMU version (major.minor.micro) that the image must run; empty only
+	// logs the version
+	ExpectedQemuVersion = os.Getenv("LIVE_QEMU_VERSION")
 )
 
 func envOr(key, def string) string {

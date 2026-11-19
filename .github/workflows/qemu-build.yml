@@ -9,7 +9,6 @@ on:
   push:
     branches:
       - master
-      - 'spike-**' # SPIKE ONLY
     paths:
       - docker/qemu/**
   pull_request:

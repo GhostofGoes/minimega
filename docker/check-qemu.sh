@@ -8,7 +8,8 @@
 #
 #   check-qemu.sh <upstream|distro> <expected version>
 #
-# Both modes check that kvm, qemu-img, and qemu-nbd run and print a version.
+# Both modes check that kvm, qemu-img, and qemu-nbd run and print a version, and
+# that the e1000 network boot ROM has the size of the Ubuntu ipxe-qemu ROM.
 # The upstream mode (QEMU built by docker/qemu/Dockerfile) also checks the exact
 # version, the system emulators, the QXL, SPICE, and VNC support, and that all
 # shared libraries resolve.
@@ -56,6 +57,20 @@ for cmd in "kvm -version" "qemu-img --version" "qemu-nbd --version"; do
         pass "${cmd}: version ${v}"
     fi
 done
+
+# A saved VM state loads only when each option ROM has the same size. The distro
+# QEMU loads its ROMs from ipxe-qemu, which qemu-system-x86 depends on.
+if [ "${MODE}" = upstream ]; then
+    rom="${PREFIX}/share/qemu/efi-e1000.rom"
+else
+    rom=/usr/lib/ipxe/qemu/efi-e1000.rom
+fi
+size="$(stat -L -c %s "${rom}" 2>/dev/null)"
+if [ "${size}" = 524288 ]; then
+    pass "${rom}: 524288 bytes"
+else
+    fail "${rom}: ${size:-no} bytes, expected 524288. State files from the Ubuntu QEMU packages do not load with a different ROM size"
+fi
 
 if [ "${MODE}" = distro ]; then
     [ "${FAILED}" -eq 0 ] || { echo "QEMU checks failed" >&2; exit 1; }
