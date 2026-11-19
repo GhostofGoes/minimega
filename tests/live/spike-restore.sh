@@ -20,6 +20,8 @@
 #   SAVE-OLD-REAL           a phenix-shaped VM in parallel (2 vCPUs, 1 GB, CPU
 #                           model, qcow2 disk, NIC with a fixed MAC, -vga qxl)
 #   RESTORE-NEW-REAL        restore it from a rewritten header with the saved .hdd
+#   RESTORE-NEW-REAL-OLDROM    the same, with the old image's iPXE ROMs in the new container
+#   RESTORE-NEW-REAL-NOBLEROM  the same, with the iPXE ROMs of Ubuntu 24.04 ipxe-qemu
 #   CONTROL-NEW             save and restore on the new image only
 #
 # Requirements: Linux, root, Docker, /dev/kvm, and the openvswitch kernel module
@@ -99,6 +101,18 @@ DET_PC="not run"
 MACHINE_OLD_REAL=unknown
 RES_REAL=fail
 DET_REAL="not run"
+RES_OLDROM=fail
+DET_OLDROM="not run"
+RES_NOBLEROM=fail
+DET_NOBLEROM="not run"
+ROM_E1000_OLD=unknown
+ROM_E1000_NEW=unknown
+ROM_E1000_NOBLE=n/a
+ROM_QXL_OLD=unknown
+ROM_QXL_NEW=unknown
+NOBLE_ERR="not staged"
+ROM_NOTE=""
+HDD_SUM=""
 RES_CONTROL=fail
 DET_CONTROL="not run"
 RESULTS_PRINTED=0
@@ -131,6 +145,7 @@ REAL_HEADER=unknown
 GUEST_MAC=""
 GUEST_QXL=""
 RESTORE_CHECK=""
+PRE_RESTORE=""
 PROBE_OUT=""
 MACHINE=""
 HEADER=""
@@ -870,14 +885,17 @@ run_save_old_real() {
 }
 
 # run_restore LABEL MACHINE STATE MARKER UPTIME [COMMAND...] restores STATE on the
-# new image for the VM that use_vm selected. A non-empty RESTORE_CHECK names a
-# function that runs after a successful restore.
+# new image for the VM that use_vm selected. A non-empty PRE_RESTORE names a
+# function that runs in the new container before the launch, and a non-empty
+# RESTORE_CHECK names a function that runs after a successful restore.
 run_restore() {
     local label=$1 machine=$2 state=$3 marker=$4 uptime=$5 rc=0 err
     shift 5
     : > "${QEMU_LOG}"
     if ! start_mm "${NEW_IMAGE}" "${label}"; then
         DETAIL="minimega did not start from ${NEW_IMAGE}"
+        rc=1
+    elif [[ -n "${PRE_RESTORE}" ]] && ! "${PRE_RESTORE}"; then
         rc=1
     elif ! restore_guest "${state}" "${machine}" "${marker}" "${uptime}" "$@"; then
         rc=1
@@ -890,6 +908,137 @@ run_restore() {
     collect_evidence "${label}"
     kill_flush
     stop_mm "${label}"
+    return "${rc}"
+}
+
+# rom_size TEXT NAME prints the size from a "ROMSIZE NAME BYTES" line, else "missing".
+rom_size() {
+    local v
+    v="$(awk -v n="$2" '$1 == "ROMSIZE" && $2 == n { print $3; exit }' <<<"$1")"
+    printf '%s' "${v:-missing}"
+}
+
+# rom_evidence logs the ROM files of both images and stages the iPXE ROMs of the
+# old image (STAGE/rom-old) and of Ubuntu 24.04 ipxe-qemu (STAGE/rom-noble).
+rom_evidence() {
+    local out
+    mkdir -p "${STAGE}/rom-old" "${STAGE}/rom-noble"
+    log "ROM files of ${OLD_IMAGE}"
+    # shellcheck disable=SC2016
+    out="$(docker run --rm -v "${STAGE}/rom-old:/x" "${OLD_IMAGE}" bash -c '
+        ls -lL /usr/share/qemu/*.rom /usr/share/qemu/*.bin
+        echo "efi-e1000.rom -> $(readlink -f /usr/share/qemu/efi-e1000.rom)"
+        dpkg -S /usr/share/qemu/efi-e1000.rom "$(readlink -f /usr/share/qemu/efi-e1000.rom)" 2>&1
+        dpkg-query -W ipxe-qemu seabios 2>&1
+        echo "kvm -L help:"; kvm -L help 2>&1
+        for f in efi-e1000.rom vgabios-qxl.bin; do echo "ROMSIZE $f $(stat -L -c %s /usr/share/qemu/$f 2>/dev/null)"; done
+        for f in /usr/share/qemu/efi-*.rom /usr/share/qemu/pxe-*.rom; do
+            if [ -e "$f" ]; then cp -L "$f" /x/; fi
+        done
+        true' 2>&1 || true)"
+    printf '%s\n' "${out}" | tee "${ART}/logs/roms-old.txt" | sed 's/^/    /'
+    ROM_E1000_OLD="$(rom_size "${out}" efi-e1000.rom)"
+    ROM_QXL_OLD="$(rom_size "${out}" vgabios-qxl.bin)"
+
+    log "ROM files of ${NEW_IMAGE}"
+    # shellcheck disable=SC2016
+    out="$(docker run --rm "${NEW_IMAGE}" bash -c '
+        ls -lL /usr/local/share/qemu/*.rom /usr/local/share/qemu/*.bin
+        echo "kvm -L help:"; kvm -L help 2>&1
+        for f in efi-e1000.rom vgabios-qxl.bin; do echo "ROMSIZE $f $(stat -L -c %s /usr/local/share/qemu/$f 2>/dev/null)"; done
+        true' 2>&1 || true)"
+    printf '%s\n' "${out}" | tee "${ART}/logs/roms-new.txt" | sed 's/^/    /'
+    ROM_E1000_NEW="$(rom_size "${out}" efi-e1000.rom)"
+    ROM_QXL_NEW="$(rom_size "${out}" vgabios-qxl.bin)"
+
+    log "ROM files of Ubuntu 24.04 ipxe-qemu, installed in a throwaway ${NEW_IMAGE} container"
+    # shellcheck disable=SC2016
+    if out="$(docker run --rm -v "${STAGE}/rom-noble:/x" "${NEW_IMAGE}" bash -c '
+        set -e
+        export DEBIAN_FRONTEND=noninteractive
+        apt-get update -qq
+        apt-get install -y -qq --no-install-recommends ipxe-qemu >/dev/null
+        dpkg-query -W ipxe-qemu
+        ls -lL /usr/lib/ipxe/qemu/
+        for f in /usr/lib/ipxe/qemu/*.rom; do cp -L "$f" /x/; done
+        echo "ROMSIZE efi-e1000.rom $(stat -L -c %s /usr/lib/ipxe/qemu/efi-e1000.rom)"' 2>&1)"; then
+        NOBLE_ERR=""
+        ROM_E1000_NOBLE="$(rom_size "${out}" efi-e1000.rom)"
+    else
+        NOBLE_ERR="ipxe-qemu install or copy failed: $(oneline "$(tail -n 3 <<<"${out}")" 300)"
+    fi
+    printf '%s\n' "${out}" | tee "${ART}/logs/roms-noble.txt" | sed 's/^/    /'
+    ls -l "${STAGE}/rom-old" "${STAGE}/rom-noble" || true
+}
+
+# replace_roms DIR backs up the bundled iPXE ROMs in the new container and copies
+# each ROM in DIR (the files directory is mounted at the same path) over the
+# bundled file of the same name. It adds to ROM_NOTE.
+# shellcheck disable=SC2329 # called by the PRE_RESTORE functions
+replace_roms() {
+    local dir=$1 f name replaced="" skipped="" size
+    local qdir=/usr/local/share/qemu
+    if ! docker exec "${CONTAINER}" sh -c "mkdir -p ${qdir}/bundled-rom-backup && cp -a ${qdir}/efi-*.rom ${qdir}/pxe-*.rom ${qdir}/bundled-rom-backup/ 2>/dev/null; ls ${qdir}/bundled-rom-backup | wc -l"; then
+        DETAIL="could not back up the bundled ROMs in ${CONTAINER}"
+        return 1
+    fi
+    for f in "${dir}"/*.rom; do
+        [[ -f "${f}" ]] || continue
+        name="$(basename "${f}")"
+        if docker exec "${CONTAINER}" test -e "${qdir}/${name}"; then
+            if ! docker exec "${CONTAINER}" cp "${f}" "${qdir}/${name}"; then
+                DETAIL="could not copy ${name} into ${CONTAINER}"
+                return 1
+            fi
+            replaced+=" ${name}"
+        else
+            skipped+=" ${name}"
+        fi
+    done
+    if [[ -z "${replaced}" ]]; then
+        DETAIL="no ROM in ${dir} matches a bundled ROM name"
+        return 1
+    fi
+    size="$(docker exec "${CONTAINER}" stat -L -c %s "${qdir}/efi-e1000.rom" 2>/dev/null || echo missing)"
+    docker exec "${CONTAINER}" sh -c "ls -lL ${qdir}/efi-*.rom ${qdir}/pxe-*.rom" 2>&1 | sed 's/^/    /' || true
+    log "replaced:${replaced}; not bundled (skipped):${skipped:- none}"
+    ROM_NOTE="${ROM_NOTE:+${ROM_NOTE}; }replaced $(wc -w <<<"${replaced}" | tr -d ' ') ROMs from $(basename "${dir}") (efi-e1000.rom now ${size} bytes)"
+}
+
+# shellcheck disable=SC2329 # called through PRE_RESTORE
+prep_oldrom() { replace_roms "${STAGE}/rom-old"; }
+
+# shellcheck disable=SC2329 # called through PRE_RESTORE
+prep_noblerom() { replace_roms "${STAGE}/rom-noble"; }
+
+# check_hdd logs the checksum of the saved .hdd and notes a change since the first restore.
+check_hdd() {
+    local sum
+    sum="$(sha256sum "${HDD_OLD_REAL}" | cut -d ' ' -f 1)"
+    if [[ -z "${HDD_SUM}" ]]; then
+        HDD_SUM="${sum}"
+        log ".hdd sha256 ${sum}"
+    elif [[ "${sum}" != "${HDD_SUM}" ]]; then
+        log "warning: ${HDD_OLD_REAL} changed since the first restore (${HDD_SUM} -> ${sum})"
+        ROM_NOTE="warning: .hdd changed since the first restore"
+    else
+        log ".hdd unchanged since the first restore (sha256 ${sum})"
+    fi
+}
+
+# run_real_variant LABEL NAMESPACE PREP restores the rewritten real state with
+# the PREP function as PRE_RESTORE and check_real after the restore.
+run_real_variant() {
+    local label=$1 prep=$3 rc=0
+    use_vm "$2" "${VM_REAL}" "${UUID_REAL}"
+    ROM_NOTE=""
+    check_hdd
+    PRE_RESTORE="${prep}"
+    RESTORE_CHECK=check_real
+    run_restore "${label}" "${PINNED_MACHINE}" "${STATE_REAL_RW}" "${REAL_MARKER}" "${REAL_UPTIME}" \
+        "${REAL_RESTORE_CFG[@]}" || rc=1
+    PRE_RESTORE=""
+    RESTORE_CHECK=""
     return "${rc}"
 }
 
@@ -940,6 +1089,10 @@ RESULT restore_rewritten=${RES_RW} detail=\"$(oneline "${DET_RW}" 1400)\"
 RESULT restore_pc_pinned=${RES_PC} detail=\"$(oneline "${DET_PC}" 1400)\"
 RESULT machine_old_real=${MACHINE_OLD_REAL} header=${REAL_HEADER}
 RESULT restore_real=${RES_REAL} detail=\"$(oneline "${DET_REAL}" 2000)\"
+RESULT rom_e1000 old=${ROM_E1000_OLD} new=${ROM_E1000_NEW} noble_pkg=${ROM_E1000_NOBLE}
+RESULT rom_qxl old=${ROM_QXL_OLD} new=${ROM_QXL_NEW}
+RESULT restore_real_oldrom=${RES_OLDROM} detail=\"$(oneline "${DET_OLDROM}" 2000)\"
+RESULT restore_real_noblerom=${RES_NOBLEROM} detail=\"$(oneline "${DET_NOBLEROM}" 2000)\"
 RESULT control_new=${RES_CONTROL} detail=\"$(oneline "${DET_CONTROL}" 1400)\""
     echo
     printf '%s\n' "${block}" | tee "${ART}/results.txt"
@@ -1017,6 +1170,7 @@ ls -l "${STAGE}"
 
 phase "PROBE"
 probe_real
+rom_evidence
 
 # SAVE-OLD: boot on QEMU 6.2 with the default machine, write a marker, vm save.
 phase "SAVE-OLD"
@@ -1102,17 +1256,35 @@ fi
 if [[ "${real_save_ok}" == "1" ]]; then
     # RESTORE-NEW-REAL: the phenix-shaped VM from a rewritten header, with its saved disk.
     phase "RESTORE-NEW-REAL"
+    real_rw_ok=0
     if rewrite_state "${STATE_OLD_REAL}" "${STATE_REAL_RW}" "${PINNED_MACHINE}"; then
-        use_vm realnew "${VM_REAL}" "${UUID_REAL}"
-        RESTORE_CHECK=check_real
-        if run_restore restore-new-real "${PINNED_MACHINE}" "${STATE_REAL_RW}" "${REAL_MARKER}" "${REAL_UPTIME}" \
-            "${REAL_RESTORE_CFG[@]}"; then RES_REAL=pass; fi
-        RESTORE_CHECK=""
-        DET_REAL="${REAL_NOTES}; header ${REAL_HEADER} rewritten to ${PINNED_MACHINE}; ${DETAIL}"
+        real_rw_ok=1
+        if run_real_variant restore-new-real realnew ""; then RES_REAL=pass; fi
+        DET_REAL="${REAL_NOTES}; header ${REAL_HEADER} rewritten to ${PINNED_MACHINE}; ${ROM_NOTE:+${ROM_NOTE}; }${DETAIL}"
     else
         DET_REAL="${REAL_NOTES}; not run: header rewrite failed: ${DETAIL}"
+        DET_OLDROM="${DET_REAL}"
+        DET_NOBLEROM="${DET_REAL}"
     fi
     log "RESTORE-NEW-REAL ${RES_REAL}: ${DET_REAL}"
+
+    if [[ "${real_rw_ok}" == "1" ]]; then
+        # RESTORE-NEW-REAL-OLDROM: the same restore with the old image's iPXE ROMs in the new container.
+        phase "RESTORE-NEW-REAL-OLDROM"
+        if run_real_variant restore-new-real-oldrom realoldrom prep_oldrom; then RES_OLDROM=pass; fi
+        DET_OLDROM="old image iPXE ROMs; ${ROM_NOTE:+${ROM_NOTE}; }${DETAIL}"
+        log "RESTORE-NEW-REAL-OLDROM ${RES_OLDROM}: ${DET_OLDROM}"
+
+        # RESTORE-NEW-REAL-NOBLEROM: the same restore with the iPXE ROMs of Ubuntu 24.04 ipxe-qemu.
+        phase "RESTORE-NEW-REAL-NOBLEROM"
+        if [[ -n "${NOBLE_ERR}" ]]; then
+            DET_NOBLEROM="not run: ${NOBLE_ERR}"
+        else
+            if run_real_variant restore-new-real-noblerom realnoblerom prep_noblerom; then RES_NOBLEROM=pass; fi
+            DET_NOBLEROM="Ubuntu 24.04 ipxe-qemu ROMs; ${ROM_NOTE:+${ROM_NOTE}; }${DETAIL}"
+        fi
+        log "RESTORE-NEW-REAL-NOBLEROM ${RES_NOBLEROM}: ${DET_NOBLEROM}"
+    fi
 fi
 
 # CONTROL-NEW: save and restore on QEMU 11.1.3 only, to prove the procedure.
