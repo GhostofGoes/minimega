@@ -75,6 +75,7 @@ NS=""
 DETAIL=""
 CC_SEQ=0
 CC_STDOUT=""
+CC_STDERR=""
 CC_EXIT=""
 WAITED=0
 MARKER=""
@@ -282,14 +283,20 @@ wait_cc() {
     return 1
 }
 
-# cc_exec SCRIPT [LIMIT] runs "sh -c SCRIPT" on the guest (no single quotes in
-# SCRIPT) and sets CC_STDOUT and CC_EXIT from miniccc_responses.
+# cc_exec SCRIPT [LIMIT] runs "sh -c SCRIPT" on the guest and sets CC_STDOUT,
+# CC_STDERR, and CC_EXIT from miniccc_responses. minimega expands $VAR in every
+# argument (cliPreprocess), so SCRIPT must not contain $ or quoting characters.
 cc_exec() {
     local script=$1 limit=${2:-60} prefix row id n start dirs
     CC_SEQ=$(( CC_SEQ + 1 ))
     prefix="spike${CC_SEQ}"
     CC_STDOUT=""
+    CC_STDERR=""
     CC_EXIT=""
+    if [[ "${script}" == *[\$\`\"\'*#\\]* ]]; then
+        echo "  cc_exec: refusing a guest script with \$, a quote, *, # or \\: ${script}" >&2
+        return 1
+    fi
     ns_run "cc prefix ${prefix}" >/dev/null || return 1
     if ! ns_run "cc exec sh -c '${script}'" >/dev/null; then
         ns_run "clear cc prefix" >/dev/null || true
@@ -318,16 +325,34 @@ cc_exec() {
         return 1
     fi
     CC_STDOUT="$(cat "${dirs[0]}/stdout" 2>/dev/null || true)"
+    CC_STDERR="$(cat "${dirs[0]}/stderr" 2>/dev/null || true)"
     CC_EXIT="$(tr -d '[:space:]' < "${dirs[0]}/exitcode" 2>/dev/null || true)"
+    printf 'cc %s (command %s) exit=%s stdout=%q stderr=%q\n' "${prefix}" "${id}" "${CC_EXIT:-none}" \
+        "${CC_STDOUT}" "${CC_STDERR}" >> "${ART}/commands.log"
     echo "  cc ${prefix} -> exit ${CC_EXIT:-none}: $(oneline "${CC_STDOUT}")" >&2
 }
 
+# read_failed WHAT logs the raw guest output of the last cc_exec.
+read_failed() {
+    printf 'guest read failed (%s): exit=%s stdout=%q stderr=%q\n' "$1" "${CC_EXIT:-none}" \
+        "${CC_STDOUT}" "${CC_STDERR}" | tee -a "${ART}/commands.log" >&2
+}
+
+# first_field prints the first field of the first line of $1.
+first_field() { awk 'NR == 1 { print $1 }' <<<"$1"; }
+
 # guest_uptime sets UPTIME (not in a subshell: cc_exec must keep CC_SEQ).
 guest_uptime() {
-    # shellcheck disable=SC2016
-    cc_exec 'read u r < /proc/uptime && echo $u' 60 || return 1
-    UPTIME="$(oneline "${CC_STDOUT}")"
-    [[ "${UPTIME}" =~ ^[0-9]+(\.[0-9]+)?$ ]]
+    UPTIME=""
+    if ! cc_exec 'cat /proc/uptime' 60; then
+        read_failed "cat /proc/uptime"
+        return 1
+    fi
+    UPTIME="$(first_field "${CC_STDOUT}")"
+    if [[ ! "${UPTIME}" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+        read_failed "cat /proc/uptime"
+        return 1
+    fi
 }
 
 gt() { awk -v a="$1" -v b="$2" 'BEGIN { exit !(a > b) }'; }
@@ -357,6 +382,7 @@ save_guest() {
     MARKER="spike-$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')"
     if ! cc_exec "echo ${MARKER} > /tmp/spike-marker && cat /tmp/spike-marker" 60 \
         || [[ "${CC_EXIT}" != "0" || "$(oneline "${CC_STDOUT}")" != "${MARKER}" ]]; then
+        read_failed "write marker"
         DETAIL="could not write the marker (exit ${CC_EXIT:-none}, stdout '$(oneline "${CC_STDOUT}")')"
         return 1
     fi
@@ -470,13 +496,18 @@ restore_guest() {
         return 1
     fi
     log "miniccc reconnected after ${WAITED}s"
-    # shellcheck disable=SC2016
-    if ! cc_exec 'cat /tmp/spike-marker 2>/dev/null || echo NO-MARKER; read u r < /proc/uptime && echo $u' 60; then
-        DETAIL="miniccc reconnected but did not answer cc exec"
+    if ! guest_uptime; then
+        DETAIL="miniccc reconnected but cat /proc/uptime failed (stdout '$(oneline "${CC_STDOUT}")')"
         return 1
     fi
-    got_marker="$(oneline "$(head -n 1 <<<"${CC_STDOUT}")")"
-    got_uptime="$(oneline "$(tail -n 1 <<<"${CC_STDOUT}")")"
+    got_uptime="${UPTIME}"
+    if ! cc_exec 'cat /tmp/spike-marker' 60; then
+        read_failed "cat /tmp/spike-marker"
+        DETAIL="miniccc reconnected but did not answer cat /tmp/spike-marker (guest uptime ${got_uptime}s)"
+        return 1
+    fi
+    got_marker="$(first_field "${CC_STDOUT}")"
+    if [[ "${CC_EXIT}" != "0" ]]; then read_failed "cat /tmp/spike-marker"; fi
     now_machine="$(qmp_machine)"
     if [[ "${got_marker}" != "${want_marker}" ]]; then
         DETAIL="marker is '${got_marker}', expected '${want_marker}' (guest uptime ${got_uptime}s: fresh boot?)"
