@@ -66,6 +66,8 @@ Additional fields are available for KVM-based VMs:
 - vnc_port      : port for VNC shim
 - usb-use-xhci  : usb controller (true = xhci; false = ehci)
 - tpm-socket	: path of emulated tpm socket
+- machine       : machine type from vm config machine, or from the state
+                  file when the VM launched from a saved state
 
 Additional fields are available for container-based VMs:
 

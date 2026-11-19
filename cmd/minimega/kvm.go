@@ -83,6 +83,18 @@ type KVMConfig struct {
 	// file and using it with an unrelated disk (or cdrom) is discouraged.
 	// Use 'vm save' to generate state images from running VMs.
 	//
+	// QEMU loads a state image only with the machine type that saved it. At
+	// launch, minimega reads that machine type from the state image. If
+	// 'vm config machine' is empty, or is 'pc' or 'q35' for a machine type of
+	// that family, minimega uses the machine type of the state image. Other
+	// values go to QEMU with no change.
+	//
+	// If QEMU does not have the Ubuntu machine type of a state image, minimega
+	// uses the upstream machine type that corresponds to it, when minimega
+	// knows one. Then 'vm config machine' must be empty, that upstream machine
+	// type, or 'pc' or 'q35' for a machine type of that family. The 'machine'
+	// column of 'vm info' shows the machine type in use.
+	//
 	// Note: this configuration only applies to KVM-based VMs.
 	MigratePath string `config:"state" alias:"migrate"`
 
@@ -260,6 +272,11 @@ type KvmVM struct {
 
 	vncShim net.Listener // shim for VNC connections
 	VNCPort int
+
+	// pinnedMachine is the machine type that the last launch read from the
+	// state file. It is not part of KVMConfig, so "vm config clone" and saved
+	// configurations do not get it.
+	pinnedMachine string
 }
 
 type BlockDevice struct {
@@ -551,6 +568,10 @@ func (vm *KvmVM) Info(field string) (string, error) {
 		return strconv.Itoa(vm.VNCPort), nil
 	case "pid":
 		return strconv.Itoa(vm.Pid), nil
+	case "machine":
+		if vm.pinnedMachine != "" {
+			return vm.pinnedMachine, nil
+		}
 	}
 
 	return vm.KVMConfig.Info(field)
@@ -1030,10 +1051,8 @@ func (vm *KvmVM) launch() error {
 	var sErr bytes.Buffer
 	var qemuLog *os.File
 
-	vmConfig := VMConfig{BaseConfig: vm.BaseConfig, KVMConfig: vm.KVMConfig}
-
 	// if using bidirectionalCopyPaste, error out if dependencies aren't met
-	if vmConfig.BidirectionalCopyPaste {
+	if vm.BidirectionalCopyPaste {
 		if err := checkVersion("qemu", MIN_QEMU_COPY_PASTE, qemuVersion); err != nil {
 			return fmt.Errorf("bidirectional-copy-paste not supported. Please disable: %v", err)
 		}
@@ -1042,8 +1061,10 @@ func (vm *KvmVM) launch() error {
 		}
 	}
 
-	args := vmConfig.qemuArgs(vm.ID, vm.instancePath)
-	args = vmConfig.applyQemuOverrides(args)
+	args, err := vm.launchArgs()
+	if err != nil {
+		return vm.setErrorf("unable to launch VM: %v", err)
+	}
 	log.Debug("final qemu args: %#v", args)
 
 	// if the QemuPath is not absolute, try a lookup based on $PATH
@@ -1112,6 +1133,30 @@ func (vm *KvmVM) launch() error {
 	vm.waitToKill(cmd.Process, waitChan)
 
 	return nil
+}
+
+// launchArgs returns the QEMU arguments for a launch. It builds them from a
+// copy of the VM's configuration, with the machine type from the state file
+// when there is one.
+//
+// LOCK: Assumes the VM is locked.
+func (vm *KvmVM) launchArgs() ([]string, error) {
+	vmConfig := VMConfig{BaseConfig: vm.BaseConfig, KVMConfig: vm.KVMConfig}
+
+	incoming, err := vm.pinStateMachine(&vmConfig)
+	if err != nil {
+		return nil, err
+	}
+
+	args := vmConfig.qemuArgs(vm.ID, vm.instancePath)
+	if incoming != "" {
+		args, err = replaceArgValue(args, "-incoming", catIncoming(vmConfig.MigratePath), incoming)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	return vmConfig.applyQemuOverrides(args), nil
 }
 
 func (vm *KvmVM) waitForExit(p *os.Process, wait chan bool) {
@@ -1511,7 +1556,7 @@ func (vm VMConfig) qemuArgs(id int, vmPath string) []string {
 
 	if vm.MigratePath != "" {
 		args = append(args, "-incoming")
-		args = append(args, fmt.Sprintf("exec:cat %v", vm.MigratePath))
+		args = append(args, catIncoming(vm.MigratePath))
 	}
 
 	if !vm.Baremetal {
