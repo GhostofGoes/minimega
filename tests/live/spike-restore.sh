@@ -17,6 +17,9 @@
 #   RESTORE-NEW-PINNED      the same, with vm config machine pc-i440fx-6.2
 #   RESTORE-NEW-REWRITTEN   the same, from a copy whose header names pc-i440fx-6.2
 #   RESTORE-NEW-PC-PINNED   restore the SAVE-OLD-PC state, machine pc-i440fx-6.2
+#   SAVE-OLD-REAL           a phenix-shaped VM in parallel (2 vCPUs, 1 GB, CPU
+#                           model, qcow2 disk, NIC with a fixed MAC, -vga qxl)
+#   RESTORE-NEW-REAL        restore it from a rewritten header with the saved .hdd
 #   CONTROL-NEW             save and restore on the new image only
 #
 # Requirements: Linux, root, Docker, /dev/kvm, and the openvswitch kernel module
@@ -53,6 +56,10 @@ STATE_OLD="${MM_FILES}/spike-old.state"
 STATE_OLD_PC="${MM_FILES}/spike-old-pc.state"
 STATE_RW="${MM_FILES}/spike-old-rewritten.state"
 STATE_CTL="${MM_FILES}/spike-ctl.state"
+STATE_OLD_REAL="${MM_FILES}/spike-old-real.state"
+HDD_OLD_REAL="${MM_FILES}/spike-old-real.hdd"
+STATE_REAL_RW="${MM_FILES}/spike-old-real-rewritten.state"
+REAL_DISK="${STAGE}/real.qcow2"
 PINNED_MACHINE=pc-i440fx-6.2
 OLD_PC_MACHINE=pc
 
@@ -60,6 +67,15 @@ VM_MAIN=spike
 UUID_MAIN=5b1d0000-0000-4000-8000-00000000a5e1
 VM_PC=spikepc
 UUID_PC=5b1d0000-0000-4000-8000-00000000a5e2
+VM_REAL=spikereal
+UUID_REAL=5b1d0000-0000-4000-8000-00000000a5e3
+REAL_MAC=00:1f:53:00:05:01
+REAL_VLAN=spikenet
+REAL_CPU=Broadwell
+REAL_QXL=1
+REAL_NOTES=""
+REAL_SAVE_CFG=()
+REAL_RESTORE_CFG=()
 VM="${VM_MAIN}"
 UUID="${UUID_MAIN}"
 MEMORY=512
@@ -80,6 +96,9 @@ RES_RW=fail
 DET_RW="not run"
 RES_PC=fail
 DET_PC="not run"
+MACHINE_OLD_REAL=unknown
+RES_REAL=fail
+DET_REAL="not run"
 RES_CONTROL=fail
 DET_CONTROL="not run"
 RESULTS_PRINTED=0
@@ -104,6 +123,15 @@ PC_LAUNCH_ERR=""
 PC_MARKER=""
 PC_UPTIME=""
 PC_HEADER=unknown
+REAL_LAUNCHED=0
+REAL_LAUNCH_ERR=""
+REAL_MARKER=""
+REAL_UPTIME=""
+REAL_HEADER=unknown
+GUEST_MAC=""
+GUEST_QXL=""
+RESTORE_CHECK=""
+PROBE_OUT=""
 MACHINE=""
 HEADER=""
 
@@ -271,9 +299,11 @@ qemu_version() {
 
 # --- guest operations -------------------------------------------------------
 
-# configure_vm MACHINE STATE sets the fixed VM configuration in the namespace.
+# configure_vm MACHINE STATE [COMMAND...] sets the fixed VM configuration in the
+# namespace, then the extra "vm config" commands, then the machine and state.
 configure_vm() {
     local machine=$1 state=$2 c out
+    shift 2
     local cmds=(
         "clear vm config"
         "vm config qemu ${WRAP}"
@@ -285,6 +315,7 @@ configure_vm() {
         "vm config uuid ${UUID}"
         "vm config backchannel true"
     )
+    if (( $# > 0 )); then cmds+=("$@"); fi
     if [[ -n "${machine}" ]]; then cmds+=("vm config machine ${machine}"); fi
     if [[ -n "${state}" ]]; then cmds+=("vm config state ${state}"); fi
     for c in "${cmds[@]}"; do
@@ -382,10 +413,11 @@ guest_uptime() {
 
 gt() { awk -v a="$1" -v b="$2" 'BEGIN { exit !(a > b) }'; }
 
-# launch_fresh MACHINE launches and starts a VM from the kernel and initrd.
+# launch_fresh MACHINE [COMMAND...] launches and starts a VM from the kernel and initrd.
 launch_fresh() {
-    local out
-    configure_vm "$1" "" || return 1
+    local out machine=$1
+    shift
+    configure_vm "${machine}" "" "$@" || return 1
     if ! out="$(ns_run "vm launch kvm ${VM}")"; then
         DETAIL="vm launch failed: $(oneline "${out}")"
         return 1
@@ -530,11 +562,13 @@ save_guest() {
     ls -l "${MM_FILES}"
 }
 
-# restore_guest STATE MACHINE MARKER UPTIME launches a VM from STATE and checks
-# that it runs, that miniccc reconnects, and that the marker and uptime survived.
+# restore_guest STATE MACHINE MARKER UPTIME [COMMAND...] launches a VM from STATE
+# and checks that it runs, that miniccc reconnects, and that the marker and
+# uptime survived.
 restore_guest() {
     local state=$1 machine=$2 want_marker=$3 want_uptime=$4 out t0 st qs t_run got_marker got_uptime now_machine
-    configure_vm "${machine}" "${state}" || return 1
+    shift 4
+    configure_vm "${machine}" "${state}" "$@" || return 1
     t0=${SECONDS}
     if ! out="$(ns_run "vm launch kvm ${VM}")"; then
         DETAIL="vm launch failed: $(oneline "${out}")"
@@ -651,9 +685,11 @@ collect_evidence() {
 
 # --- phases -------------------------------------------------------------------
 
-# run_save_old boots both old VMs at once, so that the SAVE-OLD-PC guest has
-# its uptime already when SAVE-OLD is done, and then saves the default one.
+# run_save_old boots all three old VMs at once, so that the SAVE-OLD-PC and
+# SAVE-OLD-REAL guests have their uptime already when SAVE-OLD is done, and then
+# saves the default one.
 run_save_old() {
+    local out
     : > "${QEMU_LOG}"
     if ! start_mm "${OLD_IMAGE}" save-old; then
         DETAIL="minimega did not start from ${OLD_IMAGE}"
@@ -666,6 +702,14 @@ run_save_old() {
         PC_LAUNCHED=1
     else
         PC_LAUNCH_ERR="${DETAIL}"
+    fi
+    use_vm saveoldreal "${VM_REAL}" "${UUID_REAL}"
+    if ! out="$(ns_run "disk create qcow2 ${REAL_DISK} 256M")"; then
+        REAL_LAUNCH_ERR="disk create failed: $(oneline "${out}")"
+    elif launch_fresh "" "${REAL_SAVE_CFG[@]}"; then
+        REAL_LAUNCHED=1
+    else
+        REAL_LAUNCH_ERR="${DETAIL}"
     fi
     use_vm saveold "${VM_MAIN}" "${UUID_MAIN}"
     wait_boot || return 1
@@ -689,19 +733,159 @@ run_save_old_pc() {
     DETAIL="saved ${STATE_OLD_PC}, header ${HEADER}, marker ${MARKER}, uptime ${SAVED_UPTIME}s"
 }
 
-# run_restore LABEL MACHINE STATE MARKER UPTIME restores STATE on the new image
-# for the VM that use_vm selected.
+# probe_qemu IMAGE ARG... starts "kvm -M pc -S" with ARG in IMAGE for 5 s. It
+# succeeds when QEMU is still running then, and sets PROBE_OUT to its output.
+probe_qemu() {
+    local image=$1 out rc=0
+    shift
+    out="$(docker run --rm --device /dev/kvm "${image}" timeout 5 kvm -M pc -nodefaults -display none -S "$@" 2>&1)" || rc=$?
+    PROBE_OUT="${out}"
+    echo "  probe ${image} kvm $*: exit ${rc}${out:+: $(oneline "${out}" 300)}"
+    (( rc == 124 ))
+}
+
+# probe_real decides the CPU model and QXL for the real VM; both images must accept each one.
+probe_real() {
+    local image warnings=0 n
+    for image in "${OLD_IMAGE}" "${NEW_IMAGE}"; do
+        if probe_qemu "${image}" -cpu "${REAL_CPU}"; then
+            n="$(grep -c "doesn't support requested feature" <<<"${PROBE_OUT}" || true)"
+            if (( n > warnings )); then warnings=${n}; fi
+        else
+            REAL_NOTES+="cpu ${REAL_CPU} refused by ${image} ($(oneline "${PROBE_OUT}" 200)), using the default host; "
+            REAL_CPU=host
+            break
+        fi
+    done
+    if [[ "${REAL_CPU}" != host ]]; then
+        REAL_NOTES+="cpu ${REAL_CPU} (${warnings} host feature warnings); "
+    fi
+    for image in "${OLD_IMAGE}" "${NEW_IMAGE}"; do
+        if ! probe_qemu "${image}" -vga qxl; then
+            REAL_NOTES+="qxl dropped: ${image} refused -vga qxl ($(oneline "${PROBE_OUT}" 200)); "
+            REAL_QXL=0
+            break
+        fi
+    done
+    if [[ "${REAL_QXL}" == 1 ]]; then REAL_NOTES+="qemu-append -vga qxl; "; fi
+    REAL_NOTES+="2 vCPUs, 1024 MB, ide disk, e1000 NIC ${REAL_MAC} on ${REAL_VLAN}"
+    local cfg=(
+        "vm config vcpus 2"
+        "vm config memory 1024"
+        "vm config net ${REAL_VLAN},${REAL_MAC}"
+    )
+    if [[ "${REAL_CPU}" != host ]]; then cfg+=("vm config cpu ${REAL_CPU}"); fi
+    if [[ "${REAL_QXL}" == 1 ]]; then cfg+=("vm config qemu-append -vga qxl"); fi
+    REAL_SAVE_CFG=("${cfg[@]}" "vm config disks ${REAL_DISK}")
+    REAL_RESTORE_CFG=("${cfg[@]}" "vm config disks ${HDD_OLD_REAL},ide,writeback")
+    log "real VM: ${REAL_NOTES}"
+}
+
+# guest_hw sets GUEST_MAC (eth0) and GUEST_QXL (yes or no) from plain files in the guest.
+guest_hw() {
+    GUEST_MAC=""
+    GUEST_QXL=""
+    if ! cc_exec 'cat /sys/class/net/eth0/address' 60 || [[ "${CC_EXIT}" != "0" ]]; then
+        read_failed "cat /sys/class/net/eth0/address"
+        return 1
+    fi
+    GUEST_MAC="$(first_field "${CC_STDOUT}" | tr '[:upper:]' '[:lower:]')"
+    if ! cc_exec 'cat /proc/bus/pci/devices' 60 || [[ "${CC_EXIT}" != "0" ]]; then
+        read_failed "cat /proc/bus/pci/devices"
+        return 1
+    fi
+    if awk '{ print tolower($2) }' <<<"${CC_STDOUT}" | grep -qx 1b360100; then GUEST_QXL=yes; else GUEST_QXL=no; fi
+}
+
+# check_real is the RESTORE_CHECK of RESTORE-NEW-REAL: the same MAC, and QXL if it was used.
+# shellcheck disable=SC2329 # called through RESTORE_CHECK
+check_real() {
+    local want_mac
+    want_mac="$(tr '[:upper:]' '[:lower:]' <<<"${REAL_MAC}")"
+    if ! guest_hw; then
+        DETAIL="${DETAIL}; could not read eth0 address or PCI devices after the restore"
+        return 1
+    fi
+    if [[ "${GUEST_MAC}" != "${want_mac}" ]]; then
+        DETAIL="${DETAIL}; eth0 MAC is '${GUEST_MAC}', expected ${want_mac}"
+        return 1
+    fi
+    if [[ "${REAL_QXL}" == 1 && "${GUEST_QXL}" != yes ]]; then
+        DETAIL="${DETAIL}; eth0 MAC matches but no QXL device 1b36:0100 in /proc/bus/pci/devices"
+        return 1
+    fi
+    DETAIL="${DETAIL}; eth0 MAC ${GUEST_MAC} matches; QXL 1b36:0100 present: ${GUEST_QXL}"
+}
+
+# fix_hdd_backing logs the backing file of the saved .hdd. A sync=top backup of
+# a relative snapshot can name <base>/<VM id>/../files/...; that VM directory
+# does not exist in the restore container, so rebase (metadata only) to REAL_DISK.
+fix_hdd_backing() {
+    local info backing
+    info="$(docker exec "${CONTAINER}" qemu-img info "${HDD_OLD_REAL}" 2>&1 || true)"
+    printf '%s\n' "${info}" | sed 's/^/    /'
+    backing="$(sed -n 's/^backing file: \([^ ]*\).*/\1/p' <<<"${info}" | head -n 1)"
+    if [[ -z "${backing}" ]]; then
+        REAL_NOTES+="; .hdd has no backing file"
+        return 0
+    fi
+    if [[ "${backing}" == "${REAL_DISK}" ]]; then
+        REAL_NOTES+="; .hdd backing ${backing}"
+        return 0
+    fi
+    if ! docker exec "${CONTAINER}" qemu-img rebase -u -F qcow2 -b "${REAL_DISK}" "${HDD_OLD_REAL}"; then
+        DETAIL="qemu-img rebase of ${HDD_OLD_REAL} failed (backing ${backing})"
+        return 1
+    fi
+    log ".hdd backing ${backing} rebased (metadata only) to ${REAL_DISK}"
+    REAL_NOTES+="; .hdd backing ${backing} rebased to ${REAL_DISK}"
+}
+
+# run_save_old_real saves the phenix-shaped VM, in the SAVE-OLD container.
+run_save_old_real() {
+    local size
+    use_vm saveoldreal "${VM_REAL}" "${UUID_REAL}"
+    if [[ "${REAL_LAUNCHED}" != "1" ]]; then
+        DETAIL="VM not launched: ${REAL_LAUNCH_ERR:-SAVE-OLD stopped before the launch}"
+        return 1
+    fi
+    wait_boot || return 1
+    if guest_hw; then
+        log "real VM before save: eth0 ${GUEST_MAC}, QXL 1b36:0100 present: ${GUEST_QXL}"
+        REAL_NOTES+="; before save eth0 ${GUEST_MAC}, qxl ${GUEST_QXL}"
+    else
+        REAL_NOTES+="; before save eth0 and PCI read failed"
+    fi
+    save_guest spike-old-real || return 1
+    size="$(stat -c %s "${HDD_OLD_REAL}" 2>/dev/null || echo 0)"
+    if (( size == 0 )); then
+        DETAIL="vm save completed but ${HDD_OLD_REAL} is missing or empty"
+        return 1
+    fi
+    log "disk file ${HDD_OLD_REAL}: ${size} bytes"
+    fix_hdd_backing || return 1
+    MACHINE_OLD_REAL="${MACHINE:-unknown}"
+    REAL_HEADER="${HEADER}"
+    DETAIL="saved ${STATE_OLD_REAL} ($(stat -c %s "${STATE_OLD_REAL}") bytes) and ${HDD_OLD_REAL} (${size} bytes), header ${HEADER}, marker ${MARKER}, uptime ${SAVED_UPTIME}s"
+}
+
+# run_restore LABEL MACHINE STATE MARKER UPTIME [COMMAND...] restores STATE on the
+# new image for the VM that use_vm selected. A non-empty RESTORE_CHECK names a
+# function that runs after a successful restore.
 run_restore() {
     local label=$1 machine=$2 state=$3 marker=$4 uptime=$5 rc=0 err
+    shift 5
     : > "${QEMU_LOG}"
     if ! start_mm "${NEW_IMAGE}" "${label}"; then
         DETAIL="minimega did not start from ${NEW_IMAGE}"
         rc=1
-    elif ! restore_guest "${state}" "${machine}" "${marker}" "${uptime}"; then
+    elif ! restore_guest "${state}" "${machine}" "${marker}" "${uptime}" "$@"; then
         rc=1
         sleep 2
         err="$(qemu_error)"
         if [[ -n "${err}" ]]; then DETAIL="${DETAIL}; ${err}"; fi
+    elif [[ -n "${RESTORE_CHECK}" ]] && ! "${RESTORE_CHECK}"; then
+        rc=1
     fi
     collect_evidence "${label}"
     kill_flush
@@ -754,6 +938,8 @@ RESULT restore_unpinned=${RES_UNPINNED} detail=\"$(oneline "${DET_UNPINNED}" 140
 RESULT restore_pinned=${RES_PINNED} detail=\"$(oneline "${DET_PINNED}" 1400)\"
 RESULT restore_rewritten=${RES_RW} detail=\"$(oneline "${DET_RW}" 1400)\"
 RESULT restore_pc_pinned=${RES_PC} detail=\"$(oneline "${DET_PC}" 1400)\"
+RESULT machine_old_real=${MACHINE_OLD_REAL} header=${REAL_HEADER}
+RESULT restore_real=${RES_REAL} detail=\"$(oneline "${DET_REAL}" 2000)\"
 RESULT control_new=${RES_CONTROL} detail=\"$(oneline "${DET_CONTROL}" 1400)\""
     echo
     printf '%s\n' "${block}" | tee "${ART}/results.txt"
@@ -771,7 +957,7 @@ cleanup() {
         docker logs "${CONTAINER}" > "${ART}/logs/container-at-exit.log" 2>&1
         docker rm -f "${CONTAINER}" >/dev/null 2>&1
     fi
-    for f in "${STATE_OLD}" "${STATE_OLD_PC}" "${STATE_RW}" "${STATE_CTL}"; do
+    for f in "${STATE_OLD}" "${STATE_OLD_PC}" "${STATE_RW}" "${STATE_OLD_REAL}" "${STATE_REAL_RW}" "${STATE_CTL}"; do
         if [[ -f "${f}" ]]; then head -c 1048576 "${f}" > "${ART}/$(basename "${f}").head"; fi
     done
     print_results
@@ -829,6 +1015,9 @@ build_guest
 write_wrapper
 ls -l "${STAGE}"
 
+phase "PROBE"
+probe_real
+
 # SAVE-OLD: boot on QEMU 6.2 with the default machine, write a marker, vm save.
 phase "SAVE-OLD"
 save_ok=0
@@ -858,6 +1047,20 @@ else
     DET_PC="not run: SAVE-OLD-PC failed: ${DETAIL}"
 fi
 collect_evidence save-old-pc save-old
+
+# SAVE-OLD-REAL: the phenix-shaped old VM, in the same container.
+phase "SAVE-OLD-REAL"
+real_save_ok=0
+if run_save_old_real; then
+    real_save_ok=1
+    REAL_MARKER="${MARKER}"
+    REAL_UPTIME="${SAVED_UPTIME}"
+    log "SAVE-OLD-REAL ok: ${DETAIL}"
+else
+    log "SAVE-OLD-REAL FAILED: ${DETAIL}"
+    DET_REAL="${REAL_NOTES}; not run: SAVE-OLD-REAL failed: ${DETAIL}"
+fi
+collect_evidence save-old-real save-old
 stop_mm save-old
 
 if [[ "${save_ok}" == "1" ]]; then
@@ -894,6 +1097,22 @@ if [[ "${pc_save_ok}" == "1" ]]; then
     if run_restore restore-new-pc-pinned "${PINNED_MACHINE}" "${STATE_OLD_PC}" "${PC_MARKER}" "${PC_UPTIME}"; then RES_PC=pass; fi
     DET_PC="header ${PC_HEADER}; ${DETAIL}"
     log "RESTORE-NEW-PC-PINNED ${RES_PC}: ${DET_PC}"
+fi
+
+if [[ "${real_save_ok}" == "1" ]]; then
+    # RESTORE-NEW-REAL: the phenix-shaped VM from a rewritten header, with its saved disk.
+    phase "RESTORE-NEW-REAL"
+    if rewrite_state "${STATE_OLD_REAL}" "${STATE_REAL_RW}" "${PINNED_MACHINE}"; then
+        use_vm realnew "${VM_REAL}" "${UUID_REAL}"
+        RESTORE_CHECK=check_real
+        if run_restore restore-new-real "${PINNED_MACHINE}" "${STATE_REAL_RW}" "${REAL_MARKER}" "${REAL_UPTIME}" \
+            "${REAL_RESTORE_CFG[@]}"; then RES_REAL=pass; fi
+        RESTORE_CHECK=""
+        DET_REAL="${REAL_NOTES}; header ${REAL_HEADER} rewritten to ${PINNED_MACHINE}; ${DETAIL}"
+    else
+        DET_REAL="${REAL_NOTES}; not run: header rewrite failed: ${DETAIL}"
+    fi
+    log "RESTORE-NEW-REAL ${RES_REAL}: ${DET_REAL}"
 fi
 
 # CONTROL-NEW: save and restore on QEMU 11.1.3 only, to prove the procedure.
