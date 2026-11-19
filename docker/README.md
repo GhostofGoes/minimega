@@ -52,6 +52,10 @@ A state file from `vm save` restores only on the machine type that saved it.
 Thus a state file from an image with a different QEMU version needs
 `vm config machine <old type>`. Restores between QEMU versions are not tested.
 
+A state file also restores only when each network boot ROM has the same size.
+The image uses the ROMs of the Ubuntu `ipxe-qemu` package, as the Ubuntu QEMU
+packages do. Thus the ROMs do not prevent a restore between the two.
+
 ### QEMU options that QEMU removed
 
 QEMU removed these options after version 6.2. A VM does not start when
