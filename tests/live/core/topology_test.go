@@ -78,6 +78,10 @@ var topology = func() []vmSpec {
 
 const (
 	d5UUID = "4c1e0000-0000-4000-8000-0000000000d5"
+	// "vm config qemu-append ... -vga qxl"
+	qxlVM = "host-c1"
+	// "vm config bidirectional-copy-paste true"
+	clipboardVM = "host-d2"
 	// total NICs across the topology (routers 5, hosts 21)
 	totalNICs = 26
 )

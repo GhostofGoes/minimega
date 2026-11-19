@@ -148,8 +148,8 @@ vm config qemu-append -semihosting -semihosting-config enable=on,target=native
 
 #### Technical details
 
-minimega uses QEMU version 1.6 or greater. When launching `kvm` type VMs, the
-following occurs, in order:
+minimega uses QEMU version 1.6 or greater. minimega is tested with QEMU 8.2
+through 11.1.3. When launching `kvm` type VMs, the following occurs, in order:
 
 - A new VM handler is created within minimega, which is populated with a copy of the VM configuration
 - An instance directory for the VM is created (by default /tmp/minimega/N, where N is the VM ID), and the configuration is written to disk

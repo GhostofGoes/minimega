@@ -426,6 +426,8 @@ status of in-flight saves by invoking 'vm save' with no arguments.
 
 Note: This will overwrite any prior saved files.
 
+Note: A state file restores only on the machine type that saved it.
+
 Note: vm save is currently supported for KVM VMs only. Android VM save is not
 supported because Android Emulator snapshot/AVD state is managed separately
 from minimega's KVM migration state.`,
