@@ -6,7 +6,11 @@ package harness
 
 import (
 	"encoding/binary"
+	"fmt"
+	"path"
 	"regexp"
+	"sort"
+	"strings"
 )
 
 // This file holds guest-side data that the tests generate instead of storing
@@ -18,6 +22,45 @@ var qemuVersionRe = regexp.MustCompile(`\d+\.\d+\.\d+`)
 // It accepts "QEMU emulator version 11.1.3 (...)", "v11.1.3", and "11.1.3".
 func QemuVersion(s string) string {
 	return qemuVersionRe.FindString(s)
+}
+
+// PCIIDs reads the output of
+// "grep . /sys/bus/pci/devices/*/vendor /sys/bus/pci/devices/*/device"
+// (lines "<device dir>/<vendor|device>:<value>") and returns one
+// "vendor:device" pair for each device, sorted by device directory.
+func PCIIDs(out string) ([]string, error) {
+	vendor, device := map[string]string{}, map[string]string{}
+	for _, line := range strings.Fields(out) {
+		i := strings.LastIndex(line, ":")
+		if i < 0 {
+			return nil, fmt.Errorf("unexpected line %q", line)
+		}
+		file, value := line[:i], line[i+1:]
+		switch dir := path.Dir(file); path.Base(file) {
+		case "vendor":
+			vendor[dir] = value
+		case "device":
+			device[dir] = value
+		default:
+			return nil, fmt.Errorf("unexpected line %q", line)
+		}
+	}
+	var dirs []string
+	for dir := range vendor {
+		dirs = append(dirs, dir)
+	}
+	sort.Strings(dirs)
+	var ids []string
+	for _, dir := range dirs {
+		if device[dir] == "" {
+			return nil, fmt.Errorf("%v has a vendor and no device", dir)
+		}
+		ids = append(ids, vendor[dir]+":"+device[dir])
+	}
+	if len(ids) != len(device) {
+		return nil, fmt.Errorf("%d vendor and %d device files", len(ids), len(device))
+	}
+	return ids, nil
 }
 
 // ArmBootMessage is the line that ArmBootImage writes to its serial port.

@@ -147,7 +147,6 @@ The QEMU phases do these checks:
 | `Clipboard` | `host-d2` | QMP `query-chardev` lists `vdagent`. The guest has the virtio port `com.redhat.spice.0`. |
 | `ArmBoot` | `arm-boot` | The phase writes a small AArch64 program, launches it as a bare-metal `virt` VM, and reads its message with `vm serial`. Then it removes the VM. The phase is skipped when the image has no `qemu-system-aarch64`. |
 | `CDROM` | `host-b2` | `vm cdrom change` inserts a 2 MiB image. The guest reads it as `sr0` with 4096 sectors. After `vm cdrom eject`, the guest cannot read `sr0`. |
-| `SaveRestore` | `host-c2` | The phase saves the VM with `vm save`, then kills it. It launches the VM again from the state file and the saved disk, with the same UUID and MAC. miniccc connects again and the guest uptime continues. This phase runs last before teardown. |
 
 ## Running locally
 
@@ -190,10 +189,12 @@ and `live.initrd`) from the `live-test-artifacts` artifact of a CI run:
 
 ```bash
 sudo LIVE_PULL=0 LIVE_GUEST_DIR=/path/to/x86-guest \
-  LIVE_QEMU=qemu-system-x86_64 LIVE_CPU=qemu64 \
+  LIVE_QEMU=/usr/local/bin/qemu-system-x86_64 LIVE_CPU=qemu64 \
   tests/live/run.sh minimega:dev
 ```
 
+`LIVE_QEMU` must be an absolute path: `vm config qemu` resolves a relative
+name against the files directory.
 The image must contain `qemu-system-x86_64`. The suite passes this way, only
 slower.
 
@@ -221,6 +222,9 @@ set `-f build_qemu=true`.
   adding it to the list in `TestLive` with the phases it needs. Use
   `harness.CCOK`/`harness.CCEventually` for guest commands and
   `harness.Eventually` for anything asynchronous.
+- Do not use shell variables (`$name` or `${name}`) in a guest command.
+  minimega expands them from its own environment before the guest gets the
+  command.
 - If you change `core/topology.mm`, update `core/topology_test.go` to match.
 - Add a group by creating `tests/live/<name>/` with a `topology.mm` and
   `//go:build live` tests in `package <name>` that import
