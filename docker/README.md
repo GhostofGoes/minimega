@@ -22,6 +22,57 @@ docker build -t minimega -f docker/Dockerfile .
 docker run -it minimega /opt/minimega/bin/minimega --version
 ```
 
+## QEMU in the image
+
+The image contains QEMU 11.1.3. The `docker/qemu` recipe builds QEMU from
+source. See [`docker/qemu/README.md`](qemu/README.md).
+
+The image contains four emulators: `qemu-system-x86_64`, `qemu-system-i386`,
+`qemu-system-arm`, and `qemu-system-aarch64`. The `kvm` program starts
+`qemu-system-x86_64` with KVM.
+
+minimega is tested with QEMU 8.2 through 11.1.3. The hosts that run the
+container are tested on Ubuntu 24.04 with KVM.
+
+To build the image with the Ubuntu QEMU packages instead, set the
+`QEMU_SOURCE` build argument. This image contains only the x86 emulators.
+
+```bash
+docker build -t minimega --build-arg QEMU_SOURCE=distro -f docker/Dockerfile .
+```
+
+### Machine types and saved VMs
+
+The machine types `pc` and `q35` are now the QEMU 11.1 versions. Thus a guest
+sees newer virtual hardware than with an older QEMU. To keep the older
+hardware, set an older machine type with `vm config machine`, for example
+`vm config machine pc-i440fx-8.2`.
+
+A state file from `vm save` restores only on the machine type that saved it.
+Thus a state file from an image with a different QEMU version needs
+`vm config machine <old type>`. Restores between QEMU versions are not tested.
+
+### QEMU options that QEMU removed
+
+QEMU removed these options after version 6.2. A VM does not start when
+`vm config qemu-append` or `vm config qemu-override` gives one of them:
+
+- `-no-hpet` and `-no-acpi`. Use `-machine hpet=off` and `-machine acpi=off`.
+- `-soundhw`.
+- `-watchdog`.
+- `-device sga`.
+- `-chardev tty`.
+- The `scsi` property of `virtio-blk`.
+- `-virtfs proxy`.
+- `-chroot` and `-runas`. Use `-run-with`.
+- `reconnect=`. Use `reconnect-ms=`.
+- The CPU model `Icelake-Client`.
+- Gluster images.
+- Machine types 5.1 and older.
+
+A sound device needs an explicit audio backend, for example
+`-audiodev none,id=snd0`.
+
 ## Start the minimega Docker container
 
 > [!NOTE]

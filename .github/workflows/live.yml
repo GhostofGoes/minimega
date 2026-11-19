@@ -10,6 +10,10 @@ name: Live Tests
 # Tests > Run workflow, or `gh workflow run live.yml --ref <branch>`), it
 # builds the dispatched branch the same way, so it works on a fork without a
 # pull request. Set "image" to test an existing image instead.
+#
+# The image build copies QEMU from the published qemu-build image. When a pull
+# request changes docker/qemu/ (or "build_qemu" is set on a manual run), the
+# job first builds docker/qemu/Dockerfile and uses that local image instead.
 
 on:
   workflow_call:
@@ -26,6 +30,24 @@ on:
         required: false
         default: ""
         type: string
+      qemu_source:
+        description: QEMU source for the image build (upstream or distro)
+        required: false
+        default: upstream
+        type: choice
+        options:
+          - upstream
+          - distro
+      expected_qemu:
+        description: Expected QEMU version (empty uses ARG QEMU_VERSION in docker/qemu/Dockerfile; with distro, empty skips the comparison)
+        required: false
+        default: ""
+        type: string
+      build_qemu:
+        description: Build docker/qemu/Dockerfile in this job instead of using the published qemu-build image
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -35,7 +57,8 @@ jobs:
   live:
     name: Live tests (KVM)
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    # a local QEMU build (see build_qemu) adds about 20 minutes
+    timeout-minutes: 90
     env:
       IMAGE: ${{ inputs.image || 'minimega:live' }}
       BUILD: ${{ inputs.image == '' }}
@@ -72,12 +95,89 @@ jobs:
           lsmod | grep -E '^(kvm|openvswitch)'
           nproc; free -h
 
+      # A fork uses the qemu-build image from its own registry.
+      - name: Select QEMU image and version
+        id: qemu
+        env:
+          OWNER: ${{ github.repository_owner }}
+          EXPECTED_QEMU: ${{ inputs.expected_qemu }}
+          QEMU_SOURCE: ${{ inputs.qemu_source || 'upstream' }}
+        run: |
+          version="$(sed -n 's/^ARG QEMU_VERSION="\([^"]*\)"$/\1/p' docker/qemu/Dockerfile)"
+          revision="$(sed -n 's/^ARG QEMU_BUILD_REVISION="\([^"]*\)"$/\1/p' docker/qemu/Dockerfile)"
+          if [ -z "${version}" ] || [ -z "${revision}" ]; then
+            echo "::error::cannot read ARG QEMU_VERSION and ARG QEMU_BUILD_REVISION from docker/qemu/Dockerfile"
+            exit 1
+          fi
+          echo "image=ghcr.io/${OWNER,,}/qemu-build:${version}-noble-${revision}" >> "$GITHUB_OUTPUT"
+          # the Ubuntu packages have their own version
+          if [ "${QEMU_SOURCE}" = distro ]; then
+            version=""
+          fi
+          echo "version=${EXPECTED_QEMU:-${version}}" >> "$GITHUB_OUTPUT"
+
+      # The published qemu-build tag does not contain a change to the recipe.
+      - name: Check for QEMU recipe changes
+        id: recipe
+        if: env.BUILD == 'true'
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          BUILD_QEMU: ${{ inputs.build_qemu }}
+          QEMU_SOURCE: ${{ inputs.qemu_source || 'upstream' }}
+        run: |
+          build=false
+          if [ "${QEMU_SOURCE}" = distro ]; then
+            echo "QEMU_SOURCE=distro does not use the qemu-build image"
+          elif [ "${BUILD_QEMU}" = true ]; then
+            echo "build_qemu is set"
+            build=true
+          elif [ "${EVENT}" = pull_request ]; then
+            # HEAD is the merge commit of the pull request
+            if git diff --quiet "${BASE_SHA}" HEAD -- docker/qemu/; then
+              echo "docker/qemu/ is the same as in ${BASE_SHA}"
+            else
+              status=$?
+              if [ "${status}" -ne 1 ]; then
+                echo "::error::cannot compare docker/qemu/ with ${BASE_SHA}"
+                exit 1
+              fi
+              echo "the pull request changes docker/qemu/"
+              build=true
+            fi
+          fi
+          echo "build=${build}" >> "$GITHUB_OUTPUT"
+
+      # The image build pulls the qemu-build image, which can be private.
+      - name: Log in to GitHub Container Registry
+        if: env.BUILD == 'true' || startsWith(env.IMAGE, 'ghcr.io/')
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # The job uses the default builder (Docker driver), so the next build
+      # resolves "FROM qemu-build:local" from the local image store.
+      - name: Build QEMU image
+        if: steps.recipe.outputs.build == 'true'
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: docker/qemu
+          file: docker/qemu/Dockerfile
+          push: false
+          load: true
+          tags: qemu-build:local
+
       - name: Build container image
         if: env.BUILD == 'true'
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: .
           file: docker/Dockerfile
+          build-args: |
+            QEMU_IMAGE=${{ steps.recipe.outputs.build == 'true' && 'qemu-build:local' || steps.qemu.outputs.image }}
+            QEMU_SOURCE=${{ inputs.qemu_source || 'upstream' }}
           push: false
           load: true
           tags: ${{ env.IMAGE }}
@@ -86,20 +186,14 @@ jobs:
         if: env.BUILD == 'true'
         run: echo "LIVE_PULL=0" >> "$GITHUB_ENV"
 
-      - name: Log in to GitHub Container Registry
-        if: env.BUILD != 'true' && startsWith(env.IMAGE, 'ghcr.io/')
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
       - name: Build test binary
         run: go test -c -tags live -o "${{ runner.temp }}/live.test" ./tests/live/core
 
       - name: Run live tests
+        env:
+          LIVE_QEMU_VERSION: ${{ steps.qemu.outputs.version }}
         run: |
-          sudo --preserve-env=GITHUB_STEP_SUMMARY,LIVE_PULL \
+          sudo --preserve-env=GITHUB_STEP_SUMMARY,LIVE_PULL,LIVE_QEMU_VERSION \
             LIVE_TEST_BIN="${{ runner.temp }}/live.test" \
             LIVE_ARTIFACTS="${{ github.workspace }}/live-artifacts" \
             tests/live/run.sh "$IMAGE"

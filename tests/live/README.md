@@ -110,8 +110,8 @@ flowchart TB
 | Routers | `rtr-ab`, `rtr-cd` | minirouter: interfaces, DHCP ranges and static leases, DNS records, OSPF (bird), `fw` (iptables), `rid`, `schedule` |
 | lan-a | `host-a1..a5` | dynamic leases, range launch (`host-a[2-5]`), `serial-ports`, `virtio-ports`, `colocate`, host tap |
 | lan-b | `host-b1..b5` | static MACs, `e1000` vs `virtio-net-pci`, `vcpus`/`cores` |
-| lan-c | `host-c1..c5` | `disk create`, virtio/IDE disks, cache mode, snapshot isolation, `qemu-append`, `machine q35`, `usb-use-xhci`, `vga cirrus` |
-| lan-d | `host-d1..d5` | firewall target, `backchannel false`, dual-homed NICs, fixed `uuid` |
+| lan-c | `host-c1..c5` | `disk create`, virtio/IDE disks, cache mode, snapshot isolation, `qemu-append` (SMBIOS serial and `-vga qxl`), `machine q35`, `usb-use-xhci`, `vga cirrus` |
+| lan-d | `host-d1..d5` | firewall target, `bidirectional-copy-paste`, `backchannel false`, dual-homed NICs, fixed `uuid` |
 
 Every VM shares one saved configuration (`vm config save live-base`), launches
 through the namespace queue (`ns queueing true` + `vm launch`), and is started
@@ -126,17 +126,28 @@ phases (screenshots, QMP, serial, ...) still run.
 
 | Area | Checks |
 |---|---|
-| Control plane | `version`, `check`, `host`, `namespace`, `ns hosts/queue/queueing`, `vm info`, `vm info summary`, `vlans`, `bridge` + OVS port/VLAN tags, `file list`, `disk info/snapshot`, miniweb (`/`, `/vms/info.json`) |
+| Control plane | `version`, `check`, `host`, `namespace`, `ns hosts/queue/queueing`, `vm info`, `vm info summary`, `vlans`, `bridge` + OVS port/VLAN tags, `file list`, `disk info/snapshot`, miniweb (`/`, `/vms/info.json`), QEMU version (`kvm -version` and QMP `query-version`) |
 | Boot | all 22 VMs `RUNNING`, 21 miniccc clients, every expected address learned from tap snooping |
 | Command and control | `cc exec` (one, all, tag and column filters), `cc exitcode`, `cc send`/`recv`, `cc background`, `cc process list/kill`, `cc responses`, `cc delete` |
-| Guest view of config | SMBIOS serial from `qemu-append`, VM UUID, disk sizes per interface, snapshot isolation, Q35 vs i440FX, xHCI, SMP, NIC driver and MAC, dual-homed addressing |
+| Guest view of config | SMBIOS serial from `qemu-append`, VM UUID, disk sizes per interface, snapshot isolation, Q35 vs i440FX, xHCI, SMP, NIC driver and MAC, dual-homed addressing, QXL PCI device and screenshot, `vdagent` chardev and `com.redhat.spice.0` virtio port |
 | Networking | same-LAN ping, OSPF routes, cross-router ping and traceroute, no-cc host reachable, DNS, HTTP to protonuke, firewall drop vs control, host tap (both directions), QoS delay and loss, `capture pcap` |
-| VM operations | `vm screenshot` (std and cirrus), `vm serial`, `vm qmp`, `vm tag` + tag filter, `vm top`, `vm stop/start`, `vm net disconnect/connect`, `vm hotplug add/remove`, `vm save`, `vm kill` + `vm flush` + `vm config clone` + queued relaunch |
+| VM operations | `vm screenshot` (std and cirrus), `vm serial`, `vm qmp`, bare-metal AArch64 VM (`qemu-system-aarch64`, `vm serial`), `vm tag` + tag filter, `vm top`, `vm stop/start`, `vm net disconnect/connect`, `vm hotplug add/remove`, `vm cdrom change/eject`, `vm save`, `vm kill` + `vm flush` + `vm config clone` + queued relaunch, restore from `vm save` (`vm config state`) |
 | Tools | `passwordify` on the guest initrd: a VM booted from it accepts the new root password and has the installed keys |
 | VNC | the RFB handshake and a frame through miniweb and the VNC shim, `vnc record fb` decoded, keys typed on the `host-d3` console with QEMU extended key events, `vnc record kb` + `vnc play`, paste as keys, `vnc type`, `vnc inject` (key and `LoadFile`, with and without a playback), `vm kill` while recording and playing (entries stop, files close) |
 | Teardown | `clear namespace` removes VMs, QEMU processes, and OVS ports |
 
-Out of scope: containers, Android, bare-metal VMs, and multi-node meshes.
+Out of scope: containers, Android, and multi-node meshes.
+
+The QEMU phases do these checks:
+
+| Phase | Host | Check |
+|---|---|---|
+| `QemuVersion` | `host-c3` | `kvm -version` and QMP `query-version` report `LIVE_QEMU_VERSION`. When the variable is not set, the phase only logs the version. |
+| `QXL` | `host-c1` | The guest has the PCI device `0x1b36:0x0100`. `vm screenshot` returns an image with text. |
+| `Clipboard` | `host-d2` | QMP `query-chardev` lists `vdagent`. The guest has the virtio port `com.redhat.spice.0`. |
+| `ArmBoot` | `arm-boot` | The phase writes a small AArch64 program, launches it as a bare-metal `virt` VM, and reads its message with `vm serial`. Then it removes the VM. The phase is skipped when the image has no `qemu-system-aarch64`. |
+| `CDROM` | `host-b2` | `vm cdrom change` inserts a 2 MiB image. The guest reads it as `sr0` with 4096 sectors. After `vm cdrom eject`, the guest cannot read `sr0`. |
+| `SaveRestore` | `host-c2` | The phase saves the VM with `vm save`, then kills it. It launches the VM again from the state file and the saved disk, with the same UUID and MAC. miniccc connects again and the guest uptime continues. This phase runs last before teardown. |
 
 ## Running locally
 
@@ -150,6 +161,9 @@ sudo tests/live/run.sh ghcr.io/sandia-minimega/minimega:master
 docker build -t minimega:dev -f docker/Dockerfile .
 sudo LIVE_PULL=0 tests/live/run.sh minimega:dev
 
+# check the QEMU version that the image runs
+sudo LIVE_PULL=0 LIVE_QEMU_VERSION=11.1.3 tests/live/run.sh minimega:dev
+
 # run a subset and keep the experiment up to poke at it
 sudo LIVE_KEEP=1 LIVE_TEST_ARGS='-test.run TestLive/(Version|Namespace|Inventory|CCClients|DHCP|DNS)$' \
   tests/live/run.sh minimega:dev
@@ -161,7 +175,8 @@ non-empty `/tmp/minimega` (`LIVE_MM_BASE`), unless `LIVE_FORCE=1` is set, and
 always refuses a base directory that is not an absolute, normalized path at
 least two levels deep or that is a home or system directory; a finished run removes both
 unless `LIVE_KEEP=1` kept them. `LIVE_GROUP=<name>` runs
-the group in `tests/live/<name>`. Results land in
+the group in `tests/live/<name>`. `LIVE_QEMU_VERSION=<major.minor.micro>` makes
+the `QemuVersion` phase compare the QEMU version. Results land in
 `./live-artifacts`: the test log, a Markdown summary, minimega and container
 logs, diagnostics (`vm info`, routers, OVS), cc responses, screenshots, and a
 pcap.
@@ -175,12 +190,30 @@ and `live.initrd`) from the `live-test-artifacts` artifact of a CI run:
 
 ```bash
 sudo LIVE_PULL=0 LIVE_GUEST_DIR=/path/to/x86-guest \
-  LIVE_QEMU=/usr/bin/qemu-system-x86_64 LIVE_CPU=qemu64 \
+  LIVE_QEMU=qemu-system-x86_64 LIVE_CPU=qemu64 \
   tests/live/run.sh minimega:dev
 ```
 
 The image must contain `qemu-system-x86_64`. The suite passes this way, only
 slower.
+
+### QEMU from the Ubuntu packages
+
+The live workflow builds the image with the QEMU from `docker/qemu` by default.
+To test the image with the Ubuntu QEMU packages, run the workflow with
+`qemu_source=distro`:
+
+```bash
+gh workflow run live.yml --ref <branch> -f qemu_source=distro
+```
+
+With `qemu_source=distro`, the `QemuVersion` phase only logs the version. To
+compare it, also set `expected_qemu`, for example `-f expected_qemu=8.2.2`. The
+`ArmBoot` phase is skipped because this image has no Arm emulator.
+
+When a pull request changes `docker/qemu/`, the live job builds
+`docker/qemu/Dockerfile` first and uses that image. To do this on a manual run,
+set `-f build_qemu=true`.
 
 ## Changing the tests
 

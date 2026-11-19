@@ -3,6 +3,11 @@
 ARG BASE_IMAGE="ubuntu:24.04"
 ARG GO_IMAGE="golang:1.24.13"
 ARG PYTHON_IMAGE="python:3.13-slim"
+# QEMU_SOURCE="upstream" copies QEMU from QEMU_IMAGE (built by docker/qemu/Dockerfile);
+# QEMU_SOURCE="distro" installs the Ubuntu QEMU packages instead.
+ARG QEMU_IMAGE="ghcr.io/sandia-minimega/qemu-build:11.1.3-noble-1"
+ARG QEMU_SOURCE="upstream"
+ARG QEMU_VERSION="11.1.3"
 
 # -- go builder --
 FROM ${GO_IMAGE} AS gobuilder
@@ -41,26 +46,50 @@ COPY --from=gobuilder /minimega/.git ./.git
 RUN python scripts/zensical_build.py build --strict
 
 
+# -- QEMU, selected by QEMU_SOURCE --
+# Each stage has /out (copied to /) and /out-packages (Ubuntu packages to install).
+FROM ${QEMU_IMAGE} AS qemu-upstream
+
+FROM ${BASE_IMAGE} AS qemu-distro
+RUN mkdir /out && echo "qemu-system-x86 qemu-utils" > /out-packages
+
+# The base is one of the two stages above, not a registry image.
+# hadolint ignore=DL3006
+FROM qemu-${QEMU_SOURCE} AS qemu
+
+
 # -- minimega image --
 FROM ${BASE_IMAGE}
+
+ARG QEMU_SOURCE
+ARG QEMU_VERSION
 
 ENV DEBIAN_FRONTEND="noninteractive" \
     PATH="$PATH:/opt/minimega/bin"
 
+COPY --from=qemu /out-packages /tmp/qemu-packages
+
 # libxkbfile1: the Android emulator (vm launch android, with the Android SDK
 # mounted into the container) links against it.
 # cpio: vmbetter and passwordify unpack and pack initramfs images with it.
+# hadolint ignore=SC2046
 RUN apt-get update \
   && apt-get install -y \
     bash-completion dnsmasq iproute2 isc-dhcp-client \
     cpio less libpcap-dev ntfs-3g openssh-client \
-    openvswitch-switch qemu-system-x86 qemu-utils \
+    openvswitch-switch \
     iptables ffmpeg \
     libxkbfile1 \
+    $(cat /tmp/qemu-packages) \
+  && rm /tmp/qemu-packages \
   && apt-get autoremove -y \
   && apt-get clean -y \
   && rm -rf /var/lib/apt/lists/* \
   && rm -rf /var/cache/apt/archives/*
+
+COPY --from=qemu /out/ /
+COPY ./docker/check-qemu.sh /usr/local/bin/check-qemu.sh
+RUN /usr/local/bin/check-qemu.sh "$QEMU_SOURCE" "$QEMU_VERSION"
 
 # Copy all binaries, including tools such as vmbetter, rfbplay and vncdrone
 # While this includes some tools like minitest that generally aren't

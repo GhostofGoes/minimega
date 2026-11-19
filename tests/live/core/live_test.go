@@ -15,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -61,6 +62,7 @@ func TestLive(t *testing.T) {
 		p("FileList", testFileList, inv),
 		p("Disk", testDisk, inv),
 		p("Miniweb", testMiniweb, inv),
+		p("QemuVersion", testQemuVersion, inv),
 
 		// guests come up
 		p("CCClients", testCCClients, inv),
@@ -81,6 +83,8 @@ func TestLive(t *testing.T) {
 		p("GuestSMP", testGuestSMP, cc),
 		p("GuestNICDrivers", testGuestNICDrivers, cc),
 		p("GuestDualHomed", testGuestDualHomed, network),
+		p("QXL", testQXL, cc),
+		p("Clipboard", testClipboard, cc),
 
 		// networking
 		p("PingSameLAN", testPingSameLAN, network),
@@ -98,6 +102,7 @@ func TestLive(t *testing.T) {
 		p("Screenshot", testScreenshot, inv),
 		p("Serial", testSerial, inv),
 		p("QMP", testQMP, inv),
+		p("ArmBoot", testArmBoot, inv),
 		p("VNCShim", testVNCShim, inv),
 		p("VNCRecordFB", testVNCRecordFB, inv),
 		p("VNCKeyboard", testVNCKeyboard, cc),
@@ -109,8 +114,11 @@ func TestLive(t *testing.T) {
 		p("StopStart", testStopStart, cc),
 		p("NetDisconnectConnect", testNetDisconnectConnect, network),
 		p("Hotplug", testHotplug, cc),
+		p("CDROM", testCDROM, cc),
 		p("Save", testSave, cc),
 		p("KillFlushRelaunch", testKillFlushRelaunch, cc),
+		// last before teardown: it replaces host-c2 with its restored copy
+		p("SaveRestore", testSaveRestore, cc),
 
 		// tools shipped in the image
 		p("Passwordify", testPasswordify, cc),
@@ -270,6 +278,10 @@ func testVMConfig(t *testing.T) {
 	check("host-c2", "disks", "writeback")
 	check("host-c5", "usb-use-xhci", "true")
 	check("host-d5", "uuid", d5UUID)
+	check(clipboardVM, "bidirectional-copy-paste", "true")
+	if got := vms["host-d3"]["bidirectional-copy-paste"]; got != "false" {
+		t.Errorf("host-d3 bidirectional-copy-paste = %q, want false (cleared after %v)", got, clipboardVM)
+	}
 	for i := 1; i <= 5; i++ {
 		check("host-b"+itoa(i), "mac", "00:1f:53:00:02:1"+itoa(i))
 	}
@@ -431,6 +443,47 @@ func testMiniweb(t *testing.T) {
 		if !bytes.Contains(body, []byte(`"`+s.Name+`"`)) {
 			t.Errorf("/vms/info.json missing %v", s.Name)
 		}
+	}
+}
+
+func testQemuVersion(t *testing.T) {
+	// the kvm wrapper adds -enable-kvm, which -version does not need
+	out, err := harness.InContainer(t, "kvm", "-version")
+	if err != nil {
+		t.Fatalf("kvm -version: %v: %s", err, out)
+	}
+	binary := harness.QemuVersion(strings.SplitN(out, "\n", 2)[0])
+	if binary == "" {
+		t.Fatalf("kvm -version printed no version: %q", out)
+	}
+
+	// the QEMU process of a running VM
+	var qv struct {
+		Return struct {
+			QEMU struct {
+				Major, Minor, Micro int
+			} `json:"qemu"`
+			Package string `json:"package"`
+		} `json:"return"`
+	}
+	raw := harness.MustText(t, `vm qmp host-c3 '{ "execute": "query-version" }'`)
+	if err := json.Unmarshal([]byte(raw), &qv); err != nil {
+		t.Fatalf("query-version %q: %v", raw, err)
+	}
+	v := qv.Return.QEMU
+	running := fmt.Sprintf("%d.%d.%d", v.Major, v.Minor, v.Micro)
+	t.Logf("kvm -version: %v; host-c3 runs QEMU %v %v", binary, running, qv.Return.Package)
+
+	want := harness.QemuVersion(harness.ExpectedQemuVersion)
+	if want == "" {
+		t.Logf("LIVE_QEMU_VERSION is not set (%q): versions not compared", harness.ExpectedQemuVersion)
+		return
+	}
+	if binary != want {
+		t.Errorf("kvm -version = %v, want %v (LIVE_QEMU_VERSION)", binary, want)
+	}
+	if running != want {
+		t.Errorf("host-c3 query-version = %v, want %v (LIVE_QEMU_VERSION)", running, want)
 	}
 }
 
@@ -744,6 +797,65 @@ func testGuestDualHomed(t *testing.T) {
 	harness.CCOK(t, "host-d5", "ping -c 2 -W 2 10.10.3.13 && ping -c 2 -W 2 10.10.4.12")
 }
 
+// pciIDs lists a guest's PCI devices as "vendor:device" ("0x1b36:0x0100").
+func pciIDs(t *testing.T, vm string) []string {
+	t.Helper()
+	out := harness.CCOK(t, vm, `for d in /sys/bus/pci/devices/*; do echo "$(cat $d/vendor):$(cat $d/device)"; done`)
+	return strings.Fields(out)
+}
+
+func testQXL(t *testing.T) {
+	const qxl, stdVGA = "0x1b36:0x0100", "0x1234:0x1111"
+	if ids := pciIDs(t, qxlVM); !slices.Contains(ids, qxl) {
+		t.Errorf("%v has no QXL device %v (qemu-append -vga qxl): %v", qxlVM, qxl, ids)
+	} else if slices.Contains(ids, stdVGA) {
+		t.Errorf("%v has both QXL and the std VGA %v: %v", qxlVM, stdVGA, ids)
+	}
+	// control: a host without qemu-append keeps the std VGA
+	if ids := pciIDs(t, "host-c3"); slices.Contains(ids, qxl) || !slices.Contains(ids, stdVGA) {
+		t.Errorf("host-c3 PCI devices = %v, want %v and no %v", ids, stdVGA, qxl)
+	}
+
+	// the same check as the Screenshot phase: a console with text
+	host, path := harness.Artifact(t, qxlVM+"-qxl.png")
+	harness.MustRun(t, "vm screenshot "+qxlVM+" file "+path+" 800")
+	b, err := os.ReadFile(host)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n, err := harness.DistinctColors(b); err != nil || n < 2 {
+		t.Errorf("QXL screenshot has %d colors, want a console with text: %v", n, err)
+	}
+	harness.Keep(t, host)
+}
+
+func testClipboard(t *testing.T) {
+	var chardevs struct {
+		Return []struct {
+			Label string `json:"label"`
+		} `json:"return"`
+	}
+	raw := harness.MustText(t, `vm qmp `+clipboardVM+` '{ "execute": "query-chardev" }'`)
+	if err := json.Unmarshal([]byte(raw), &chardevs); err != nil {
+		t.Fatalf("query-chardev %q: %v", raw, err)
+	}
+	var labels []string
+	for _, c := range chardevs.Return {
+		labels = append(labels, c.Label)
+	}
+	if !slices.Contains(labels, "vdagent") {
+		t.Errorf("%v chardevs = %v, want vdagent (bidirectional-copy-paste)", clipboardVM, labels)
+	}
+
+	names := strings.Fields(harness.CCOK(t, clipboardVM, "cat /sys/class/virtio-ports/*/name"))
+	if !slices.Contains(names, "com.redhat.spice.0") {
+		t.Errorf("%v virtio ports = %v, want com.redhat.spice.0", clipboardVM, names)
+	}
+	if !slices.Contains(names, "cc") {
+		t.Errorf("%v virtio ports = %v, want the miniccc port cc as well", clipboardVM, names)
+	}
+}
+
 // --- networking --------------------------------------------------------------
 
 func ipOf(t *testing.T, vm string) string {
@@ -958,6 +1070,68 @@ func testQMP(t *testing.T) {
 	}
 }
 
+// armVM is the bare-metal Arm VM that ArmBoot launches and removes.
+const armVM = "arm-boot"
+
+func testArmBoot(t *testing.T) {
+	if out, err := harness.InContainer(t, "sh", "-c", "command -v qemu-system-aarch64"); err != nil {
+		t.Skipf("the image has no qemu-system-aarch64 (QEMU_SOURCE=distro): %v %s", err, out)
+	}
+	host, path := harness.Artifact(t, armVM+".bin")
+	if err := os.WriteFile(host, harness.ArmBootImage(), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// not part of the topology: remove it again, whatever the result
+	t.Cleanup(func() {
+		harness.Run("clear vm config")
+		if _, ok := harness.VMInfo(t)[armVM]; !ok {
+			return
+		}
+		harness.Run("vm kill " + armVM)
+		harness.Eventually(t, 30*time.Second, 2*time.Second, func() error {
+			if s := harness.VMInfo(t)[armVM]["state"]; s != "QUIT" && s != "ERROR" {
+				return fmt.Errorf("%v state = %v", armVM, s)
+			}
+			return nil
+		})
+		harness.MustRun(t, "vm flush")
+		if _, ok := harness.VMInfo(t)[armVM]; ok {
+			t.Errorf("%v still present after flush", armVM)
+		}
+	})
+
+	// machine and cpu are checked against the QEMU binary, so set it first
+	for _, cmd := range []string{
+		"clear vm config",
+		"vm config qemu qemu-system-aarch64",
+		"vm config machine virt",
+		"vm config cpu cortex-a57",
+		"vm config memory 128",
+		"vm config vcpus 1",
+		"vm config baremetal true",
+		"vm config backchannel false",
+		"vm config serial-ports 1",
+		"vm config kernel " + path,
+		"vm launch kvm " + armVM,
+		"vm launch",
+		"vm start " + armVM,
+	} {
+		harness.MustRun(t, cmd)
+	}
+
+	harness.Eventually(t, time.Minute, 2*time.Second, func() error {
+		out, err := harness.Text("vm serial " + armVM + " 0 2000 4096")
+		if err != nil {
+			return err
+		}
+		if !strings.Contains(out, harness.ArmBootMessage) {
+			return fmt.Errorf("serial output: %q (state %v)", out, harness.VMInfo(t)[armVM]["state"])
+		}
+		return nil
+	})
+}
+
 func testTags(t *testing.T) {
 	harness.MustRun(t, "vm tag host-b5 stage tested")
 	rows := harness.MustTable(t, "vm tag host-b5 stage")
@@ -1022,6 +1196,35 @@ func testHotplug(t *testing.T) {
 
 	harness.MustRun(t, "vm hotplug remove host-c3 all")
 	harness.CCEventually(t, "host-c3", "! grep -l 65536 /sys/block/sd*/size 2>/dev/null", time.Minute)
+}
+
+func testCDROM(t *testing.T) {
+	const vm = "host-b2"
+	marker := fmt.Sprintf("LIVE-CDROM-%d", time.Now().UnixNano())
+	host, path := harness.Artifact(t, "cdrom.iso")
+	// 2 MiB is 1024 CD sectors of 2048 bytes, which the guest reports as 4096
+	// sectors of 512 bytes
+	img := make([]byte, 2<<20)
+	copy(img, marker)
+	if err := os.WriteFile(host, img, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// minimega attaches the drive as ide0-cd0, the first IDE device: sr0
+	harness.MustRun(t, "vm cdrom change "+vm+" "+path)
+	if got := harness.VMInfo(t)[vm]["cdrom"]; got != path {
+		t.Errorf("cdrom after change = %q, want %q", got, path)
+	}
+	// Linux checks for a new medium when the device opens, so read it first
+	harness.CCEventually(t, vm, "dd if=/dev/sr0 bs=2048 count=1 2>/dev/null | grep -q "+marker+
+		` && test "$(cat /sys/block/sr0/size)" = 4096`, time.Minute)
+
+	harness.MustRun(t, "vm cdrom eject "+vm)
+	if got := harness.VMInfo(t)[vm]["cdrom"]; got != "" {
+		t.Errorf("cdrom after eject = %q, want empty", got)
+	}
+	// Linux keeps the last size of sr0 after an eject, so check the read
+	harness.CCEventually(t, vm, "dd if=/dev/sr0 of=/dev/null bs=2048 count=1 2>&1 | grep -q 'No medium found'", time.Minute)
 }
 
 func testSave(t *testing.T) {
@@ -1096,6 +1299,92 @@ func testKillFlushRelaunch(t *testing.T) {
 	}
 	if r["uuid"] == harness.VMInfo(t)["host-a4"]["uuid"] {
 		t.Errorf("clone kept the source UUID")
+	}
+}
+
+// guestUptime returns a guest's /proc/uptime in seconds.
+func guestUptime(t *testing.T, vm string) float64 {
+	t.Helper()
+	out := harness.CCOK(t, vm, "cat /proc/uptime")
+	f := strings.Fields(out)
+	if len(f) == 0 {
+		t.Fatalf("%v /proc/uptime: %q", vm, out)
+	}
+	up, err := strconv.ParseFloat(f[0], 64)
+	if err != nil {
+		t.Fatalf("%v /proc/uptime: %q: %v", vm, out, err)
+	}
+	return up
+}
+
+func testSaveRestore(t *testing.T) {
+	// host-c2 has an IDE disk, miniccc, and a static MAC; the Save phase
+	// already showed that it saves
+	const vm, name = "host-c2", "live/restore-c2"
+	state := harness.MMFiles + "/" + name + ".state"
+	disk := harness.MMFiles + "/" + name + ".hdd"
+	before := harness.VMInfo(t)[vm]
+
+	// clone needs a launched VM, so take the configuration now
+	harness.MustRun(t, "vm config clone "+vm)
+	defer harness.Run("clear vm config")
+	saved := guestUptime(t, vm)
+
+	harness.MustRun(t, "vm save "+vm+" "+name)
+	harness.Eventually(t, 3*time.Minute, 3*time.Second, func() error {
+		for _, r := range harness.MustTable(t, "vm save") {
+			if r["name"] == vm {
+				if r["status"] != "completed" {
+					return fmt.Errorf("save status: %v", r)
+				}
+				return nil
+			}
+		}
+		return fmt.Errorf("vm save does not list %v", vm)
+	})
+	for _, f := range []string{state, disk} {
+		if fi, err := os.Stat(f); err != nil || fi.Size() == 0 {
+			t.Fatalf("saved file %v: %v", f, err)
+		}
+	}
+
+	harness.MustRun(t, "vm kill "+vm)
+	harness.Eventually(t, 30*time.Second, 2*time.Second, func() error {
+		if s := harness.VMInfo(t)[vm]["state"]; s != "QUIT" {
+			return fmt.Errorf("state = %v", s)
+		}
+		return nil
+	})
+	harness.MustRun(t, "vm flush")
+
+	// the same VM again: clone keeps the MAC and clears the UUID
+	for _, cmd := range []string{
+		"vm config uuid " + before["uuid"],
+		"vm config state " + state,
+		"vm config disks " + disk + ",ide,writeback",
+		"vm launch kvm " + vm,
+		"vm launch",
+		"vm start " + vm,
+	} {
+		harness.MustRun(t, cmd)
+	}
+
+	harness.Eventually(t, 3*time.Minute, 5*time.Second, func() error {
+		r := harness.VMInfo(t)[vm]
+		if r["state"] != "RUNNING" || r["cc_active"] != "true" {
+			return fmt.Errorf("%v state=%v cc=%v", vm, r["state"], r["cc_active"])
+		}
+		return nil
+	})
+	after := harness.VMInfo(t)[vm]
+	if after["uuid"] != before["uuid"] || after["mac"] != before["mac"] {
+		t.Errorf("restored %v uuid/mac = %v/%v, want %v/%v", vm, after["uuid"], after["mac"], before["uuid"], before["mac"])
+	}
+	// a restore continues the guest clock; a reboot starts it again near 0
+	if up := guestUptime(t, vm); up <= saved {
+		t.Errorf("%v uptime %.1fs after restore, %.1fs before save: the guest rebooted", vm, up, saved)
+	} else {
+		t.Logf("%v uptime %.1fs before save, %.1fs after restore", vm, saved, up)
 	}
 }
 

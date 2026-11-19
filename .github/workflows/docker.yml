@@ -61,11 +61,25 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      # A fork uses the qemu-build image from its own registry.
+      - name: Select QEMU image
+        id: qemu
+        env:
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          version="$(sed -n 's/^ARG QEMU_VERSION="\([^"]*\)"$/\1/p' docker/qemu/Dockerfile)"
+          revision="$(sed -n 's/^ARG QEMU_BUILD_REVISION="\([^"]*\)"$/\1/p' docker/qemu/Dockerfile)"
+          if [ -z "${version}" ] || [ -z "${revision}" ]; then
+            echo "::error::cannot read ARG QEMU_VERSION and ARG QEMU_BUILD_REVISION from docker/qemu/Dockerfile"
+            exit 1
+          fi
+          echo "image=ghcr.io/${OWNER,,}/qemu-build:${version}-noble-${revision}" >> "$GITHUB_OUTPUT"
       - name: Build container image
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: .
           file: docker/Dockerfile
+          build-args: QEMU_IMAGE=${{ steps.qemu.outputs.image }}
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}

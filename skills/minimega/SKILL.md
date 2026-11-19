@@ -47,6 +47,8 @@ docker exec minimega mm vm info
 
 Omit `-it` for non-interactive automation. The normal container deployment is
 privileged and mounts host devices; follow `docker/README.md`.
+The image ships QEMU 11.1.3 from `docker/qemu`; `QEMU_SOURCE=distro` builds it
+with the Ubuntu QEMU packages instead.
 
 ## Configuration and CLI help
 

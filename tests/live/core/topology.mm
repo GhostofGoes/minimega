@@ -7,8 +7,8 @@
 #
 #   lan-a 10.10.1.0/24  host-a1..a5  dynamic DHCP from rtr-ab
 #   lan-b 10.10.2.0/24  host-b1..b5  static DHCP (by MAC) from rtr-ab; OSPF transit
-#   lan-c 10.10.3.0/24  host-c1..c5  static DHCP from rtr-cd; disks, machine types
-#   lan-d 10.10.4.0/24  host-d1..d5  static DHCP from rtr-cd; firewall, no-cc host
+#   lan-c 10.10.3.0/24  host-c1..c5  static DHCP from rtr-cd; disks, machine types, QXL
+#   lan-d 10.10.4.0/24  host-d1..d5  static DHCP from rtr-cd; firewall, no-cc host, clipboard
 #
 #   rtr-ab  lan-a .1, lan-b .1   (OSPF area 0, router id 1.1.1.1)
 #   rtr-cd  lan-b .2, lan-c .1, lan-d .1   (OSPF area 0, router id 2.2.2.2)
@@ -121,12 +121,13 @@ vm config restore live-base
 vm config tags role server
 vm config tags lan c
 
-# host-c1: virtio data disk plus raw QEMU arguments (an SMBIOS serial the
-# guest can read back).
+# host-c1: virtio data disk plus raw QEMU arguments: an SMBIOS serial the
+# guest can read back, and a QXL adapter in the form phenix sends ("-vga qxl"
+# after minimega's own "-vga std"). qemu-append is one list, so both go here.
 vm config append live.role=host live.hostname=host-c1
 vm config net lan-c,00:1f:53:00:03:11,virtio-net-pci
 vm config disks live/data.qcow2,virtio
-vm config qemu-append -smbios type=1,serial=LIVE-C1
+vm config qemu-append -smbios type=1,serial=LIVE-C1 -vga qxl
 vm launch kvm host-c1
 
 # host-c2: the same base disk over IDE with an explicit cache mode.
@@ -166,10 +167,14 @@ vm config append live.role=host live.hostname=host-d1
 vm config net lan-d,00:1f:53:00:04:11,virtio-net-pci
 vm launch kvm host-d1
 
+# host-d2: bidirectional copy and paste (a qemu-vdagent chardev on a
+# virtio-serial port).
+vm config bidirectional-copy-paste true
 vm config append live.role=host live.hostname=host-d2
 vm config net lan-d,00:1f:53:00:04:12,virtio-net-pci
 vm launch kvm host-d2
 
+vm config bidirectional-copy-paste false
 vm config append live.role=host live.hostname=host-d3
 vm config net lan-d,00:1f:53:00:04:13,virtio-net-pci
 vm launch kvm host-d3
