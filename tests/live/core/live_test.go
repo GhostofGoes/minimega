@@ -1144,6 +1144,33 @@ func guestUptime(t *testing.T, vm string) float64 {
 	return up
 }
 
+// waitSaved waits until QEMU reports that the migration of "vm save" is
+// complete. It asks QMP: the status list of "vm save" can stop the daemon when
+// a VM is in a transient migration status.
+func waitSaved(t *testing.T, vm string) {
+	t.Helper()
+	harness.Eventually(t, 3*time.Minute, 3*time.Second, func() error {
+		out, err := harness.Text("vm qmp " + vm + ` '{ "execute": "query-migrate" }'`)
+		if err != nil {
+			return err
+		}
+		var r struct {
+			Return struct {
+				Status string `json:"status"`
+			} `json:"return"`
+		}
+		if i := strings.Index(out, "{"); i < 0 {
+			return fmt.Errorf("query-migrate: %q", out)
+		} else if err := json.Unmarshal([]byte(out[i:]), &r); err != nil {
+			return fmt.Errorf("query-migrate: %q: %v", out, err)
+		}
+		if r.Return.Status != "completed" {
+			return fmt.Errorf("migration status %q", r.Return.Status)
+		}
+		return nil
+	})
+}
+
 func testSaveRestore(t *testing.T) {
 	// host-c2 has an IDE disk, miniccc, and a static MAC; the Save phase
 	// already showed that it saves
@@ -1160,17 +1187,7 @@ func testSaveRestore(t *testing.T) {
 	saved := guestUptime(t, vm)
 
 	harness.MustRun(t, "vm save "+vm+" "+name)
-	harness.Eventually(t, 3*time.Minute, 3*time.Second, func() error {
-		for _, r := range harness.MustTable(t, "vm save") {
-			if r["name"] == vm {
-				if r["status"] != "completed" {
-					return fmt.Errorf("save status: %v", r)
-				}
-				return nil
-			}
-		}
-		return fmt.Errorf("vm save does not list %v", vm)
-	})
+	waitSaved(t, vm)
 	for _, f := range []string{state, disk} {
 		if fi, err := os.Stat(f); err != nil || fi.Size() == 0 {
 			t.Fatalf("saved file %v: %v", f, err)
