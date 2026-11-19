@@ -168,15 +168,9 @@ func diskSnapshot(src, dst string) error {
 		return fmt.Errorf("[image %s] error getting info: %v", src, err)
 	}
 
-	backing := src
-
-	if !*f_absSnapshot {
-		var err error
-
-		backing, err = filepath.Rel(filepath.Dir(dst), src)
-		if err != nil {
-			return fmt.Errorf("[image %s] error getting src backing image relative to dst: %v", src, err)
-		}
+	backing, err := backingName(dst, src, *f_absSnapshot)
+	if err != nil {
+		return fmt.Errorf("[image %s] error getting src backing image relative to dst: %v", src, err)
 	}
 
 	out, err := processWrapper("qemu-img", "create", "-f", "qcow2", "-b", backing, "-F", info.Format, dst)
@@ -204,15 +198,9 @@ func diskRebase(image, backing string, unsafe bool) error {
 			log.Warn("minimega expects backing images to be in the files directory")
 		}
 
-		parent := backing
-
-		if !*f_absSnapshot {
-			var err error
-
-			parent, err = filepath.Rel(filepath.Dir(image), backing)
-			if err != nil {
-				return fmt.Errorf("[image %s] error getting parent backing relative to dst: %v", backing, err)
-			}
+		parent, err := backingName(image, backing, *f_absSnapshot)
+		if err != nil {
+			return fmt.Errorf("[image %s] error getting parent backing relative to dst: %v", backing, err)
 		}
 
 		backingInfo, err := diskInfo(backing)
@@ -234,6 +222,74 @@ func diskRebase(image, backing string, unsafe bool) error {
 	out, err := processWrapper(args...)
 	if err != nil {
 		return fmt.Errorf("[image %s] %v: %v", image, out, err)
+	}
+
+	return nil
+}
+
+// backingName returns the backing file name to write in image for the backing
+// file backing. The name is relative to the directory of image unless abs is
+// true.
+func backingName(image, backing string, abs bool) (string, error) {
+	if abs {
+		return backing, nil
+	}
+
+	return filepath.Rel(filepath.Dir(image), backing)
+}
+
+// savedDiskBacking returns the clean path of the backing file of the saved
+// disk image, and whether the stored backing name is different from the name
+// that diskRebase writes. For a drive-backup target, QEMU writes the backing
+// name that the VM overlay resolves to, such as "<base>/<id>/../files/x.qcow2".
+// That name does not open after "vm flush" removes the instance directory.
+func savedDiskBacking(image, stored string, abs bool) (string, bool, error) {
+	// as in QEMU, a ":" before the first "/" makes the name a protocol or
+	// "json:" name and not a path, so leave it as it is
+	if i := strings.IndexAny(stored, ":/"); stored == "" || (i >= 0 && stored[i] == ':') {
+		return "", false, nil
+	}
+
+	backing := stored
+	if !filepath.IsAbs(backing) {
+		backing = filepath.Join(filepath.Dir(image), backing)
+	}
+	backing = filepath.Clean(backing)
+
+	name, err := backingName(image, backing, abs)
+	if err != nil {
+		return "", false, err
+	}
+
+	return backing, name != stored, nil
+}
+
+// fixSavedDiskBacking rebases the saved disk image, without a data copy, so
+// that its backing file name does not use the VM instance directory.
+func fixSavedDiskBacking(image string) error {
+	abs, err := filepath.Abs(image)
+	if err != nil {
+		return fmt.Errorf("saved disk %v: %w", image, err)
+	}
+	image = abs
+
+	info, err := diskInfo(image)
+	if err != nil {
+		return fmt.Errorf("saved disk %v: %w", image, err)
+	}
+
+	backing, rebase, err := savedDiskBacking(image, info.BackingFile, *f_absSnapshot)
+	if err != nil {
+		return fmt.Errorf("saved disk %v: %w", image, err)
+	}
+	if !rebase {
+		return nil
+	}
+
+	log.Debug("rebasing saved disk %v on %v", image, backing)
+
+	if err := diskRebase(image, backing, true); err != nil {
+		return fmt.Errorf("saved disk %v: %w", image, err)
 	}
 
 	return nil
