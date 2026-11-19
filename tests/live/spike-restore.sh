@@ -12,8 +12,11 @@
 #
 # Phases:
 #   SAVE-OLD                boot a guest on the old image, write a marker, vm save
-#   RESTORE-NEW-UNPINNED    restore that state on the new image, default machine
+#   SAVE-OLD-PC             the same in parallel, with vm config machine pc
+#   RESTORE-NEW-UNPINNED    restore the SAVE-OLD state on the new image, default machine
 #   RESTORE-NEW-PINNED      the same, with vm config machine pc-i440fx-6.2
+#   RESTORE-NEW-REWRITTEN   the same, from a copy whose header names pc-i440fx-6.2
+#   RESTORE-NEW-PC-PINNED   restore the SAVE-OLD-PC state, machine pc-i440fx-6.2
 #   CONTROL-NEW             save and restore on the new image only
 #
 # Requirements: Linux, root, Docker, /dev/kvm, and the openvswitch kernel module
@@ -47,11 +50,18 @@ STAGE="${MM_FILES}/spike"
 WRAP="${STAGE}/qemu-wrap"
 QEMU_LOG="${STAGE}/qemu-stderr.log"
 STATE_OLD="${MM_FILES}/spike-old.state"
+STATE_OLD_PC="${MM_FILES}/spike-old-pc.state"
+STATE_RW="${MM_FILES}/spike-old-rewritten.state"
 STATE_CTL="${MM_FILES}/spike-ctl.state"
 PINNED_MACHINE=pc-i440fx-6.2
+OLD_PC_MACHINE=pc
 
-VM=spike
-UUID=5b1d0000-0000-4000-8000-00000000a5e1
+VM_MAIN=spike
+UUID_MAIN=5b1d0000-0000-4000-8000-00000000a5e1
+VM_PC=spikepc
+UUID_PC=5b1d0000-0000-4000-8000-00000000a5e2
+VM="${VM_MAIN}"
+UUID="${UUID_MAIN}"
 MEMORY=512
 MIN_UPTIME="${SPIKE_MIN_UPTIME:-120}"
 
@@ -61,10 +71,15 @@ QMP_STATUS='{ "execute": "query-status" }'
 QEMU_OLD=unknown
 QEMU_NEW=unknown
 MACHINE_OLD=unknown
+MACHINE_OLD_PC=unknown
 RES_UNPINNED=fail
 DET_UNPINNED="not run"
 RES_PINNED=fail
 DET_PINNED="not run"
+RES_RW=fail
+DET_RW="not run"
+RES_PC=fail
+DET_PC="not run"
 RES_CONTROL=fail
 DET_CONTROL="not run"
 RESULTS_PRINTED=0
@@ -83,14 +98,24 @@ UPTIME=""
 SAVED_UPTIME=""
 OLD_MARKER=""
 OLD_UPTIME=""
+OLD_HEADER=unknown
+PC_LAUNCHED=0
+PC_LAUNCH_ERR=""
+PC_MARKER=""
+PC_UPTIME=""
+PC_HEADER=unknown
 MACHINE=""
+HEADER=""
 
 log() { echo "==> [$(date +%H:%M:%S)] $*"; }
 phase() { echo; echo "==================== $* ===================="; }
 die() { echo "ERROR: $*" >&2; exit 1; }
 
-# oneline joins text into one grep-friendly line without double quotes.
-oneline() { printf '%s' "$1" | tr '\n\r\t"' "   '" | tr -s ' ' | sed 's/^ //; s/ $//' | cut -c1-400; }
+# oneline TEXT [LIMIT] joins text into one grep-friendly line without double quotes.
+oneline() { printf '%s' "$1" | tr '\n\r\t"' "   '" | tr -s ' ' | sed 's/^ //; s/ $//' | cut -c "1-${2:-400}"; }
+
+# use_vm NAMESPACE NAME UUID selects the namespace and VM that later commands use.
+use_vm() { NS=$1; VM=$2; UUID=$3; }
 
 # --- minimega commands ------------------------------------------------------
 
@@ -357,10 +382,10 @@ guest_uptime() {
 
 gt() { awk -v a="$1" -v b="$2" 'BEGIN { exit !(a > b) }'; }
 
-# boot_fresh launches and starts a VM from the kernel and initrd and waits for miniccc.
-boot_fresh() {
+# launch_fresh MACHINE launches and starts a VM from the kernel and initrd.
+launch_fresh() {
     local out
-    configure_vm "" "" || return 1
+    configure_vm "$1" "" || return 1
     if ! out="$(ns_run "vm launch kvm ${VM}")"; then
         DETAIL="vm launch failed: $(oneline "${out}")"
         return 1
@@ -369,16 +394,77 @@ boot_fresh() {
         DETAIL="vm start failed: $(oneline "${out}")"
         return 1
     fi
+}
+
+wait_boot() {
     if ! wait_cc 180; then
         DETAIL="miniccc did not connect within 180s (vm state $(vm_state))"
         return 1
     fi
-    log "miniccc connected after ${WAITED}s"
+    log "miniccc of ${VM} connected (waited ${WAITED}s)"
+}
+
+boot_fresh() { launch_fresh "" && wait_boot; }
+
+# state_machine FILE prints the machine name in the configuration section that
+# follows the QEVM magic and version 3: 0x07, a big-endian 32-bit length, the name.
+state_machine() {
+    local f=$1 hex len name
+    hex="$(head -c 13 "${f}" | od -An -v -tx1 | tr -d ' \n')"
+    [[ "${hex:0:18}" == 5145564d0000000307 ]] || return 1
+    len=$(( 16#${hex:18:8} ))
+    (( len > 0 && len < 256 )) || return 1
+    name="$(dd if="${f}" bs=1 skip=13 count="${len}" 2>/dev/null)"
+    [[ "${#name}" -eq "${len}" && "${name}" =~ ^[A-Za-z0-9._-]+$ ]] || return 1
+    printf '%s' "${name}"
+}
+
+be32() {
+    local n=$1 s
+    for s in 24 16 8 0; do
+        printf '%b' "\\0$(printf '%03o' $(( (n >> s) & 255 )))"
+    done
+}
+
+# rewrite_state SRC DST MACHINE writes a copy of SRC whose header names MACHINE.
+# The bytes after the old name are streamed unchanged.
+rewrite_state() {
+    local src=$1 dst=$2 new=$3 old want got
+    if ! old="$(state_machine "${src}")"; then
+        DETAIL="no QEVM configuration header in ${src}"
+        return 1
+    fi
+    log "rewriting the header of ${src}: ${old} -> ${new}"
+    if ! { head -c 9 "${src}" && be32 "${#new}" && printf '%s' "${new}" \
+        && tail -c +$(( 14 + ${#old} )) "${src}"; } > "${dst}"; then
+        DETAIL="could not write ${dst}"
+        return 1
+    fi
+    echo "  original header:"
+    od -A d -v -t x1z -N 48 "${src}" | sed 's/^/    /'
+    echo "  rewritten header:"
+    od -A d -v -t x1z -N 48 "${dst}" | sed 's/^/    /'
+    want=$(( $(stat -c %s "${src}") - ${#old} + ${#new} ))
+    got="$(stat -c %s "${dst}")"
+    if (( got != want )); then
+        DETAIL="rewritten file has ${got} bytes, expected ${want}"
+        return 1
+    fi
+    if [[ "$(state_machine "${dst}" || true)" != "${new}" ]]; then
+        DETAIL="rewritten header does not parse as ${new}"
+        return 1
+    fi
+    if ! cmp -s <(tail -c +$(( 14 + ${#old} )) "${src}") <(tail -c +$(( 14 + ${#new} )) "${dst}"); then
+        DETAIL="the stream after the header differs from the original"
+        return 1
+    fi
+    log "rewritten ${dst}: ${got} bytes, header ${new}, rest of the stream identical"
 }
 
 # save_guest NAME writes a marker, records uptime and machine type, and runs vm save NAME.
 save_guest() {
-    local name=$1 file="${MM_FILES}/$1.state" start status seen="" size=0 header
+    local name=$1 file="${MM_FILES}/$1.state" start status seen="" size=0
+    HEADER=unknown
     MARKER="spike-$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')"
     if ! cc_exec "echo ${MARKER} > /tmp/spike-marker && cat /tmp/spike-marker" 60 \
         || [[ "${CC_EXIT}" != "0" || "$(oneline "${CC_STDOUT}")" != "${MARKER}" ]]; then
@@ -438,8 +524,9 @@ save_guest() {
         DETAIL="vm save completed but ${file} is missing or empty"
         return 1
     fi
-    header="$(head -c 65536 "${file}" | grep -aoE 'pc-(i440fx|q35)-[0-9]+\.[0-9]+' | head -n 1 || true)"
-    log "state file ${file}: ${size} bytes, machine in stream header: ${header:-not found}"
+    HEADER="$(state_machine "${file}" || echo unparsed)"
+    log "state file ${file}: ${size} bytes, machine in stream header: ${HEADER}"
+    od -A d -v -t x1z -N 48 "${file}" | sed 's/^/    /' || true
     ls -l "${MM_FILES}"
 }
 
@@ -531,28 +618,32 @@ kill_flush() {
     ns_run "vm flush" >/dev/null 2>&1 || true
 }
 
-# qemu_error prints the first QEMU stderr lines, else the VM error tag.
+# qemu_error prints the last QEMU stderr lines with the "load of migration
+# failed" line at the end, else the VM error tag.
 qemu_error() {
-    local lines tags
-    lines="$(grep -v '^=== ' "${QEMU_LOG}" 2>/dev/null | sed '/^[[:space:]]*$/d' | head -n 5 || true)"
+    local lines load other tags
+    lines="$(grep -v '^=== ' "${QEMU_LOG}" 2>/dev/null | sed '/^[[:space:]]*$/d' || true)"
     if [[ -n "${lines}" ]]; then
-        oneline "qemu stderr: ${lines}"
+        load="$(grep -m 1 'load of migration failed' <<<"${lines}" || true)"
+        other="$(grep -v 'load of migration failed' <<<"${lines}" | tail -n 4 || true)"
+        oneline "qemu stderr: ${other}${other:+ }${load}" 1000
         return
     fi
     tags="$(MM_QUIET=1 mmv ".columns tags .filter name=${VM} vm info" 2>/dev/null || true)"
-    if [[ -n "${tags}" ]]; then oneline "vm tags: ${tags}"; fi
+    if [[ -n "${tags}" ]]; then oneline "vm tags: ${tags}" 1000; fi
 }
 
-# collect_evidence LABEL saves vm info, QEMU stderr, and minimega log lines.
+# collect_evidence LABEL [CONTAINER LABEL] saves vm info, QEMU stderr, and
+# minimega log lines.
 collect_evidence() {
-    local label=$1 f="${ART}/evidence-$1.txt"
+    local label=$1 f="${ART}/evidence-$1.txt" log_label=${2:-$1}
     {
         echo "## vm info (${NS})"
         MM_QUIET=1 ns_run ".columns name,state,tags vm info" || true
         echo "## QEMU stderr and command lines (${QEMU_LOG})"
         cat "${QEMU_LOG}" 2>/dev/null || true
         echo "## minimega log: errors, qemu, migration"
-        grep -iE 'error|qemu|migrat|incoming|state' "${ART}/logs/minimega-${label}.log" 2>/dev/null | tail -n 80 || true
+        grep -iE 'error|qemu|migrat|incoming|state' "${ART}/logs/minimega-${log_label}.log" 2>/dev/null | tail -n 80 || true
     } > "${f}" 2>&1
     sed 's/^/    | /' "${f}"
     cp "${QEMU_LOG}" "${ART}/logs/qemu-stderr-${label}.log" 2>/dev/null || true
@@ -560,28 +651,53 @@ collect_evidence() {
 
 # --- phases -------------------------------------------------------------------
 
+# run_save_old boots both old VMs at once, so that the SAVE-OLD-PC guest has
+# its uptime already when SAVE-OLD is done, and then saves the default one.
 run_save_old() {
-    NS=saveold
     : > "${QEMU_LOG}"
     if ! start_mm "${OLD_IMAGE}" save-old; then
         DETAIL="minimega did not start from ${OLD_IMAGE}"
         return 1
     fi
-    boot_fresh || return 1
+    use_vm saveold "${VM_MAIN}" "${UUID_MAIN}"
+    launch_fresh "" || return 1
+    use_vm saveoldpc "${VM_PC}" "${UUID_PC}"
+    if launch_fresh "${OLD_PC_MACHINE}"; then
+        PC_LAUNCHED=1
+    else
+        PC_LAUNCH_ERR="${DETAIL}"
+    fi
+    use_vm saveold "${VM_MAIN}" "${UUID_MAIN}"
+    wait_boot || return 1
     save_guest spike-old || return 1
     MACHINE_OLD="${MACHINE:-unknown}"
-    DETAIL="saved ${STATE_OLD}, marker ${MARKER}, uptime ${SAVED_UPTIME}s"
+    OLD_HEADER="${HEADER}"
+    DETAIL="saved ${STATE_OLD}, header ${HEADER}, marker ${MARKER}, uptime ${SAVED_UPTIME}s"
 }
 
-# run_restore LABEL NAMESPACE MACHINE restores STATE_OLD on the new image.
+# run_save_old_pc saves the second old VM, in the SAVE-OLD container.
+run_save_old_pc() {
+    use_vm saveoldpc "${VM_PC}" "${UUID_PC}"
+    if [[ "${PC_LAUNCHED}" != "1" ]]; then
+        DETAIL="VM not launched: ${PC_LAUNCH_ERR:-SAVE-OLD stopped before the launch}"
+        return 1
+    fi
+    wait_boot || return 1
+    save_guest spike-old-pc || return 1
+    MACHINE_OLD_PC="${MACHINE:-unknown}"
+    PC_HEADER="${HEADER}"
+    DETAIL="saved ${STATE_OLD_PC}, header ${HEADER}, marker ${MARKER}, uptime ${SAVED_UPTIME}s"
+}
+
+# run_restore LABEL MACHINE STATE MARKER UPTIME restores STATE on the new image
+# for the VM that use_vm selected.
 run_restore() {
-    local label=$1 machine=$3 rc=0 err
-    NS=$2
+    local label=$1 machine=$2 state=$3 marker=$4 uptime=$5 rc=0 err
     : > "${QEMU_LOG}"
     if ! start_mm "${NEW_IMAGE}" "${label}"; then
         DETAIL="minimega did not start from ${NEW_IMAGE}"
         rc=1
-    elif ! restore_guest "${STATE_OLD}" "${machine}" "${OLD_MARKER}" "${OLD_UPTIME}"; then
+    elif ! restore_guest "${state}" "${machine}" "${marker}" "${uptime}"; then
         rc=1
         sleep 2
         err="$(qemu_error)"
@@ -595,7 +711,7 @@ run_restore() {
 
 run_control() {
     local rc=0 err ctl_marker ctl_uptime
-    NS=ctlsave
+    use_vm ctlsave "${VM_MAIN}" "${UUID_MAIN}"
     : > "${QEMU_LOG}"
     if ! start_mm "${NEW_IMAGE}" control-new; then
         DETAIL="minimega did not start from ${NEW_IMAGE}"
@@ -608,7 +724,7 @@ run_control() {
         kill_flush
         cp "${QEMU_LOG}" "${ART}/logs/qemu-stderr-control-save.log" 2>/dev/null || true
         : > "${QEMU_LOG}"
-        NS=ctlrestore
+        use_vm ctlrestore "${VM_MAIN}" "${UUID_MAIN}"
         if ! restore_guest "${STATE_CTL}" "" "${ctl_marker}" "${ctl_uptime}"; then
             rc=1
             sleep 2
@@ -632,10 +748,13 @@ print_results() {
     if [[ "${RESULTS_PRINTED}" == "1" ]]; then return; fi
     RESULTS_PRINTED=1
     block="RESULT qemu_old=${QEMU_OLD} qemu_new=${QEMU_NEW}
-RESULT machine_old=${MACHINE_OLD}
-RESULT restore_unpinned=${RES_UNPINNED} detail=\"$(oneline "${DET_UNPINNED}")\"
-RESULT restore_pinned=${RES_PINNED} detail=\"$(oneline "${DET_PINNED}")\"
-RESULT control_new=${RES_CONTROL} detail=\"$(oneline "${DET_CONTROL}")\""
+RESULT machine_old=${MACHINE_OLD} header=${OLD_HEADER}
+RESULT machine_old_pc=${MACHINE_OLD_PC} header=${PC_HEADER}
+RESULT restore_unpinned=${RES_UNPINNED} detail=\"$(oneline "${DET_UNPINNED}" 1400)\"
+RESULT restore_pinned=${RES_PINNED} detail=\"$(oneline "${DET_PINNED}" 1400)\"
+RESULT restore_rewritten=${RES_RW} detail=\"$(oneline "${DET_RW}" 1400)\"
+RESULT restore_pc_pinned=${RES_PC} detail=\"$(oneline "${DET_PC}" 1400)\"
+RESULT control_new=${RES_CONTROL} detail=\"$(oneline "${DET_CONTROL}" 1400)\""
     echo
     printf '%s\n' "${block}" | tee "${ART}/results.txt"
     if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
@@ -652,7 +771,7 @@ cleanup() {
         docker logs "${CONTAINER}" > "${ART}/logs/container-at-exit.log" 2>&1
         docker rm -f "${CONTAINER}" >/dev/null 2>&1
     fi
-    for f in "${STATE_OLD}" "${STATE_CTL}"; do
+    for f in "${STATE_OLD}" "${STATE_OLD_PC}" "${STATE_RW}" "${STATE_CTL}"; do
         if [[ -f "${f}" ]]; then head -c 1048576 "${f}" > "${ART}/$(basename "${f}").head"; fi
     done
     print_results
@@ -722,22 +841,59 @@ else
     log "SAVE-OLD FAILED: ${DETAIL}"
     DET_UNPINNED="not run: SAVE-OLD failed: ${DETAIL}"
     DET_PINNED="${DET_UNPINNED}"
+    DET_RW="${DET_UNPINNED}"
 fi
 collect_evidence save-old
+
+# SAVE-OLD-PC: the second old VM (vm config machine pc), in the same container.
+phase "SAVE-OLD-PC"
+pc_save_ok=0
+if run_save_old_pc; then
+    pc_save_ok=1
+    PC_MARKER="${MARKER}"
+    PC_UPTIME="${SAVED_UPTIME}"
+    log "SAVE-OLD-PC ok: ${DETAIL}"
+else
+    log "SAVE-OLD-PC FAILED: ${DETAIL}"
+    DET_PC="not run: SAVE-OLD-PC failed: ${DETAIL}"
+fi
+collect_evidence save-old-pc save-old
 stop_mm save-old
 
 if [[ "${save_ok}" == "1" ]]; then
     # RESTORE-NEW-UNPINNED: the same VM on QEMU 11.1.3, default machine (expected to fail).
     phase "RESTORE-NEW-UNPINNED"
-    if run_restore restore-new-unpinned unpinned ""; then RES_UNPINNED=pass; fi
-    DET_UNPINNED="${DETAIL}"
+    use_vm unpinned "${VM_MAIN}" "${UUID_MAIN}"
+    if run_restore restore-new-unpinned "" "${STATE_OLD}" "${OLD_MARKER}" "${OLD_UPTIME}"; then RES_UNPINNED=pass; fi
+    DET_UNPINNED="header ${OLD_HEADER}; ${DETAIL}"
     log "RESTORE-NEW-UNPINNED ${RES_UNPINNED}: ${DET_UNPINNED}"
 
     # RESTORE-NEW-PINNED: the same VM on QEMU 11.1.3 with machine pc-i440fx-6.2.
     phase "RESTORE-NEW-PINNED"
-    if run_restore restore-new-pinned pinned "${PINNED_MACHINE}"; then RES_PINNED=pass; fi
-    DET_PINNED="${DETAIL}"
+    use_vm pinned "${VM_MAIN}" "${UUID_MAIN}"
+    if run_restore restore-new-pinned "${PINNED_MACHINE}" "${STATE_OLD}" "${OLD_MARKER}" "${OLD_UPTIME}"; then RES_PINNED=pass; fi
+    DET_PINNED="header ${OLD_HEADER}; ${DETAIL}"
     log "RESTORE-NEW-PINNED ${RES_PINNED}: ${DET_PINNED}"
+
+    # RESTORE-NEW-REWRITTEN: the SAVE-OLD state with pc-i440fx-6.2 in its header, pinned to it.
+    phase "RESTORE-NEW-REWRITTEN"
+    if rewrite_state "${STATE_OLD}" "${STATE_RW}" "${PINNED_MACHINE}"; then
+        use_vm rewritten "${VM_MAIN}" "${UUID_MAIN}"
+        if run_restore restore-new-rewritten "${PINNED_MACHINE}" "${STATE_RW}" "${OLD_MARKER}" "${OLD_UPTIME}"; then RES_RW=pass; fi
+        DET_RW="header ${OLD_HEADER} rewritten to ${PINNED_MACHINE}; ${DETAIL}"
+    else
+        DET_RW="not run: header rewrite failed: ${DETAIL}"
+    fi
+    log "RESTORE-NEW-REWRITTEN ${RES_RW}: ${DET_RW}"
+fi
+
+if [[ "${pc_save_ok}" == "1" ]]; then
+    # RESTORE-NEW-PC-PINNED: the SAVE-OLD-PC state on QEMU 11.1.3 with machine pc-i440fx-6.2.
+    phase "RESTORE-NEW-PC-PINNED"
+    use_vm pcpinned "${VM_PC}" "${UUID_PC}"
+    if run_restore restore-new-pc-pinned "${PINNED_MACHINE}" "${STATE_OLD_PC}" "${PC_MARKER}" "${PC_UPTIME}"; then RES_PC=pass; fi
+    DET_PC="header ${PC_HEADER}; ${DETAIL}"
+    log "RESTORE-NEW-PC-PINNED ${RES_PC}: ${DET_PC}"
 fi
 
 # CONTROL-NEW: save and restore on QEMU 11.1.3 only, to prove the procedure.
