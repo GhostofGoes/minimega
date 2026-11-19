@@ -1,10 +1,12 @@
 # SPIKE ONLY: not for merge
 name: "Spike: restore old state on new QEMU"
 
-# Saves a KVM VM with "vm save" on QEMU 6.2 (the published master image) and
-# restores it with "vm config state" on QEMU 11.1.3 (this fork's spike image),
-# with and without "vm config machine pc-i440fx-6.2". See
-# tests/live/spike-restore.sh. The RESULT lines are in the job summary.
+# Saves KVM VMs with "vm save" on QEMU 6.2 (the published master image) and
+# restores them with "vm config state" on QEMU 11.1.3 (this fork's spike image).
+# The native phases restore the original state files with no header rewrite, no
+# "vm config machine", and no ROM change, and check that minimega pinned the
+# machine type by itself. See tests/live/spike-restore.sh. The RESULT lines are
+# in the job summary.
 
 on:
   push:

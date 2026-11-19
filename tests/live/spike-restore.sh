@@ -6,22 +6,30 @@
 # SPIKE ONLY: not for merge.
 #
 # Find out whether a KVM state file that "vm save" writes on QEMU 6.2 restores
-# on QEMU 11.1.3, with and without "vm config machine pc-i440fx-6.2".
+# on QEMU 11.1.3. The NATIVE phases restore the original state files with no
+# header rewrite, no "vm config machine", and no ROM change: minimega must read
+# the machine type from the state file and pin it by itself.
 #
 #   sudo tests/live/spike-restore.sh <old image> <new image> [artifacts dir]
 #
 # Phases:
 #   SAVE-OLD                boot a guest on the old image, write a marker, vm save
 #   SAVE-OLD-PC             the same in parallel, with vm config machine pc
-#   RESTORE-NEW-UNPINNED    restore the SAVE-OLD state on the new image, default machine
-#   RESTORE-NEW-PINNED      the same, with vm config machine pc-i440fx-6.2
-#   RESTORE-NEW-REWRITTEN   the same, from a copy whose header names pc-i440fx-6.2
-#   RESTORE-NEW-PC-PINNED   restore the SAVE-OLD-PC state, machine pc-i440fx-6.2
 #   SAVE-OLD-REAL           a phenix-shaped VM in parallel (2 vCPUs, 1 GB, CPU
 #                           model, qcow2 disk, NIC with a fixed MAC, -vga qxl)
-#   RESTORE-NEW-REAL        restore it from a rewritten header with the saved .hdd
-#   RESTORE-NEW-REAL-OLDROM    the same, with the old image's iPXE ROMs in the new container
-#   RESTORE-NEW-REAL-NOBLEROM  the same, with the iPXE ROMs of Ubuntu 24.04 ipxe-qemu
+#   RESTORE-NEW-NATIVE      restore the original SAVE-OLD state, no machine set;
+#                           check the vm info machine column and the QEMU -M and
+#                           -incoming arguments
+#   RESTORE-NEW-REAL-NATIVE the same for the SAVE-OLD-REAL state and its .hdd,
+#                           plus the guest MAC and QXL checks
+#   RESTORE-NEW-PINNED-MAPPED  the original SAVE-OLD state with an explicit
+#                           vm config machine pc-i440fx-6.2 (the mapped type)
+#   RESTORE-NEW-EXPLICIT-OTHER the original SAVE-OLD state with an explicit
+#                           vm config machine pc-i440fx-11.1 (minimega must refuse)
+#   RESTORE-NEW-REWRITTEN   a copy whose header names pc-i440fx-6.2, machine pc-i440fx-6.2
+#   RESTORE-NEW-PC-PINNED   restore the SAVE-OLD-PC state, machine pc-i440fx-6.2
+#   RESTORE-NEW-REAL        the SAVE-OLD-REAL state from a rewritten header, machine
+#                           pc-i440fx-6.2, with the ROMs of the new image
 #   CONTROL-NEW             save and restore on the new image only
 #
 # Requirements: Linux, root, Docker, /dev/kvm, and the openvswitch kernel module
@@ -36,9 +44,8 @@
 #   SPIKE_FORCE=1         replace an existing container and base directory
 #   SPIKE_KEEP=1          keep the base directory (state files) at exit
 #
-# The output ends with "RESULT key=value" lines. The exit status is 0 when every
-# phase produced a result (a failed restore is a valid result), and 1 when the
-# procedure could not run.
+# The output ends with "RESULT key=value" lines. The exit status is 1 when
+# restore_native, restore_real_native, or control_new is not "pass", else 0.
 
 set -euo pipefail
 
@@ -63,6 +70,7 @@ HDD_OLD_REAL="${MM_FILES}/spike-old-real.hdd"
 STATE_REAL_RW="${MM_FILES}/spike-old-real-rewritten.state"
 REAL_DISK="${STAGE}/real.qcow2"
 PINNED_MACHINE=pc-i440fx-6.2
+OTHER_MACHINE=pc-i440fx-11.1
 OLD_PC_MACHINE=pc
 
 VM_MAIN=spike
@@ -90,10 +98,14 @@ QEMU_OLD=unknown
 QEMU_NEW=unknown
 MACHINE_OLD=unknown
 MACHINE_OLD_PC=unknown
-RES_UNPINNED=fail
-DET_UNPINNED="not run"
+RES_NATIVE=fail
+DET_NATIVE="not run"
+RES_REAL_NATIVE=fail
+DET_REAL_NATIVE="not run"
 RES_PINNED=fail
 DET_PINNED="not run"
+RES_OTHER=other
+DET_OTHER="not run"
 RES_RW=fail
 DET_RW="not run"
 RES_PC=fail
@@ -101,17 +113,11 @@ DET_PC="not run"
 MACHINE_OLD_REAL=unknown
 RES_REAL=fail
 DET_REAL="not run"
-RES_OLDROM=fail
-DET_OLDROM="not run"
-RES_NOBLEROM=fail
-DET_NOBLEROM="not run"
 ROM_E1000_OLD=unknown
 ROM_E1000_NEW=unknown
-ROM_E1000_NOBLE=n/a
 ROM_QXL_OLD=unknown
 ROM_QXL_NEW=unknown
-NOBLE_ERR="not staged"
-ROM_NOTE=""
+HDD_NOTE=""
 HDD_SUM=""
 RES_CONTROL=fail
 DET_CONTROL="not run"
@@ -145,7 +151,6 @@ REAL_HEADER=unknown
 GUEST_MAC=""
 GUEST_QXL=""
 RESTORE_CHECK=""
-PRE_RESTORE=""
 PROBE_OUT=""
 MACHINE=""
 HEADER=""
@@ -885,17 +890,14 @@ run_save_old_real() {
 }
 
 # run_restore LABEL MACHINE STATE MARKER UPTIME [COMMAND...] restores STATE on the
-# new image for the VM that use_vm selected. A non-empty PRE_RESTORE names a
-# function that runs in the new container before the launch, and a non-empty
-# RESTORE_CHECK names a function that runs after a successful restore.
+# new image for the VM that use_vm selected. A non-empty RESTORE_CHECK names a
+# function that runs after a successful restore.
 run_restore() {
     local label=$1 machine=$2 state=$3 marker=$4 uptime=$5 rc=0 err
     shift 5
     : > "${QEMU_LOG}"
     if ! start_mm "${NEW_IMAGE}" "${label}"; then
         DETAIL="minimega did not start from ${NEW_IMAGE}"
-        rc=1
-    elif [[ -n "${PRE_RESTORE}" ]] && ! "${PRE_RESTORE}"; then
         rc=1
     elif ! restore_guest "${state}" "${machine}" "${marker}" "${uptime}" "$@"; then
         rc=1
@@ -918,23 +920,21 @@ rom_size() {
     printf '%s' "${v:-missing}"
 }
 
-# rom_evidence logs the ROM files of both images and stages the iPXE ROMs of the
-# old image (STAGE/rom-old) and of Ubuntu 24.04 ipxe-qemu (STAGE/rom-noble).
+# rom_evidence logs the ROM files that each QEMU loads. Ubuntu 22.04 QEMU loads
+# its iPXE ROMs from /usr/lib/ipxe/qemu (package ipxe-qemu); the new image loads
+# them from /usr/local/share/qemu.
 rom_evidence() {
     local out
-    mkdir -p "${STAGE}/rom-old" "${STAGE}/rom-noble"
     log "ROM files of ${OLD_IMAGE}"
     # shellcheck disable=SC2016
-    out="$(docker run --rm -v "${STAGE}/rom-old:/x" "${OLD_IMAGE}" bash -c '
-        ls -lL /usr/share/qemu/*.rom /usr/share/qemu/*.bin
-        echo "efi-e1000.rom -> $(readlink -f /usr/share/qemu/efi-e1000.rom)"
-        dpkg -S /usr/share/qemu/efi-e1000.rom "$(readlink -f /usr/share/qemu/efi-e1000.rom)" 2>&1
+    out="$(docker run --rm "${OLD_IMAGE}" bash -c '
+        ls -lL /usr/lib/ipxe/qemu/ /usr/share/qemu/*.bin 2>&1
+        echo "efi-e1000.rom -> $(readlink -f /usr/lib/ipxe/qemu/efi-e1000.rom)"
+        dpkg -S /usr/lib/ipxe/qemu/efi-e1000.rom 2>&1
         dpkg-query -W ipxe-qemu seabios 2>&1
         echo "kvm -L help:"; kvm -L help 2>&1
-        for f in efi-e1000.rom vgabios-qxl.bin; do echo "ROMSIZE $f $(stat -L -c %s /usr/share/qemu/$f 2>/dev/null)"; done
-        for f in /usr/share/qemu/efi-*.rom /usr/share/qemu/pxe-*.rom; do
-            if [ -e "$f" ]; then cp -L "$f" /x/; fi
-        done
+        echo "ROMSIZE efi-e1000.rom $(stat -L -c %s /usr/lib/ipxe/qemu/efi-e1000.rom 2>/dev/null)"
+        echo "ROMSIZE vgabios-qxl.bin $(stat -L -c %s /usr/share/qemu/vgabios-qxl.bin 2>/dev/null)"
         true' 2>&1 || true)"
     printf '%s\n' "${out}" | tee "${ART}/logs/roms-old.txt" | sed 's/^/    /'
     ROM_E1000_OLD="$(rom_size "${out}" efi-e1000.rom)"
@@ -943,73 +943,14 @@ rom_evidence() {
     log "ROM files of ${NEW_IMAGE}"
     # shellcheck disable=SC2016
     out="$(docker run --rm "${NEW_IMAGE}" bash -c '
-        ls -lL /usr/local/share/qemu/*.rom /usr/local/share/qemu/*.bin
+        ls -lL /usr/local/share/qemu/*.rom /usr/local/share/qemu/*.bin 2>&1
         echo "kvm -L help:"; kvm -L help 2>&1
         for f in efi-e1000.rom vgabios-qxl.bin; do echo "ROMSIZE $f $(stat -L -c %s /usr/local/share/qemu/$f 2>/dev/null)"; done
         true' 2>&1 || true)"
     printf '%s\n' "${out}" | tee "${ART}/logs/roms-new.txt" | sed 's/^/    /'
     ROM_E1000_NEW="$(rom_size "${out}" efi-e1000.rom)"
     ROM_QXL_NEW="$(rom_size "${out}" vgabios-qxl.bin)"
-
-    log "ROM files of Ubuntu 24.04 ipxe-qemu, installed in a throwaway ${NEW_IMAGE} container"
-    # shellcheck disable=SC2016
-    if out="$(docker run --rm -v "${STAGE}/rom-noble:/x" "${NEW_IMAGE}" bash -c '
-        set -e
-        export DEBIAN_FRONTEND=noninteractive
-        apt-get update -qq
-        apt-get install -y -qq --no-install-recommends ipxe-qemu >/dev/null
-        dpkg-query -W ipxe-qemu
-        ls -lL /usr/lib/ipxe/qemu/
-        for f in /usr/lib/ipxe/qemu/*.rom; do cp -L "$f" /x/; done
-        echo "ROMSIZE efi-e1000.rom $(stat -L -c %s /usr/lib/ipxe/qemu/efi-e1000.rom)"' 2>&1)"; then
-        NOBLE_ERR=""
-        ROM_E1000_NOBLE="$(rom_size "${out}" efi-e1000.rom)"
-    else
-        NOBLE_ERR="ipxe-qemu install or copy failed: $(oneline "$(tail -n 3 <<<"${out}")" 300)"
-    fi
-    printf '%s\n' "${out}" | tee "${ART}/logs/roms-noble.txt" | sed 's/^/    /'
-    ls -l "${STAGE}/rom-old" "${STAGE}/rom-noble" || true
 }
-
-# replace_roms DIR backs up the bundled iPXE ROMs in the new container and copies
-# each ROM in DIR (the files directory is mounted at the same path) over the
-# bundled file of the same name. It adds to ROM_NOTE.
-# shellcheck disable=SC2329 # called by the PRE_RESTORE functions
-replace_roms() {
-    local dir=$1 f name replaced="" skipped="" size
-    local qdir=/usr/local/share/qemu
-    if ! docker exec "${CONTAINER}" sh -c "mkdir -p ${qdir}/bundled-rom-backup && cp -a ${qdir}/efi-*.rom ${qdir}/pxe-*.rom ${qdir}/bundled-rom-backup/ 2>/dev/null; ls ${qdir}/bundled-rom-backup | wc -l"; then
-        DETAIL="could not back up the bundled ROMs in ${CONTAINER}"
-        return 1
-    fi
-    for f in "${dir}"/*.rom; do
-        [[ -f "${f}" ]] || continue
-        name="$(basename "${f}")"
-        if docker exec "${CONTAINER}" test -e "${qdir}/${name}"; then
-            if ! docker exec "${CONTAINER}" cp "${f}" "${qdir}/${name}"; then
-                DETAIL="could not copy ${name} into ${CONTAINER}"
-                return 1
-            fi
-            replaced+=" ${name}"
-        else
-            skipped+=" ${name}"
-        fi
-    done
-    if [[ -z "${replaced}" ]]; then
-        DETAIL="no ROM in ${dir} matches a bundled ROM name"
-        return 1
-    fi
-    size="$(docker exec "${CONTAINER}" stat -L -c %s "${qdir}/efi-e1000.rom" 2>/dev/null || echo missing)"
-    docker exec "${CONTAINER}" sh -c "ls -lL ${qdir}/efi-*.rom ${qdir}/pxe-*.rom" 2>&1 | sed 's/^/    /' || true
-    log "replaced:${replaced}; not bundled (skipped):${skipped:- none}"
-    ROM_NOTE="${ROM_NOTE:+${ROM_NOTE}; }replaced $(wc -w <<<"${replaced}" | tr -d ' ') ROMs from $(basename "${dir}") (efi-e1000.rom now ${size} bytes)"
-}
-
-# shellcheck disable=SC2329 # called through PRE_RESTORE
-prep_oldrom() { replace_roms "${STAGE}/rom-old"; }
-
-# shellcheck disable=SC2329 # called through PRE_RESTORE
-prep_noblerom() { replace_roms "${STAGE}/rom-noble"; }
 
 # check_hdd logs the checksum of the saved .hdd and notes a change since the first restore.
 check_hdd() {
@@ -1020,26 +961,100 @@ check_hdd() {
         log ".hdd sha256 ${sum}"
     elif [[ "${sum}" != "${HDD_SUM}" ]]; then
         log "warning: ${HDD_OLD_REAL} changed since the first restore (${HDD_SUM} -> ${sum})"
-        ROM_NOTE="warning: .hdd changed since the first restore"
+        HDD_NOTE="warning: .hdd changed since the first restore"
     else
         log ".hdd unchanged since the first restore (sha256 ${sum})"
     fi
 }
 
-# run_real_variant LABEL NAMESPACE PREP restores the rewritten real state with
-# the PREP function as PRE_RESTORE and check_real after the restore.
-run_real_variant() {
-    local label=$1 prep=$3 rc=0
+# run_real LABEL NAMESPACE MACHINE STATE CHECK restores a SAVE-OLD-REAL state
+# with its saved .hdd and the real VM config, and runs CHECK after the restore.
+run_real() {
+    local label=$1 machine=$3 state=$4 rc=0
     use_vm "$2" "${VM_REAL}" "${UUID_REAL}"
-    ROM_NOTE=""
+    HDD_NOTE=""
     check_hdd
-    PRE_RESTORE="${prep}"
-    RESTORE_CHECK=check_real
-    run_restore "${label}" "${PINNED_MACHINE}" "${STATE_REAL_RW}" "${REAL_MARKER}" "${REAL_UPTIME}" \
+    RESTORE_CHECK=$5
+    run_restore "${label}" "${machine}" "${state}" "${REAL_MARKER}" "${REAL_UPTIME}" \
         "${REAL_RESTORE_CFG[@]}" || rc=1
-    PRE_RESTORE=""
     RESTORE_CHECK=""
     return "${rc}"
+}
+
+# arg_after ARGS FLAG prints the line that follows the first FLAG line in ARGS.
+# shellcheck disable=SC2329 # called by check_pin
+arg_after() { awk -v f="$2" 'p { print; exit } $0 == f { p = 1 }' <<<"$1"; }
+
+# check_pin checks that minimega pinned the machine type by itself: the vm info
+# machine column, and the -M and -incoming arguments of the QEMU process.
+# shellcheck disable=SC2329 # called through RESTORE_CHECK
+check_pin() {
+    local col pid args m inc ok=1
+    col="$(MM_QUIET=1 mmv ".columns machine .filter name=${VM} vm info" || true)"
+    col="$(oneline "${col}" 120)"
+    pid="$(MM_QUIET=1 mmv ".columns pid .filter name=${VM} vm info" || true)"
+    pid="$(grep -E '^[0-9]+$' <<<"${pid}" | head -n 1 || true)"
+    if [[ -n "${pid}" ]]; then
+        args="$(docker exec "${CONTAINER}" cat "/proc/${pid}/cmdline" 2>/dev/null | tr '\0' '\n' || true)"
+    fi
+    printf 'QEMU command line of pid %s:\n%s\n' "${pid:-none}" "${args:-}" >> "${ART}/commands.log"
+    m="$(arg_after "${args:-}" -M)"
+    if [[ -z "${m}" ]]; then m="$(arg_after "${args:-}" -machine)"; fi
+    inc="$(arg_after "${args:-}" -incoming)"
+    log "vm info machine '${col}', pid ${pid:-none}, -M '${m}', -incoming '${inc}'"
+    if [[ "${col}" != "${PINNED_MACHINE}" ]]; then ok=0; fi
+    if [[ "${m%%,*}" != "${PINNED_MACHINE}" ]]; then ok=0; fi
+    case "${inc}" in
+    "exec:{ head -c 9"*) ;;
+    *) ok=0 ;;
+    esac
+    DETAIL="${DETAIL}; vm info machine=${col:-none}; qemu -M ${m:-none}; -incoming $(oneline "${inc:-none}" 120)"
+    if [[ "${ok}" != 1 ]]; then
+        DETAIL="${DETAIL}; expected machine ${PINNED_MACHINE} in vm info and -M, and -incoming starting with exec:{ head -c 9"
+        return 1
+    fi
+}
+
+# shellcheck disable=SC2329 # called through RESTORE_CHECK
+check_real_pin() { check_real && check_pin; }
+
+# run_explicit_other launches the original SAVE-OLD state with an explicit machine
+# type that is neither the file type nor the mapped type, and sets RES_OTHER to
+# refused (minimega refused before QEMU started), restored, or other.
+run_explicit_other() {
+    local out st qs tags text start started=0
+    use_vm explicitother "${VM_MAIN}" "${UUID_MAIN}"
+    : > "${QEMU_LOG}"
+    if ! start_mm "${NEW_IMAGE}" restore-new-explicit-other; then
+        DETAIL="minimega did not start from ${NEW_IMAGE}"
+        return
+    fi
+    if configure_vm "${OTHER_MACHINE}" "${STATE_OLD}"; then
+        out="$(ns_run "vm launch kvm ${VM}" || true)"
+        start=${SECONDS}
+        while (( SECONDS - start < 30 )); do
+            st="$(vm_state)"
+            if [[ -z "${st}" || "${st}" == ERROR || "${st}" == QUIT ]]; then break; fi
+            qs="$(qmp_status)"
+            if [[ -n "${qs}" && "${qs}" != inmigrate ]]; then break; fi
+            sleep 2
+        done
+        tags="$(MM_QUIET=1 mmv ".columns tags .filter name=${VM} vm info" || true)"
+        if grep -q -- '-incoming' "${QEMU_LOG}" 2>/dev/null; then started=1; fi
+        text="$(oneline "${out} ${tags}" 600)"
+        if [[ -n "${qs:-}" && "${qs:-}" != inmigrate && "${st:-}" != ERROR && "${st:-}" != QUIT ]]; then
+            RES_OTHER=restored
+        elif [[ "${started}" == 0 && "${text}" == *"${OLD_HEADER}"* && "${text}" == *"${OTHER_MACHINE}"* ]]; then
+            RES_OTHER=refused
+        fi
+        DETAIL="vm state ${st:-none}, QEMU started: ${started}; minimega: ${text:-no error text}"
+        if [[ "${started}" == 1 ]]; then DETAIL="${DETAIL}; $(qemu_error)"; fi
+    else
+        DETAIL="${DETAIL} (vm config refused the value)"
+    fi
+    collect_evidence restore-new-explicit-other
+    kill_flush
+    stop_mm restore-new-explicit-other
 }
 
 run_control() {
@@ -1083,16 +1098,16 @@ print_results() {
     block="RESULT qemu_old=${QEMU_OLD} qemu_new=${QEMU_NEW}
 RESULT machine_old=${MACHINE_OLD} header=${OLD_HEADER}
 RESULT machine_old_pc=${MACHINE_OLD_PC} header=${PC_HEADER}
-RESULT restore_unpinned=${RES_UNPINNED} detail=\"$(oneline "${DET_UNPINNED}" 1400)\"
-RESULT restore_pinned=${RES_PINNED} detail=\"$(oneline "${DET_PINNED}" 1400)\"
+RESULT restore_native=${RES_NATIVE} detail=\"$(oneline "${DET_NATIVE}" 1400)\"
+RESULT restore_pinned_mapped=${RES_PINNED} detail=\"$(oneline "${DET_PINNED}" 1400)\"
+RESULT restore_explicit_other=${RES_OTHER} detail=\"$(oneline "${DET_OTHER}" 1400)\"
 RESULT restore_rewritten=${RES_RW} detail=\"$(oneline "${DET_RW}" 1400)\"
 RESULT restore_pc_pinned=${RES_PC} detail=\"$(oneline "${DET_PC}" 1400)\"
 RESULT machine_old_real=${MACHINE_OLD_REAL} header=${REAL_HEADER}
+RESULT restore_real_native=${RES_REAL_NATIVE} detail=\"$(oneline "${DET_REAL_NATIVE}" 2000)\"
 RESULT restore_real=${RES_REAL} detail=\"$(oneline "${DET_REAL}" 2000)\"
-RESULT rom_e1000 old=${ROM_E1000_OLD} new=${ROM_E1000_NEW} noble_pkg=${ROM_E1000_NOBLE}
+RESULT rom_e1000 old=${ROM_E1000_OLD} new=${ROM_E1000_NEW}
 RESULT rom_qxl old=${ROM_QXL_OLD} new=${ROM_QXL_NEW}
-RESULT restore_real_oldrom=${RES_OLDROM} detail=\"$(oneline "${DET_OLDROM}" 2000)\"
-RESULT restore_real_noblerom=${RES_NOBLEROM} detail=\"$(oneline "${DET_NOBLEROM}" 2000)\"
 RESULT control_new=${RES_CONTROL} detail=\"$(oneline "${DET_CONTROL}" 1400)\""
     echo
     printf '%s\n' "${block}" | tee "${ART}/results.txt"
@@ -1182,9 +1197,10 @@ if run_save_old; then
     log "SAVE-OLD ok: ${DETAIL}"
 else
     log "SAVE-OLD FAILED: ${DETAIL}"
-    DET_UNPINNED="not run: SAVE-OLD failed: ${DETAIL}"
-    DET_PINNED="${DET_UNPINNED}"
-    DET_RW="${DET_UNPINNED}"
+    DET_NATIVE="not run: SAVE-OLD failed: ${DETAIL}"
+    DET_PINNED="${DET_NATIVE}"
+    DET_OTHER="${DET_NATIVE}"
+    DET_RW="${DET_NATIVE}"
 fi
 collect_evidence save-old
 
@@ -1213,24 +1229,46 @@ if run_save_old_real; then
 else
     log "SAVE-OLD-REAL FAILED: ${DETAIL}"
     DET_REAL="${REAL_NOTES}; not run: SAVE-OLD-REAL failed: ${DETAIL}"
+    DET_REAL_NATIVE="${DET_REAL}"
 fi
 collect_evidence save-old-real save-old
 stop_mm save-old
 
 if [[ "${save_ok}" == "1" ]]; then
-    # RESTORE-NEW-UNPINNED: the same VM on QEMU 11.1.3, default machine (expected to fail).
-    phase "RESTORE-NEW-UNPINNED"
-    use_vm unpinned "${VM_MAIN}" "${UUID_MAIN}"
-    if run_restore restore-new-unpinned "" "${STATE_OLD}" "${OLD_MARKER}" "${OLD_UPTIME}"; then RES_UNPINNED=pass; fi
-    DET_UNPINNED="header ${OLD_HEADER}; ${DETAIL}"
-    log "RESTORE-NEW-UNPINNED ${RES_UNPINNED}: ${DET_UNPINNED}"
+    # RESTORE-NEW-NATIVE: the original SAVE-OLD state, no machine set: minimega pins the type.
+    phase "RESTORE-NEW-NATIVE"
+    use_vm native "${VM_MAIN}" "${UUID_MAIN}"
+    RESTORE_CHECK=check_pin
+    if run_restore restore-new-native "" "${STATE_OLD}" "${OLD_MARKER}" "${OLD_UPTIME}"; then RES_NATIVE=pass; fi
+    RESTORE_CHECK=""
+    DET_NATIVE="header ${OLD_HEADER}; ${DETAIL}"
+    log "RESTORE-NEW-NATIVE ${RES_NATIVE}: ${DET_NATIVE}"
+fi
 
-    # RESTORE-NEW-PINNED: the same VM on QEMU 11.1.3 with machine pc-i440fx-6.2.
-    phase "RESTORE-NEW-PINNED"
-    use_vm pinned "${VM_MAIN}" "${UUID_MAIN}"
-    if run_restore restore-new-pinned "${PINNED_MACHINE}" "${STATE_OLD}" "${OLD_MARKER}" "${OLD_UPTIME}"; then RES_PINNED=pass; fi
+if [[ "${real_save_ok}" == "1" ]]; then
+    # RESTORE-NEW-REAL-NATIVE: the original SAVE-OLD-REAL state and .hdd, no machine, no ROM change.
+    phase "RESTORE-NEW-REAL-NATIVE"
+    if run_real restore-new-real-native realnative "" "${STATE_OLD_REAL}" check_real_pin; then RES_REAL_NATIVE=pass; fi
+    DET_REAL_NATIVE="${REAL_NOTES}; header ${REAL_HEADER}; ${HDD_NOTE:+${HDD_NOTE}; }${DETAIL}"
+    log "RESTORE-NEW-REAL-NATIVE ${RES_REAL_NATIVE}: ${DET_REAL_NATIVE}"
+fi
+
+if [[ "${save_ok}" == "1" ]]; then
+    # RESTORE-NEW-PINNED-MAPPED: the original SAVE-OLD state with vm config machine pc-i440fx-6.2.
+    phase "RESTORE-NEW-PINNED-MAPPED"
+    use_vm pinnedmapped "${VM_MAIN}" "${UUID_MAIN}"
+    RESTORE_CHECK=check_pin
+    if run_restore restore-new-pinned-mapped "${PINNED_MACHINE}" "${STATE_OLD}" "${OLD_MARKER}" "${OLD_UPTIME}"; then RES_PINNED=pass; fi
+    RESTORE_CHECK=""
     DET_PINNED="header ${OLD_HEADER}; ${DETAIL}"
-    log "RESTORE-NEW-PINNED ${RES_PINNED}: ${DET_PINNED}"
+    log "RESTORE-NEW-PINNED-MAPPED ${RES_PINNED}: ${DET_PINNED}"
+
+    # RESTORE-NEW-EXPLICIT-OTHER: the original SAVE-OLD state with vm config machine pc-i440fx-11.1.
+    phase "RESTORE-NEW-EXPLICIT-OTHER"
+    DETAIL=""
+    run_explicit_other || true
+    DET_OTHER="header ${OLD_HEADER}, machine ${OTHER_MACHINE}; ${DETAIL}"
+    log "RESTORE-NEW-EXPLICIT-OTHER ${RES_OTHER}: ${DET_OTHER}"
 
     # RESTORE-NEW-REWRITTEN: the SAVE-OLD state with pc-i440fx-6.2 in its header, pinned to it.
     phase "RESTORE-NEW-REWRITTEN"
@@ -1254,37 +1292,15 @@ if [[ "${pc_save_ok}" == "1" ]]; then
 fi
 
 if [[ "${real_save_ok}" == "1" ]]; then
-    # RESTORE-NEW-REAL: the phenix-shaped VM from a rewritten header, with its saved disk.
+    # RESTORE-NEW-REAL: the SAVE-OLD-REAL state from a rewritten header, machine pc-i440fx-6.2.
     phase "RESTORE-NEW-REAL"
-    real_rw_ok=0
     if rewrite_state "${STATE_OLD_REAL}" "${STATE_REAL_RW}" "${PINNED_MACHINE}"; then
-        real_rw_ok=1
-        if run_real_variant restore-new-real realnew ""; then RES_REAL=pass; fi
-        DET_REAL="${REAL_NOTES}; header ${REAL_HEADER} rewritten to ${PINNED_MACHINE}; ${ROM_NOTE:+${ROM_NOTE}; }${DETAIL}"
+        if run_real restore-new-real realnew "${PINNED_MACHINE}" "${STATE_REAL_RW}" check_real; then RES_REAL=pass; fi
+        DET_REAL="${REAL_NOTES}; header ${REAL_HEADER} rewritten to ${PINNED_MACHINE}; ${HDD_NOTE:+${HDD_NOTE}; }${DETAIL}"
     else
         DET_REAL="${REAL_NOTES}; not run: header rewrite failed: ${DETAIL}"
-        DET_OLDROM="${DET_REAL}"
-        DET_NOBLEROM="${DET_REAL}"
     fi
     log "RESTORE-NEW-REAL ${RES_REAL}: ${DET_REAL}"
-
-    if [[ "${real_rw_ok}" == "1" ]]; then
-        # RESTORE-NEW-REAL-OLDROM: the same restore with the old image's iPXE ROMs in the new container.
-        phase "RESTORE-NEW-REAL-OLDROM"
-        if run_real_variant restore-new-real-oldrom realoldrom prep_oldrom; then RES_OLDROM=pass; fi
-        DET_OLDROM="old image iPXE ROMs; ${ROM_NOTE:+${ROM_NOTE}; }${DETAIL}"
-        log "RESTORE-NEW-REAL-OLDROM ${RES_OLDROM}: ${DET_OLDROM}"
-
-        # RESTORE-NEW-REAL-NOBLEROM: the same restore with the iPXE ROMs of Ubuntu 24.04 ipxe-qemu.
-        phase "RESTORE-NEW-REAL-NOBLEROM"
-        if [[ -n "${NOBLE_ERR}" ]]; then
-            DET_NOBLEROM="not run: ${NOBLE_ERR}"
-        else
-            if run_real_variant restore-new-real-noblerom realnoblerom prep_noblerom; then RES_NOBLEROM=pass; fi
-            DET_NOBLEROM="Ubuntu 24.04 ipxe-qemu ROMs; ${ROM_NOTE:+${ROM_NOTE}; }${DETAIL}"
-        fi
-        log "RESTORE-NEW-REAL-NOBLEROM ${RES_NOBLEROM}: ${DET_NOBLEROM}"
-    fi
 fi
 
 # CONTROL-NEW: save and restore on QEMU 11.1.3 only, to prove the procedure.
@@ -1294,14 +1310,11 @@ DET_CONTROL="${DETAIL}"
 log "CONTROL-NEW ${RES_CONTROL}: ${DET_CONTROL}"
 
 status=0
-if [[ "${save_ok}" != "1" ]]; then
-    log "the procedure could not run: SAVE-OLD failed"
-    status=1
-elif [[ "${RES_CONTROL}" != "pass" && "${RES_PINNED}" != "pass" ]]; then
-    log "CONTROL-NEW failed too, so the RESTORE-NEW-PINNED failure is not conclusive"
-    status=1
-elif [[ "${RES_CONTROL}" != "pass" ]]; then
-    log "warning: CONTROL-NEW failed, but RESTORE-NEW-PINNED passed on its own"
-fi
+for r in "restore_native=${RES_NATIVE}" "restore_real_native=${RES_REAL_NATIVE}" "control_new=${RES_CONTROL}"; do
+    if [[ "${r#*=}" != pass ]]; then
+        log "FAIL: ${r}"
+        status=1
+    fi
+done
 print_results
 exit "${status}"
