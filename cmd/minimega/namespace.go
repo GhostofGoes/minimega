@@ -76,6 +76,11 @@ type Namespace struct {
 	// QueuedVMs toggles whether we should queue VMs or not when launching
 	QueueVMs bool
 
+	// index of the names and UUIDs in queue, nil until a Queue needs it.
+	// queuedNames maps vmNameKey of each name to the names with that key.
+	queuedNames map[string][]string
+	queuedUUIDs map[string]bool
+
 	vmConfig      VMConfig
 	savedVMConfig map[string]VMConfig
 
@@ -244,28 +249,18 @@ func (n *Namespace) Destroy() error {
 		log.Error("unable to delete mirrors: %v", err)
 	}
 
-	// Kill and flush all the VMs
+	// Kill and flush all the VMs, including the VMs that are launching
+	n.WaitLaunches()
 	n.Kill(Wildcard)
-	n.FlushAll(n.ccServer)
+	n.flushAll(n.ccServer)
 
 	// Stop ron server
 	n.ccServer.Destroy()
 
-	// Delete any Taps associated with the namespace
-	for t := range n.Taps {
-		tap, err := bridges.FindTap(t)
-		if err != nil {
-			return err
-		}
-
-		br, err := getBridge(tap.Bridge)
-		if err != nil {
-			return err
-		}
-
-		if err := br.DestroyTap(tap.Name); err != nil {
-			return err
-		}
+	// Delete any Taps associated with the namespace. hostTapDelete destroys
+	// them and the VM taps in one pass of the reaper.
+	if err := hostTapDelete(n, Wildcard); err != nil {
+		return err
 	}
 
 	// Free up any VLANs associated with the namespace
@@ -278,71 +273,124 @@ func (n *Namespace) Destroy() error {
 }
 
 // Queue handles storing the current VM config to the namespace's queued VMs so
-// that we can launch it in the future.
-func (n *Namespace) Queue(arg string, vmType VMType, vmConfig VMConfig) error {
+// that we can launch it in the future. It returns a warning for each VM name
+// that minimega 4.0.0 will reject, and logs each warning.
+func (n *Namespace) Queue(arg string, vmType VMType, vmConfig VMConfig) ([]string, error) {
 	// invalidate assignment
 	n.assignment = nil
 
-	names, err := expandLaunchNames(arg)
+	names, warnings, err := expandLaunchNames(arg)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	if len(names) > 1 && vmConfig.UUID != "" {
-		return errors.New("cannot launch multiple VMs with a pre-configured UUID")
+		return nil, errors.New("cannot launch multiple VMs with a pre-configured UUID")
 	}
 
-	// look for name and UUID conflicts across the namespace
-	takenName := map[string]bool{}
-	takenUUID := map[string]bool{}
-
-	for _, vm := range globalVMs(n) {
-		takenName[vm.GetName()] = true
-		takenUUID[vm.GetUUID()] = true
+	if vmType == ANDROID && vmConfig.VNCListenPort != 0 {
+		return nil, errAndroidVNCPort
 	}
 
-	for _, name := range names {
-		if takenName[name] {
-			return fmt.Errorf("vm already exists with name `%s`", name)
-		}
-
-		if name != "" && !validName.MatchString(name) {
-			return fmt.Errorf("%v: `%v`", validNameErr, name)
-		}
-	}
-
-	if takenUUID[vmConfig.UUID] && vmConfig.UUID != "" {
-		return fmt.Errorf("vm already exists with UUID `%s`", vmConfig.UUID)
-	}
-
-	// add in all the queued VM names and then recheck
-	for _, q := range n.queued() {
-		for _, name := range q.Names {
-			takenName[name] = true
-		}
-		takenUUID[q.VMConfig.UUID] = true
+	if len(names) > 1 && vmType == KVM && vmConfig.VNCListenPort != 0 {
+		return nil, errors.New("cannot launch multiple VMs with a pre-configured VNC port")
 	}
 
 	for _, name := range names {
-		if takenName[name] && name != "" {
-			return fmt.Errorf("vm already queued with name `%s`", name)
+		if name != "" {
+			warning, err := checkVMName(name)
+			if err != nil {
+				return nil, err
+			}
+			warnings = appendWarning(warnings, warning)
 		}
 	}
 
-	if takenUUID[vmConfig.UUID] && vmConfig.UUID != "" {
-		return fmt.Errorf("vm already queued with UUID `%s`", vmConfig.UUID)
+	// Look for name and UUID conflicts across the namespace. With queueing,
+	// Schedule does this one time for all the queued VMs, because a `vm info`
+	// on each host for each queued VM is slow with many VMs.
+	if !n.QueueVMs {
+		q := &QueuedVMs{VMConfig: vmConfig, Names: names}
+		conflicts, err := vmConflicts(globalVMs(n), []*QueuedVMs{q})
+		if err != nil {
+			return nil, err
+		}
+		warnings = append(warnings, conflicts...)
 	}
 
 	n.configLock.Lock()
 	defer n.configLock.Unlock()
 
-	n.queue = append(n.queue, &QueuedVMs{
+	// look for conflicts with the queued VMs
+	n.indexQueue()
+
+	for _, name := range names {
+		warning, err := nameTaken(n.queuedNames, name, "queued")
+		if err != nil {
+			return nil, err
+		}
+		warnings = appendWarning(warnings, warning)
+	}
+
+	if n.queuedUUIDs[vmConfig.UUID] && vmConfig.UUID != "" {
+		return nil, fmt.Errorf("vm already queued with UUID `%s`", vmConfig.UUID)
+	}
+
+	q := &QueuedVMs{
 		VMConfig: vmConfig,
 		VMType:   vmType,
 		Names:    names,
-	})
+	}
 
-	return nil
+	if vmType == CONTAINER {
+		q.FilesystemTar = tarSource(vmConfig.FilesystemPath)
+	}
+
+	n.queue = append(n.queue, q)
+	n.addToQueueIndex(q)
+
+	for _, warning := range warnings {
+		log.Warn("%v", warning)
+	}
+
+	return warnings, nil
+}
+
+// appendWarning appends warning to warnings unless warning is empty.
+func appendWarning(warnings []string, warning string) []string {
+	if warning == "" {
+		return warnings
+	}
+
+	return append(warnings, warning)
+}
+
+// nameTaken returns an error when taken, a map from vmNameKey to VM names,
+// has a VM name that is equal to name. It returns a warning when taken has a VM name that differs
+// from name only in letter case. state is "exists" or "queued".
+func nameTaken(taken map[string][]string, name, state string) (string, error) {
+	if name == "" {
+		return "", nil
+	}
+
+	others := taken[vmNameKey(name)]
+	if len(others) == 0 {
+		return "", nil
+	}
+
+	if slices.Contains(others, name) {
+		if state == "exists" {
+			return "", fmt.Errorf("vm already exists with name `%s`", name)
+		}
+
+		return "", fmt.Errorf("vm already queued with name `%s`", name)
+	}
+
+	if state == "exists" {
+		return caseConflictWarning(fmt.Sprintf("vm name `%s` conflicts with existing vm `%s`", name, others[0])), nil
+	}
+
+	return caseConflictWarning(fmt.Sprintf("vm name `%s` conflicts with queued vm `%s`", name, others[0])), nil
 }
 
 // queued returns a copy of queue.
@@ -386,6 +434,77 @@ func (n *Namespace) copyVMConfig(name string) (config VMConfig, done func(), err
 	n.addLaunching(pending)
 
 	return config, func() { n.endLaunch(pending) }, nil
+}
+
+// vmConflicts returns an error when a queued VM has the name or UUID of one of
+// the VMs in vms. It returns a warning for each queued VM name that differs
+// from the name of one of the VMs in vms only in letter case.
+func vmConflicts(vms []VM, queue []*QueuedVMs) ([]string, error) {
+	// takenName maps vmNameKey of each name to the names with that key
+	takenName := map[string][]string{}
+	takenUUID := map[string]bool{}
+
+	for _, vm := range vms {
+		key := vmNameKey(vm.GetName())
+		takenName[key] = append(takenName[key], vm.GetName())
+		takenUUID[vm.GetUUID()] = true
+	}
+
+	var warnings []string
+
+	for _, q := range queue {
+		for _, name := range q.Names {
+			warning, err := nameTaken(takenName, name, "exists")
+			if err != nil {
+				return nil, err
+			}
+			warnings = appendWarning(warnings, warning)
+		}
+
+		if takenUUID[q.VMConfig.UUID] && q.VMConfig.UUID != "" {
+			return nil, fmt.Errorf("vm already exists with UUID `%s`", q.VMConfig.UUID)
+		}
+	}
+
+	return warnings, nil
+}
+
+// clearQueue removes all the queued VMs and the index of their names and
+// UUIDs. The caller must hold configLock.
+func (n *Namespace) clearQueue() {
+	n.queue = nil
+	n.queuedNames, n.queuedUUIDs = nil, nil
+}
+
+// indexQueue makes the index of the names and UUIDs in the queue, if it does
+// not exist. The caller must hold configLock.
+func (n *Namespace) indexQueue() {
+	if n.queuedNames != nil {
+		return
+	}
+
+	n.queuedNames = map[string][]string{}
+	n.queuedUUIDs = map[string]bool{}
+
+	for _, q := range n.queue {
+		n.addToQueueIndex(q)
+	}
+}
+
+// addToQueueIndex adds the names and UUID of q to the index of the queue, if
+// the index exists. The caller must hold configLock.
+func (n *Namespace) addToQueueIndex(q *QueuedVMs) {
+	if n.queuedNames == nil {
+		return
+	}
+
+	for _, name := range q.Names {
+		if name != "" {
+			key := vmNameKey(name)
+			n.queuedNames[key] = append(n.queuedNames[key], name)
+		}
+	}
+	n.queuedUUIDs[q.VMConfig.UUID] = true
 }
 
 // hostStats returns stats from hosts in the namespace.
@@ -452,8 +571,20 @@ func (n *Namespace) Schedule(dryRun bool) error {
 		}
 	}
 
+	vms := globalVMs(n)
+
+	// The queued VMs were not checked against the VMs in the namespace when
+	// queueing was enabled.
+	warnings, err := vmConflicts(vms, queue)
+	if err != nil {
+		return err
+	}
+	for _, warning := range warnings {
+		log.Warn("%v", warning)
+	}
+
 	// resolve any "colocated" VMs for VMs that are already launched
-	for _, vm := range globalVMs(n) {
+	for _, vm := range vms {
 		for _, q := range queue {
 			if q.Colocate == vm.GetName() {
 				q.Schedule = vm.GetHost()
@@ -501,49 +632,54 @@ func (n *Namespace) schedule(assignment map[string][]*QueuedVMs, queue []*Queued
 
 	n.scheduleStats = append(n.scheduleStats, stats)
 
-	// Result of vm launch commands
-	respChan := make(chan minicli.Responses)
+	// set names here instead of on the remote host to ensure that we get
+	// names that are unique across the namespace
+	for _, queue := range assignment {
+		for _, q := range queue {
+			for i, name := range q.Names {
+				if name == "" {
+					q.Names[i] = fmt.Sprintf("vm-%v", n.vmID.Next())
+				}
+			}
+		}
+	}
+
+	results := make(chan scheduleResult)
 
 	var wg sync.WaitGroup
 
 	for host, queue := range assignment {
-		wg.Add(1)
+		// limit the launches in progress on each host
+		slots := make(chan struct{}, scheduleHostParallel())
 
-		go func(host string, queue []*QueuedVMs) {
-			defer wg.Done()
+		for _, q := range queue {
+			wg.Add(1)
 
-			for _, q := range queue {
-				// set name here instead of on the remote host to ensure that we
-				// get names that are unique across the namespace
-				for i, name := range q.Names {
-					if name == "" {
-						q.Names[i] = fmt.Sprintf("vm-%v", n.vmID.Next())
-					}
-				}
+			go func(host string, q *QueuedVMs) {
+				defer wg.Done()
 
-				n.hostLaunch(host, q, respChan)
-			}
-		}(host, queue)
+				slots <- struct{}{}
+				defer func() { <-slots }()
+
+				results <- scheduleLaunch(n, host, q)
+			}(host, q)
+		}
 	}
 
 	go func() {
 		wg.Wait()
-		close(respChan)
+		close(results)
 	}()
 
-	// Collect all the responses and log them
-	for resps := range respChan {
-		for _, resp := range resps {
-			if resp.Error != "" {
-				stats.failures += 1
-				log.Error("launch error, host %v -- %v", resp.Host, resp.Error)
-			} else {
-				// Response should number of VMs launched
-				i, _ := strconv.Atoi(resp.Response)
-				stats.launched += i
+	// Collect all the results and log them
+	for r := range results {
+		stats.launched += r.launched
+		stats.failures += r.failed
 
-				log.Debug("launch response, host %v -- %v", resp.Host, resp.Response)
-			}
+		if r.err != "" {
+			log.Error("launch error, host %v -- %v", r.host, r.err)
+		} else {
+			log.Debug("launch response, host %v -- %v launched", r.host, r.launched)
 		}
 	}
 
@@ -637,6 +773,7 @@ func (n *Namespace) startLaunch(qs, dequeue []*QueuedVMs) {
 		n.queue = slices.DeleteFunc(slices.Clone(n.queue), func(q *QueuedVMs) bool {
 			return slices.Contains(dequeue, q)
 		})
+		n.queuedNames, n.queuedUUIDs = nil, nil
 	}
 
 	n.addLaunching(qs)
@@ -678,27 +815,57 @@ func (ns *Namespace) NewCommand(c *ron.Command) int {
 	return id
 }
 
+// scheduleResult is the result of the launch of one queued entry on one host.
+type scheduleResult struct {
+	host             string
+	launched, failed int
+	err              string
+}
+
+// scheduleLaunch launches q on host. Tests replace it.
+var scheduleLaunch = (*Namespace).hostLaunch
+
+// scheduleHostParallel returns the maximum number of launches in progress on
+// each host. Tests replace it.
+var scheduleHostParallel = runtime.NumCPU
+
 // hostLaunch launches a queuedVM on the specified host and namespace.
-func (n *Namespace) hostLaunch(host string, queued *QueuedVMs, respChan chan<- minicli.Responses) {
+func (n *Namespace) hostLaunch(host string, queued *QueuedVMs) scheduleResult {
 	log.Info("scheduling %v %v VMs on %v", len(queued.Names), queued.VMType, host)
+
+	res := scheduleResult{host: host}
 
 	// Launching the VMs locally
 	if host == hostname {
-		resp := &minicli.Response{
-			Host:     hostname,
-			Response: strconv.Itoa(len(queued.Names)),
+		errs := n.Launch("", queued)
+
+		res.launched = launchedCount(len(queued.Names), errs)
+		res.failed = len(queued.Names) - res.launched
+		if err := makeErrSlice(errs); err != nil {
+			res.err = err.Error()
 		}
 
-		if err := makeErrSlice(n.Launch("", queued)); err != nil {
-			resp.Error = err.Error()
-		}
-
-		respChan <- minicli.Responses{resp}
-
-		return
+		return res
 	}
 
-	forward(meshageLaunch(host, n.Name, queued), respChan)
+	var resp *minicli.Response
+	for resps := range meshageLaunch(host, n.Name, queued) {
+		if len(resps) > 0 {
+			resp = resps[0]
+		}
+	}
+
+	if resp == nil {
+		res.failed = len(queued.Names)
+		res.err = "timed out"
+		return res
+	}
+
+	res.launched, _ = strconv.Atoi(resp.Response)
+	res.failed = len(queued.Names) - res.launched
+	res.err = resp.Error
+
+	return res
 }
 
 // hostSlice converts the hosts map into a slice of hostnames
@@ -1078,13 +1245,19 @@ func GetNamespace() *Namespace {
 	namespaceLock.Lock()
 	defer namespaceLock.Unlock()
 
-	_, ok := namespaces[namespace]
-	if namespace == DefaultNamespace && !ok {
-		// recreate automatically
-		namespaces[namespace] = NewNamespace(namespace)
+	if namespace == DefaultNamespace {
+		ensureDefaultNamespace()
 	}
 
 	return namespaces[namespace]
+}
+
+// ensureDefaultNamespace recreates the default namespace if it was cleared so
+// that it always exists. Caller must hold namespaceLock.
+func ensureDefaultNamespace() {
+	if _, ok := namespaces[DefaultNamespace]; !ok {
+		namespaces[DefaultNamespace] = NewNamespace(DefaultNamespace)
+	}
 }
 
 // resolveNamespace returns the namespace a command must run in: the one tagged
@@ -1169,6 +1342,8 @@ func ListNamespaces() []string {
 	namespaceLock.Lock()
 	defer namespaceLock.Unlock()
 
+	ensureDefaultNamespace()
+
 	res := []string{}
 	for n := range namespaces {
 		res = append(res, n)
@@ -1197,6 +1372,8 @@ func allNamespaces() []*Namespace {
 func InfoNamespaces() []NamespaceInfo {
 	namespaceLock.Lock()
 	defer namespaceLock.Unlock()
+
+	ensureDefaultNamespace()
 
 	res := []NamespaceInfo{}
 	for n := range namespaces {

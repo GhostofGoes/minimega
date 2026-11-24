@@ -18,15 +18,18 @@ type Dnsmasq struct {
 	DNS      map[string][]string
 	RAD      map[string]bool
 	Upstream string
+	Custom   []string
 }
 
 type Dhcp struct {
-	Addr   string
-	Low    string
-	High   string
-	Router string
-	DNS    string
-	Static map[string]string
+	Addr    string
+	Low     string
+	High    string
+	Netmask string
+	Router  string
+	DNS     string
+	Static  map[string]string
+	Relay   []string
 }
 
 var (
@@ -43,9 +46,12 @@ func init() {
 			"dnsmasq <dhcp,> option <router,> <addr> <server>",
 			"dnsmasq <dhcp,> option <dns,> <addr> <server>",
 			"dnsmasq <dhcp,> <static,> <addr> <mac> <ip>",
+			"dnsmasq <dhcp,> <netmask,> <addr> <mask>",
+			"dnsmasq <dhcp,> <relay,> <addr> <server>",
 			"dnsmasq <dns,> <ip> <host>",
 			"dnsmasq <upstream,> <ip>",
 			"dnsmasq <ra,> <subnet>",
+			"dnsmasq <custom,> <line>",
 		},
 		Call: handleDnsmasq,
 	})
@@ -95,6 +101,12 @@ func handleDnsmasq(c *minicli.Command, r chan<- minicli.Responses) {
 			ip := c.StringArgs["ip"]
 			d := DHCPFindOrCreate(addr)
 			d.Static[mac] = ip
+		} else if c.BoolArgs["netmask"] {
+			d := DHCPFindOrCreate(c.StringArgs["addr"])
+			d.Netmask = c.StringArgs["mask"]
+		} else if c.BoolArgs["relay"] {
+			d := DHCPFindOrCreate(c.StringArgs["addr"])
+			d.Relay = append(d.Relay, c.StringArgs["server"])
 		}
 	} else if c.BoolArgs["dns"] {
 		ip := c.StringArgs["ip"]
@@ -107,6 +119,8 @@ func handleDnsmasq(c *minicli.Command, r chan<- minicli.Responses) {
 	} else if c.BoolArgs["ra"] {
 		subnet := c.StringArgs["subnet"]
 		dnsmasqData.RAD[subnet] = true
+	} else if c.BoolArgs["custom"] {
+		dnsmasqData.Custom = append(dnsmasqData.Custom, c.StringArgs["line"])
 	}
 }
 
@@ -181,10 +195,15 @@ no-resolv
 dhcp-lease-max=4294967295
 {{ range $v := .DHCP }}
 # {{ $v.Addr }}
-{{ if ne $v.Low "" }}
-	dhcp-range=set:{{ $v.Addr }},{{ $v.Low }},{{ $v.High }}
+{{ if $v.Relay }}
+{{ range $server := $v.Relay }}
+	dhcp-relay={{ $v.Addr }},{{ $server }}
+{{ end }}
 {{ else }}
-	dhcp-range=set:{{ $v.Addr }},{{ $v.Addr }},static
+{{ if ne $v.Low "" }}
+	dhcp-range=set:{{ $v.Addr }},{{ $v.Low }},{{ $v.High }}{{ if ne $v.Netmask "" }},{{ $v.Netmask }}{{ end }}
+{{ else }}
+	dhcp-range=set:{{ $v.Addr }},{{ $v.Addr }},static{{ if ne $v.Netmask "" }},{{ $v.Netmask }}{{ end }}
 {{ end }}
 {{ range $mac, $ip := $v.Static }}
 	dhcp-host=set:{{ $v.Addr }},{{ $mac }},{{ $ip }}
@@ -196,10 +215,17 @@ dhcp-lease-max=4294967295
 	dhcp-option = tag:{{ $v.Addr }}, option:dns-server, {{ $v.DNS }}
 {{ end }}
 {{ end }}
+{{ end }}
 {{ range $host, $ips := .DNS }}
 host-record={{ $host }}{{ range $v := $ips }},{{ $v }}{{ end }}
 {{ end }}
 {{ range $rad, $option := .RAD }}
 dhcp-range={{ $rad }},ra-names
+{{ end }}
+{{ if .Custom }}
+# custom
+{{ range $line := .Custom }}
+{{ $line }}
+{{ end }}
 {{ end }}
 `

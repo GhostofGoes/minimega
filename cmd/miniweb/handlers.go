@@ -48,7 +48,7 @@ func respondJSON(w http.ResponseWriter, data interface{}) {
 // indexHandler handles all unmatched URLs, redirects / to /vms
 func indexHandler(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path == "/" {
-		http.Redirect(w, r, "/vms", 302)
+		http.Redirect(w, r, vmsPath(r), 302)
 		return
 	}
 
@@ -61,13 +61,25 @@ func indexHandler(w http.ResponseWriter, r *http.Request) {
 	// potentially prefixed with a namespace
 	log.Debug("URL: %v", r.URL)
 
-	// split URL into <namespace>/<rest of URL>
-	path := strings.TrimPrefix(r.URL.Path, "/")
+	// split URL into <namespace>/<rest of URL>; split the escaped path so
+	// that an escaped "/" stays in the namespace
+	path := strings.TrimPrefix(r.URL.EscapedPath(), "/")
 	fields := strings.SplitN(path, "/", 2)
 
 	// only have a possible namespace -- redirect
 	if len(fields) == 1 {
-		http.Redirect(w, r, path+"/", 302)
+		http.Redirect(w, r, "/"+path+"/", 302)
+		return
+	}
+
+	ns, err := url.PathUnescape(fields[0])
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	rest, err := url.PathUnescape(fields[1])
+	if err != nil {
+		http.NotFound(w, r)
 		return
 	}
 
@@ -78,15 +90,31 @@ func indexHandler(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	v.Set("namespace", fields[0])
+	v.Set("namespace", ns)
 
 	// patch up query and hand back to the mux
 	r.URL.RawQuery = v.Encode()
-	r.URL.Path = "/" + fields[1]
+	r.URL.Path = "/" + rest
+	r.URL.RawPath = ""
 
 	log.Debug("new URL: %v", r.URL)
 
 	mux.ServeHTTP(w, r)
+}
+
+// vmsPath returns the VMs page, keeping the request's namespace prefix, or the
+// query form when the prefix would collide with another route (e.g. "files").
+func vmsPath(r *http.Request) string {
+	ns := r.URL.Query().Get("namespace")
+	if ns == "" || *f_namespace != "" {
+		return "/vms"
+	}
+
+	path := "/" + url.PathEscape(ns) + "/vms"
+	if _, pattern := mux.Handler(&http.Request{Method: http.MethodGet, URL: &url.URL{Path: path}}); pattern != "/" {
+		return "/vms?" + url.Values{"namespace": {ns}}.Encode()
+	}
+	return path
 }
 
 func renderTemplate(w http.ResponseWriter, r *http.Request, t string, d interface{}) {
@@ -391,8 +419,23 @@ func vmHandler(w http.ResponseWriter, r *http.Request) {
 			cmd.Command = fmt.Sprintf("vm %v %q", fields[2], name)
 
 			var res string
+			var errs []string
+			done := false
 			for resps := range run(cmd) {
 				res += resps.Rendered
+				if err := resps.Resp.Error(); err != "" {
+					errs = append(errs, err)
+				}
+				done = done || (!resps.Status && !resps.More)
+			}
+
+			if len(errs) > 0 {
+				http.Error(w, strings.Join(errs, "\n"), http.StatusBadRequest)
+				return
+			}
+			if !done {
+				http.Error(w, "no response from minimega", http.StatusBadGateway)
+				return
 			}
 
 			w.Write([]byte(res))
@@ -439,7 +482,11 @@ func vmsHandler(w http.ResponseWriter, r *http.Request) {
 			var names []string
 			for resps := range run(cmd) {
 				for _, resp := range resps.Resp {
-					names = append(names, strings.Split(resp.Response, "\n")...)
+					for _, name := range strings.Split(resp.Response, "\n") {
+						if name != "" {
+							names = append(names, name)
+						}
+					}
 				}
 			}
 
@@ -463,7 +510,7 @@ func vmsHandler(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 
-			http.Redirect(w, r, "/vms", http.StatusFound)
+			http.Redirect(w, r, vmsPath(r), http.StatusFound)
 			return
 		}
 
@@ -558,11 +605,11 @@ func consoleHandler(w http.ResponseWriter, r *http.Request) {
 
 	ptyMu.Lock()
 	tty, ok := ptys[pid]
+	ptyMu.Unlock()
 	if !ok {
 		http.Error(w, "pty not found", http.StatusNotFound)
 		return
 	}
-	ptyMu.Unlock()
 
 	switch path[3] {
 	case "size":

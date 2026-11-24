@@ -74,14 +74,27 @@ file get foo
 ```
 
 If the file exists, the command will return with no error. The `file` API is
-non-blocking - it will return immediately and enqueue the file transfer. To see
-the status of existing file transfers, use the `file status` API:
+non-blocking - it will return immediately and enqueue the file transfer.
+
+Parts are written directly into a temporary file that is moved into place once
+every part arrives, so a transfer needs about as much free space as the file
+itself. Replacing an existing file in `-headnode` mode needs room for both
+copies until the new one is moved into place. When the node serving the file
+reports its size (older versions do not), `file get` reserves the space
+before it returns and fails with a "no space left on device" error if the file
+will not fit. For a directory or glob, files are reserved one at a time, so the
+files before the one that does not fit are still transferred. If the serving
+node does not report the size, or the file system cannot reserve space, a full
+disk fails the transfer later. A transfer that fails after `file get` returns
+is logged, and commands that wait for the file, such as `vm launch`, report the
+error. To see the status of existing file transfers, use the
+`file status` API:
 
 ```text
 minimega$ file get bigfile
 minimega$ file status
-host  | Filename | Temporary directory                    | Completed parts | Queued
-foo   | bigfile  | /tmp/minimega/files/transfer_442933642 | 65/103          | false
+host  | Filename | Temporary directory                        | Completed parts | Queued
+foo   | bigfile  | /tmp/minimega/files/transfer_foo_442933642 | 65/103          | false
 ```
 
 You can also list and delete files using the `file` API:
@@ -150,6 +163,17 @@ an error since the filesystem path is set to the top-level directory inside the
 tarball. If the tarball resides outside of the iomeshage directory, minimega
 will still untar the tarball if it exists on the local node running the
 container to the same directory where the tarball resides.
+
+In a namespace, each host that launches containers with a `tar:` filesystem
+fetches and extracts the tarball itself before launching them, so the tarball
+only needs to exist on one node in the mesh (or, outside of the iomeshage
+directory, at the same path on every host). A host that already has the
+extracted directory uses it as is, and a host that already has the tarball
+does not fetch it again. To use a changed tarball, delete the extracted
+directory on every host. Also delete the old tarball on every host that does
+not have the changed tarball. minimega remembers which tarball it extracted
+until it restarts: after a restart, run the `tar:` command again before
+launching containers on other hosts.
 
 <a id="TOC_2.4."></a>
 

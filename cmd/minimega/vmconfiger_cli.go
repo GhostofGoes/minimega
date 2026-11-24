@@ -897,6 +897,44 @@ Default: "std"
 		}),
 	},
 	{
+		HelpShort: "configures vnc-port",
+		HelpLong: `Set the TCP port that the VM's VNC shim listens on. When unset (0),
+minimega picks a free port at launch. The port must not be in use on
+the host that runs the VM, so it can only be set when launching a
+single VM. The port stays reserved on that host, across namespaces and
+Android emulator ports, until the VM is flushed. Use "vm info" to see the
+port of a running VM.
+
+Note: this configuration only applies to KVM-based VMs. Android VMs
+reject it.
+
+Default: 0
+`,
+		Patterns: []string{
+			"vm config vnc-port [value]",
+		},
+
+		Call: wrapSimpleCLI(func(ns *Namespace, c *minicli.Command, r *minicli.Response) error {
+			if len(c.StringArgs) == 0 {
+				r.Response = strconv.FormatUint(ns.vmConfig.VNCListenPort, 10)
+				return nil
+			}
+
+			i, err := strconv.ParseUint(c.StringArgs["value"], 10, 64)
+			if err != nil {
+				return err
+			}
+
+			if err := validVNCPort(ns.vmConfig, i); err != nil {
+				return err
+			}
+
+			ns.vmConfig.VNCListenPort = i
+
+			return nil
+		}),
+	},
+	{
 		HelpShort: "configures append",
 		HelpLong: `Add an append string to a kernel set with vm kernel. Setting vm append
 without using vm kernel will result in an error.
@@ -1216,6 +1254,33 @@ Default: true
 		}),
 	},
 	{
+		HelpShort: "configures cc-policy",
+		HelpLong: `Set the policy for the command and control layer of a VM. "strict"
+applies stricter rules to requests from the guest, and denies tunnel
+requests from the guest. "legacy" keeps the behavior of earlier
+releases. An empty value uses the default of the VM type, which is
+legacy for all VM types.
+`,
+		Patterns: []string{
+			"vm config cc-policy [value]",
+		},
+
+		Call: wrapSimpleCLI(func(ns *Namespace, c *minicli.Command, r *minicli.Response) error {
+			if len(c.StringArgs) == 0 {
+				r.Response = ns.vmConfig.CCPolicy
+				return nil
+			}
+
+			if err := validCCPolicy(ns.vmConfig, c.StringArgs["value"]); err != nil {
+				return err
+			}
+
+			ns.vmConfig.CCPolicy = c.StringArgs["value"]
+
+			return nil
+		}),
+	},
+	{
 		HelpShort: "configures tags",
 		HelpLong: `Set tags in the same manner as "vm tag". These tags will apply to all
 newly launched VMs.
@@ -1268,6 +1333,7 @@ Default: empty map
 			"clear vm config <baremetal-network-driver,>",
 			"clear vm config <bidirectional-copy-paste,>",
 			"clear vm config <bonds,>",
+			"clear vm config <cc-policy,>",
 			"clear vm config <cpu,>",
 			"clear vm config <cdrom,>",
 			"clear vm config <colocate,>",
@@ -1305,6 +1371,7 @@ Default: empty map
 			"clear vm config <uuid,>",
 			"clear vm config <usb-use-xhci,>",
 			"clear vm config <vcpus,>",
+			"clear vm config <vnc-port,>",
 			"clear vm config <vga,>",
 			"clear vm config <virtio-ports,>",
 			"clear vm config <volume,>",
@@ -1498,6 +1565,9 @@ func (v *BaseConfig) Info(field string) (string, error) {
 	if field == "backchannel" {
 		return strconv.FormatBool(v.Backchannel), nil
 	}
+	if field == "cc-policy" {
+		return v.CCPolicy, nil
+	}
 	if field == "networks" {
 		return fmt.Sprintf("%v", v.Networks), nil
 	}
@@ -1536,6 +1606,9 @@ func (v *BaseConfig) Clear(mask string) {
 	if mask == Wildcard || mask == "backchannel" {
 		v.Backchannel = true
 	}
+	if mask == Wildcard || mask == "cc-policy" {
+		v.CCPolicy = ""
+	}
 	if mask == Wildcard || mask == "networks" {
 		v.Networks = NetConfigs{}
 	}
@@ -1571,6 +1644,9 @@ func (v *BaseConfig) WriteConfig(w io.Writer) error {
 	}
 	if v.Backchannel != true {
 		fmt.Fprintf(w, "vm config backchannel %t\n", v.Backchannel)
+	}
+	if v.CCPolicy != "" {
+		fmt.Fprintf(w, "vm config cc-policy %v\n", v.CCPolicy)
 	}
 	if err := v.Networks.WriteConfig(w); err != nil {
 		return err
@@ -1615,6 +1691,8 @@ func (v *BaseConfig) ReadConfig(r io.Reader, ns string, vmConfig *VMConfig) erro
 			v.Coschedule, _ = strconv.ParseInt(config[1], 10, 64)
 		case "backchannel":
 			v.Backchannel, _ = strconv.ParseBool(config[1])
+		case "cc-policy":
+			v.CCPolicy = config[1]
 		case "networks":
 			if err := v.ReadFieldConfig(strings.NewReader(line), "networks", ns, vmConfig); err != nil {
 				return err
@@ -1784,6 +1862,9 @@ func (v *KVMConfig) Info(field string) (string, error) {
 	if field == "vga" {
 		return v.Vga, nil
 	}
+	if field == "vnc-port" {
+		return strconv.FormatUint(v.VNCListenPort, 10), nil
+	}
 	if field == "append" {
 		return fmt.Sprintf("%v", v.Append), nil
 	}
@@ -1855,6 +1936,9 @@ func (v *KVMConfig) Clear(mask string) {
 	if mask == Wildcard || mask == "vga" {
 		v.Vga = "std"
 	}
+	if mask == Wildcard || mask == "vnc-port" {
+		v.VNCListenPort = 0
+	}
 	if mask == Wildcard || mask == "append" {
 		v.Append = nil
 	}
@@ -1923,6 +2007,9 @@ func (v *KVMConfig) WriteConfig(w io.Writer) error {
 	}
 	if v.Vga != "std" {
 		fmt.Fprintf(w, "vm config vga %v\n", v.Vga)
+	}
+	if v.VNCListenPort != 0 {
+		fmt.Fprintf(w, "vm config vnc-port %v\n", v.VNCListenPort)
 	}
 	if len(v.Append) > 0 {
 		fmt.Fprintf(w, "vm config append %v\n", quoteJoin(v.Append, " "))
@@ -1993,6 +2080,8 @@ func (v *KVMConfig) ReadConfig(r io.Reader, ns string, vmConfig *VMConfig) error
 			v.VirtioPorts = config[1]
 		case "vga":
 			v.Vga = config[1]
+		case "vnc-port":
+			v.VNCListenPort, _ = strconv.ParseUint(config[1], 10, 64)
 		case "append":
 			v.Append = fieldsQuoteEscape("\"", strings.Join(config[1:], " "))
 		case "disks":

@@ -783,9 +783,16 @@ func (vm *ContainerVM) Info(field string) (string, error) {
 }
 
 func (vm *ContainerVM) Conflicts(vm2 VM) error {
+	vm.lock.Lock()
+	defer vm.lock.Unlock()
+
+	return vm.conflictsNoLock(vm2)
+}
+
+func (vm *ContainerVM) conflictsNoLock(vm2 VM) error {
 	switch vm2 := vm2.(type) {
 	case *ContainerVM:
-		return vm.ConflictsContainer(vm2)
+		return vm.conflictsContainer(vm2)
 	case *KvmVM:
 		return vm.BaseVM.conflicts(vm2.BaseVM)
 	case *AndroidVM:
@@ -795,13 +802,10 @@ func (vm *ContainerVM) Conflicts(vm2 VM) error {
 	return errors.New("unknown VM type")
 }
 
-// ConflictsContainer tests whether vm and vm2 share a filesystem and
+// conflictsContainer tests whether vm and vm2 share a filesystem and
 // returns an error if one of them is not running in snapshot mode. Also
 // checks whether the BaseVMs conflict.
-func (vm *ContainerVM) ConflictsContainer(vm2 *ContainerVM) error {
-	vm.lock.Lock()
-	defer vm.lock.Unlock()
-
+func (vm *ContainerVM) conflictsContainer(vm2 *ContainerVM) error {
 	if vm.FilesystemPath == vm2.FilesystemPath && (!vm.Snapshot || !vm2.Snapshot) {
 		return fmt.Errorf("filesystem conflict with vm %v: %v", vm.Name, vm.FilesystemPath)
 	}
@@ -1578,7 +1582,10 @@ func containerMaskPaths(fsPath string) error {
 	for _, v := range containerMaskedPaths {
 		p := filepath.Join(fsPath, v)
 		err := syscall.Mount("/dev/null", p, "", syscall.MS_BIND, "")
-		if err != nil {
+		if errors.Is(err, syscall.ENOENT) {
+			log.Debug("not masking missing path: %v", p)
+			continue // e.g. no /proc/kcore without CONFIG_PROC_KCORE
+		} else if err != nil {
 			return err
 		}
 	}
@@ -1593,7 +1600,10 @@ func containerRemountReadOnly(fsPath string) error {
 			continue // this was actually a mountpoint
 		}
 		err = syscall.Mount(p, p, "", syscall.MS_BIND, "")
-		if err != nil {
+		if errors.Is(err, syscall.ENOENT) {
+			log.Debug("not remounting missing path read-only: %v", p)
+			continue // e.g. no /proc/sysrq-trigger without CONFIG_MAGIC_SYSRQ
+		} else if err != nil {
 			return err
 		}
 		err = syscall.Mount(p, p, "", syscall.MS_BIND|syscall.MS_REMOUNT|syscall.MS_RDONLY|syscall.MS_REC|syscall.MS_NOEXEC|syscall.MS_NOSUID|syscall.MS_NODEV, "")

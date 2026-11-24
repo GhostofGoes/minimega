@@ -189,6 +189,19 @@ type KVMConfig struct {
 	// Default: "std"
 	Vga string
 
+	// Set the TCP port that the VM's VNC shim listens on. When unset (0),
+	// minimega picks a free port at launch. The port must not be in use on
+	// the host that runs the VM, so it can only be set when launching a
+	// single VM. The port stays reserved on that host, across namespaces and
+	// Android emulator ports, until the VM is flushed. Use "vm info" to see the
+	// port of a running VM.
+	//
+	// Note: this configuration only applies to KVM-based VMs. Android VMs
+	// reject it.
+	//
+	// Default: 0
+	VNCListenPort uint64 `config:"vnc-port" validate:"validVNCPort"`
+
 	// Add an append string to a kernel set with vm kernel. Setting vm append
 	// without using vm kernel will result in an error.
 	//
@@ -390,6 +403,9 @@ func NewKVM(name, namespace string, config VMConfig) (*KvmVM, error) {
 		if config.TpmSocketPath != "" {
 			return nil, errors.New("bare-metal VMs do not support TPM devices")
 		}
+		if config.VNCListenPort != 0 {
+			return nil, errors.New("bare-metal VMs do not support VNC")
+		}
 		if len(config.Networks) != 0 && config.BaremetalNetworkDriver == "" {
 			return nil, errors.New("networked bare-metal VMs require a bare-metal NIC driver")
 		}
@@ -456,6 +472,8 @@ func (vm *KvmVM) Recover(id string, pid int) error {
 func (vm *KvmVM) Flush() error {
 	vm.lock.Lock()
 	defer vm.lock.Unlock()
+
+	defer releaseVNCPort(vm)
 
 	for _, net := range vm.Networks {
 		// Handle already disconnected taps differently since they aren't
@@ -538,6 +556,24 @@ func (vm *KvmVM) Stop() error {
 	return nil
 }
 
+// Shutdown sends an ACPI power button event to the guest and returns. The
+// guest decides when to power off.
+func (vm *KvmVM) Shutdown() error {
+	vm.lock.Lock()
+	defer vm.lock.Unlock()
+
+	if vm.State != VM_RUNNING {
+		return vmNotRunning(vm.Name)
+	}
+
+	log.Info("sending powerdown to VM: %v", vm.ID)
+	if _, err := vm.q.Raw(`{"execute": "system_powerdown"}`); err != nil {
+		return fmt.Errorf("unable to shut down vm %v: %v", vm.Name, err)
+	}
+
+	return nil
+}
+
 func (vm *KvmVM) String() string {
 	return fmt.Sprintf("%s:%d:kvm", hostname, vm.ID)
 }
@@ -562,22 +598,26 @@ func (vm *KvmVM) Info(field string) (string, error) {
 }
 
 func (vm *KvmVM) Conflicts(vm2 VM) error {
+	vm.lock.Lock()
+	defer vm.lock.Unlock()
+
+	return vm.conflictsNoLock(vm2)
+}
+
+func (vm *KvmVM) conflictsNoLock(vm2 VM) error {
 	switch vm2 := vm2.(type) {
 	case *KvmVM:
-		return vm.ConflictsKVM(vm2)
+		return vm.conflictsKVM(vm2)
 	case *ContainerVM:
 		return vm.BaseVM.conflicts(vm2.BaseVM)
 	case *AndroidVM:
-		return vm.ConflictsAndroid(vm2)
+		return vm.conflictsAndroid(vm2)
 	}
 
 	return errors.New("unknown VM type")
 }
 
-func (vm *KvmVM) ConflictsAndroid(vm2 *AndroidVM) error {
-	vm.lock.Lock()
-	defer vm.lock.Unlock()
-
+func (vm *KvmVM) conflictsAndroid(vm2 *AndroidVM) error {
 	for _, d := range vm.Disks {
 		for _, d2 := range vm2.Disks {
 			if d.Path == d2.Path && (!vm.Snapshot || !vm2.Snapshot) {
@@ -589,13 +629,10 @@ func (vm *KvmVM) ConflictsAndroid(vm2 *AndroidVM) error {
 	return vm.BaseVM.conflicts(vm2.BaseVM)
 }
 
-// ConflictsKVM tests whether vm and vm2 share a disk and returns an
+// conflictsKVM tests whether vm and vm2 share a disk and returns an
 // error if one of them is not running in snapshot mode. Also checks
 // whether the BaseVMs conflict.
-func (vm *KvmVM) ConflictsKVM(vm2 *KvmVM) error {
-	vm.lock.Lock()
-	defer vm.lock.Unlock()
-
+func (vm *KvmVM) conflictsKVM(vm2 *KvmVM) error {
 	for _, d := range vm.Disks {
 		for _, d2 := range vm2.Disks {
 			if d.Path == d2.Path && (!vm.Snapshot || !vm2.Snapshot) {
@@ -631,6 +668,7 @@ func (vm *KVMConfig) String() string {
 	fmt.Fprintf(w, "Threads:\t%v\n", vm.Threads)
 	fmt.Fprintf(w, "Sockets:\t%v\n", vm.Sockets)
 	fmt.Fprintf(w, "VGA:\t%v\n", vm.Vga)
+	fmt.Fprintf(w, "VNC Port:\t%v\n", vm.VNCListenPort)
 	fmt.Fprintf(w, "Usb Use XHCI:\t%v\n", vm.UsbUseXHCI)
 	fmt.Fprintf(w, "Bidirectional Copy Paste:\t%v\n", vm.BidirectionalCopyPaste)
 	fmt.Fprintf(w, "TPM Socket: \t%v\n", vm.TpmSocketPath)
@@ -720,52 +758,56 @@ func (vm *KvmVM) Migrate(filename string) error {
 }
 
 func (vm *KvmVM) QueryMigrate() (string, float64, error) {
-	var status string
-	var completed float64
-
 	r, err := vm.q.QueryMigrate()
 	if err != nil {
 		return "", 0.0, err
 	}
 
+	return migrateProgress(r)
+}
+
+// migrateProgress returns the status and percent complete from a QMP
+// query-migrate result. Only "active" migrations report RAM progress; QEMU
+// also reports states such as "setup" and "device" while a save starts.
+func migrateProgress(r map[string]interface{}) (string, float64, error) {
 	// find the status
-	if s, ok := r["status"]; ok {
-		status = s.(string)
-	} else {
+	s, ok := r["status"]
+	if !ok {
 		// if there is no status, it means that there is no active migration
 		return "", 0.0, nil
 	}
+	status, ok := s.(string)
+	if !ok {
+		return "", 0.0, fmt.Errorf("invalid migration status: %v", s)
+	}
 
-	var ram map[string]interface{}
 	switch status {
 	case "completed":
-		completed = 100.0
-		return status, completed, nil
-	case "failed":
-		return status, completed, nil
+		return status, 100.0, nil
 	case "active":
-		if e, ok := r["ram"]; !ok {
-			return status, completed, fmt.Errorf("could not decode ram segment: %v", e)
-		} else {
-			switch e.(type) {
-			case map[string]interface{}:
-				ram = e.(map[string]interface{})
-			default:
-				return status, completed, fmt.Errorf("invalid ram type: %v", e)
-			}
-		}
+	default:
+		return status, 0.0, nil
 	}
 
-	total := ram["total"].(float64)
-	transferred := ram["transferred"].(float64)
+	ram, ok := r["ram"].(map[string]interface{})
+	if !ok {
+		return status, 0.0, fmt.Errorf("invalid ram segment: %v", r["ram"])
+	}
+
+	total, ok := ram["total"].(float64)
+	if !ok {
+		return status, 0.0, fmt.Errorf("invalid total ram: %v", ram["total"])
+	}
+	transferred, ok := ram["transferred"].(float64)
+	if !ok {
+		return status, 0.0, fmt.Errorf("invalid transferred ram: %v", ram["transferred"])
+	}
 
 	if total == 0.0 {
-		return status, completed, fmt.Errorf("zero total ram!")
+		return status, 0.0, fmt.Errorf("zero total ram!")
 	}
 
-	completed = transferred / total * 100
-
-	return status, completed, nil
+	return status, transferred / total * 100, nil
 }
 
 func (vm *KvmVM) Screenshot(size int) ([]byte, error) {
@@ -845,12 +887,60 @@ func (vm *KvmVM) proxyVNC(ns *Namespace, addr string, remote net.Conn) {
 	vnc.Proxy(remote, local, opts)
 }
 
+// vncPortOwner maps reserved fixed VNC ports to their VM. Guarded by
+// androidPortMu, and mirrored in androidReservedPort so the Android port
+// allocator skips them.
+var vncPortOwner = map[int]*KvmVM{}
+
+// reserveVNCPort claims vm's fixed VNC port on this host, across namespaces,
+// before QEMU starts. It is held until the VM is flushed.
+func reserveVNCPort(vm *KvmVM) error {
+	port := int(vm.VNCListenPort)
+	if port == 0 {
+		return nil
+	}
+
+	androidPortMu.Lock()
+	defer androidPortMu.Unlock()
+
+	if owner := vncPortOwner[port]; owner != nil {
+		return fmt.Errorf("vnc port %v already reserved by vm %v in namespace %v", port, owner.Name, owner.Namespace)
+	}
+	if androidReservedPort[port] {
+		return fmt.Errorf("vnc port %v is reserved by an android VM", port)
+	}
+
+	l, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
+	if err != nil {
+		return fmt.Errorf("vnc port %v is not available: %v", port, err)
+	}
+	l.Close()
+
+	vncPortOwner[port] = vm
+	androidReservedPort[port] = true
+
+	return nil
+}
+
+// releaseVNCPort frees vm's fixed VNC port, if vm holds it.
+func releaseVNCPort(vm *KvmVM) {
+	port := int(vm.VNCListenPort)
+
+	androidPortMu.Lock()
+	defer androidPortMu.Unlock()
+
+	if port != 0 && vncPortOwner[port] == vm {
+		delete(vncPortOwner, port)
+		delete(androidReservedPort, port)
+	}
+}
+
 func (vm *KvmVM) connectVNC() error {
 	if vm.Baremetal {
 		return nil
 	}
 
-	l, err := net.Listen("tcp", "")
+	l, err := net.Listen("tcp", fmt.Sprintf(":%d", vm.VNCListenPort))
 	if err != nil {
 		return err
 	}
@@ -1747,6 +1837,14 @@ func validCPU(vmConfig VMConfig, cpu string) error {
 
 	if !cpus[cpu] {
 		return fmt.Errorf("invalid QEMU CPU: `%v`, see help", cpu)
+	}
+
+	return nil
+}
+
+func validVNCPort(vmConfig VMConfig, port uint64) error {
+	if port > 65535 {
+		return fmt.Errorf("invalid VNC port: %v, must be between 1 and 65535 (0 picks a free port)", port)
 	}
 
 	return nil

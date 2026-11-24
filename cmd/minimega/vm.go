@@ -78,6 +78,10 @@ type VM interface {
 	// when we create a VM but before adding it to the list of VMs.
 	Conflicts(VM) error
 
+	// conflictsNoLock is Conflicts without the lock of the VM. Use it only for
+	// a VM that is launching: the launch holds the lock.
+	conflictsNoLock(VM) error
+
 	SetCCActive(bool)
 	HasCC() bool
 	Connect(*ron.Server, bool) error
@@ -695,6 +699,17 @@ func (vm *BaseVM) SetCCActive(active bool) {
 	vm.ActiveCC = active
 }
 
+// CCPolicy returns the cc policy of the VM: the configured cc-policy, or the
+// default of the VM type. The ron server reads it without the VM lock, so it
+// must not take it.
+func (vm *BaseVM) CCPolicy() string {
+	if vm.BaseConfig.CCPolicy != "" {
+		return vm.BaseConfig.CCPolicy
+	}
+
+	return ron.CCPolicyLegacy
+}
+
 func (vm *BaseVM) HasCC() bool {
 	vm.lock.Lock()
 	defer vm.lock.Unlock()
@@ -974,6 +989,10 @@ func (vm *BaseVM) conflicts(vm2 *BaseVM) error {
 	// Return error if two VMs have same name or UUID
 	if vm.Name == vm2.Name {
 		return fmt.Errorf("duplicate VM name: %s", vm.Name)
+	}
+
+	if vmNameKey(vm.Name) == vmNameKey(vm2.Name) {
+		log.Warn("%v", caseConflictWarning(fmt.Sprintf("vm name %s conflicts with %s", vm2.Name, vm.Name)))
 	}
 
 	if vm.UUID == vm2.UUID {
